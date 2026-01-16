@@ -198,48 +198,44 @@ function App() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 
                 {/* Clash Card */}
-                <Card className="bg-zinc-900 border-zinc-800 shadow-sm">
-                  <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                    <CardTitle className="text-base font-medium text-white">Clash Engine</CardTitle>
+                <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 shadow-sm">
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-base font-medium text-white">Clash Engine</h3>
                     <Globe className="h-4 w-4 text-blue-500" />
-                  </CardHeader>
-                  <CardContent>
-                    <div className="text-2xl font-bold text-white mb-1">
-                      {status.clash ? 'Running' : 'Stopped'}
-                    </div>
-                    <p className="text-xs text-zinc-500 mb-4">Core routing service</p>
-                    <Badge variant="secondary" className={cn(
-                      "rounded-sm px-2 py-0.5 text-xs font-normal border",
-                      status.clash 
-                        ? "bg-blue-500/10 text-blue-400 border-blue-500/20" 
-                        : "bg-zinc-800 text-zinc-500 border-zinc-700"
-                    )}>
-                      {status.clash ? 'ACTIVE' : 'INACTIVE'}
-                    </Badge>
-                  </CardContent>
-                </Card>
+                  </div>
+                  <div className="text-2xl font-bold text-white mb-1">
+                    {status.clash ? 'Running' : 'Stopped'}
+                  </div>
+                  <p className="text-xs text-zinc-500 mb-4">Core routing service</p>
+                  <Badge variant="secondary" className={cn(
+                    "rounded-sm px-2 py-0.5 text-xs font-normal border",
+                    status.clash 
+                      ? "bg-blue-500/10 text-blue-400 border-blue-500/20" 
+                      : "bg-zinc-800 text-zinc-500 border-zinc-700"
+                  )}>
+                    {status.clash ? 'ACTIVE' : 'INACTIVE'}
+                  </Badge>
+                </div>
 
                 {/* MultiDesk Card */}
-                <Card className="bg-zinc-900 border-zinc-800 shadow-sm">
-                  <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                    <CardTitle className="text-base font-medium text-white">MultiDesk</CardTitle>
+                <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 shadow-sm">
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-base font-medium text-white">MultiDesk</h3>
                     <ServerIcon className="h-4 w-4 text-cyan-500" />
-                  </CardHeader>
-                  <CardContent>
-                    <div className="text-2xl font-bold text-white mb-1">
-                      {status.multidesk ? 'Connected' : 'Disconnected'}
-                    </div>
-                    <p className="text-xs text-zinc-500 mb-4">RDP acceleration service</p>
-                    <Badge variant="secondary" className={cn(
-                      "rounded-sm px-2 py-0.5 text-xs font-normal border",
-                      status.multidesk 
-                        ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/20" 
-                        : "bg-zinc-800 text-zinc-500 border-zinc-700"
-                    )}>
-                      {status.multidesk ? 'ACTIVE' : 'INACTIVE'}
-                    </Badge>
-                  </CardContent>
-                </Card>
+                  </div>
+                  <div className="text-2xl font-bold text-white mb-1">
+                    {status.multidesk ? 'Connected' : 'Disconnected'}
+                  </div>
+                  <p className="text-xs text-zinc-500 mb-4">RDP acceleration service</p>
+                  <Badge variant="secondary" className={cn(
+                    "rounded-sm px-2 py-0.5 text-xs font-normal border",
+                    status.multidesk 
+                      ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/20" 
+                      : "bg-zinc-800 text-zinc-500 border-zinc-700"
+                  )}>
+                    {status.multidesk ? 'ACTIVE' : 'INACTIVE'}
+                  </Badge>
+                </div>
               </div>
 
               {/* Power Button - Centered */}
