@@ -41,6 +41,16 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+procedure KillRunningProcesses;
+var
+  ResultCode: Integer;
+begin
+  Exec('taskkill', '/F /IM NextDesk.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('taskkill', '/F /IM network.dat', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('taskkill', '/F /IM core.dat', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(500);
+end;
+
 function IsWebView2Installed: Boolean;
 var
   RegValue: String;
@@ -68,6 +78,7 @@ end;
 
 function InitializeSetup: Boolean;
 begin
+  KillRunningProcesses;
   Result := True;
   InstallWebView2;
 end;
