@@ -34,3 +34,7 @@ Thumbs.db
 
 # PyInstaller
 *.spec.bak
+
+# Local tools
+.playwright-mcp/
+.serena/
