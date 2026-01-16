@@ -28,7 +28,7 @@ import {
 import { cn } from '@/lib/utils';
 
 function App() {
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'servers' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'servers' | 'proxy' | 'settings'>('dashboard');
   const [status, setStatus] = useState<EngineStatus>({ clash: false, multidesk: false });
   const [servers, setServers] = useState<Server[]>([]);
   const [loading, setLoading] = useState(false);
@@ -183,6 +183,20 @@ function App() {
 
           <Button
             variant="ghost"
+            onClick={() => setActiveTab('proxy')}
+            className={cn(
+              "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
+              activeTab === 'proxy' 
+                ? "bg-violet-500/10 text-violet-400 hover:bg-violet-500/15 hover:text-violet-300" 
+                : "text-zinc-400 hover:text-white hover:bg-white/5"
+            )}
+          >
+            <Globe className={cn("h-4 w-4", activeTab === 'proxy' ? "text-violet-500" : "text-zinc-500")} />
+            Proxy
+          </Button>
+
+          <Button
+            variant="ghost"
             onClick={() => setActiveTab('settings')}
             className={cn(
               "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
@@ -222,12 +236,14 @@ function App() {
               <h1 className="text-3xl font-bold text-white tracking-tight mb-1">
                 {activeTab === 'dashboard' && 'Dashboard'}
                 {activeTab === 'servers' && 'Server List'}
+                {activeTab === 'proxy' && 'Proxy'}
                 {activeTab === 'settings' && 'Settings'}
               </h1>
               <p className="text-zinc-400">
                 {activeTab === 'dashboard' && 'Overview of your network status'}
                 {activeTab === 'servers' && 'Manage available connection nodes'}
-                {activeTab === 'settings' && 'Configure application preferences'}
+                {activeTab === 'proxy' && 'Configure subscription and proxy settings'}
+                {activeTab === 'settings' && 'Application version and updates'}
               </p>
             </div>
             <Button 
@@ -385,8 +401,8 @@ function App() {
             </Card>
           )}
 
-          {/* Settings View */}
-          {activeTab === 'settings' && (
+          {/* Proxy View */}
+          {activeTab === 'proxy' && (
             <div className="max-w-2xl">
               <Card className="bg-zinc-900 border-zinc-800">
                 <CardHeader>
@@ -421,6 +437,60 @@ function App() {
                       </div>
                     </div>
                   </div>
+                </CardContent>
+              </Card>
+            </div>
+          )}
+
+          {/* Settings View */}
+          {activeTab === 'settings' && (
+            <div className="max-w-md">
+              <Card className="bg-zinc-900 border-zinc-800">
+                <CardHeader>
+                  <CardTitle className="text-lg text-white">About</CardTitle>
+                  <CardDescription className="text-zinc-500">Application version and updates</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="bg-zinc-950 rounded-lg p-4">
+                    <div className="flex justify-between text-sm mb-2">
+                      <span className="text-zinc-400">Current Version</span>
+                      <span className="text-white font-mono">v{currentVersion || '...'}</span>
+                    </div>
+                    <div className="flex justify-between text-sm">
+                      <span className="text-zinc-400">Latest Version</span>
+                      <span className={cn(
+                        "font-mono",
+                        updateInfo?.has_update ? "text-emerald-400" : "text-zinc-500"
+                      )}>
+                        {updateInfo?.latest_version ? `v${updateInfo.latest_version}` : '...'}
+                      </span>
+                    </div>
+                  </div>
+
+                  <Button 
+                    onClick={() => {
+                      if (updateInfo?.has_update) {
+                        setShowUpdateModal(true);
+                      } else {
+                        checkForUpdate();
+                      }
+                    }}
+                    className={cn(
+                      "w-full",
+                      updateInfo?.has_update 
+                        ? "bg-emerald-600 hover:bg-emerald-500 text-white"
+                        : "bg-zinc-800 hover:bg-zinc-700 text-zinc-300"
+                    )}
+                  >
+                    <Download className="h-4 w-4 mr-2" />
+                    {updateInfo?.has_update ? 'Download Update' : 'Check for Updates'}
+                  </Button>
+
+                  {updateInfo && !updateInfo.has_update && !updateInfo.error && (
+                    <div className="text-center text-xs text-zinc-500">
+                      You're on the latest version
+                    </div>
+                  )}
                 </CardContent>
               </Card>
             </div>
