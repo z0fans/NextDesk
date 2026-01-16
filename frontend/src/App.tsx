@@ -40,6 +40,7 @@ function App() {
   const [showUpdateModal, setShowUpdateModal] = useState(false);
   const [currentVersion, setCurrentVersion] = useState('');
   const [subMessage, setSubMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
 
   const fetchData = async () => {
     try {
@@ -362,9 +363,21 @@ function App() {
                        </TableRow>
                     ) : (
                       servers.map((server) => (
-                        <TableRow key={server.id} className="border-zinc-800 hover:bg-zinc-800/50">
+                        <TableRow 
+                          key={server.id} 
+                          onClick={() => setSelectedServerId(server.id)}
+                          className={cn(
+                            "border-zinc-800 cursor-pointer transition-colors",
+                            selectedServerId === server.id 
+                              ? "bg-blue-500/10 hover:bg-blue-500/15" 
+                              : "hover:bg-zinc-800/50"
+                          )}
+                        >
                           <TableCell className="font-medium text-white pl-6">
                             <div className="flex items-center gap-3">
+                              {selectedServerId === server.id && (
+                                <div className="w-1 h-6 bg-blue-500 rounded-full -ml-3 mr-2" />
+                              )}
                               <div className="h-6 w-8 rounded overflow-hidden bg-zinc-800">
                                 <img 
                                   src={`https://flagcdn.com/w80/${server.name.toLowerCase().slice(0, 2) === 'hk' ? 'hk' : server.name.toLowerCase().slice(0, 2) === 'sg' ? 'sg' : 'jp'}.png`} 
@@ -373,7 +386,9 @@ function App() {
                                   alt=""
                                 />
                               </div>
-                              {server.name}
+                              <span className={cn(selectedServerId === server.id && "text-blue-400")}>
+                                {server.name}
+                              </span>
                             </div>
                           </TableCell>
                           <TableCell className="text-zinc-400 font-mono text-xs">{server.host}</TableCell>
