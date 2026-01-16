@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from core.launcher import Launcher
@@ -14,6 +15,23 @@ class Api:
         self._updater = Updater()
         self._servers: list[dict] = []
         self._subscription_url: str = ""
+        self._config_file = Path(__file__).parent / "config.json"
+        self._load_saved_config()
+
+    def _load_saved_config(self):
+        if self._config_file.exists():
+            try:
+                data = json.loads(self._config_file.read_text(encoding="utf-8"))
+                self._subscription_url = data.get("subscription_url", "")
+            except Exception:
+                pass
+
+    def _save_config(self):
+        try:
+            data = {"subscription_url": self._subscription_url}
+            self._config_file.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            pass
 
     def start_engine(self) -> bool:
         return self._launcher.start()
@@ -27,19 +45,34 @@ class Api:
     def get_servers(self) -> list[dict]:
         return self._servers
 
+    def get_subscription_url(self) -> str:
+        return self._subscription_url
+
     def save_config(self, config: dict) -> bool:
         return True
 
-    def load_subscription(self, url: str) -> bool:
-        try:
-            self._subscription_url = url
-            proxies = self._sub_loader.load(url)
-            self._servers = self._transform_proxies_to_servers(proxies)
-            self._config_gen.generate_clash_config(proxies)
-            self._config_gen.generate_multidesk_xml(self._servers)
-            return True
-        except Exception:
-            return False
+    def load_subscription(self, url: str) -> dict:
+        result = self._sub_loader.load(url)
+
+        if not result.success:
+            return {
+                "success": False,
+                "error": result.error,
+                "server_count": 0,
+            }
+
+        self._subscription_url = url
+        self._save_config()
+
+        self._servers = self._transform_proxies_to_servers(result.proxies)
+        self._config_gen.generate_clash_config(result.proxies)
+        self._config_gen.generate_multidesk_xml(self._servers)
+
+        return {
+            "success": True,
+            "error": None,
+            "server_count": len(self._servers),
+        }
 
     def check_for_update(self) -> dict:
         return self._updater.check_for_update()
@@ -64,7 +97,7 @@ class Api:
                     "id": str(i + 1),
                     "name": proxy.get("name", f"Server-{i + 1}"),
                     "host": proxy.get("server", ""),
-                    "port": proxy.get("port", 3389),
+                    "port": 3389,
                     "status": "unknown",
                 }
             )

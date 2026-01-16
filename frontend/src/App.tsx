@@ -39,15 +39,20 @@ function App() {
   const [downloadStatus, setDownloadStatus] = useState<DownloadStatus>({ status: 'idle', progress: 0 });
   const [showUpdateModal, setShowUpdateModal] = useState(false);
   const [currentVersion, setCurrentVersion] = useState('');
+  const [subMessage, setSubMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   const fetchData = async () => {
     try {
-      const [newStatus, newServers] = await Promise.all([
+      const [newStatus, newServers, savedUrl] = await Promise.all([
         api.getStatus(),
-        api.getServers()
+        api.getServers(),
+        api.getSubscriptionUrl()
       ]);
       setStatus(newStatus);
       setServers(newServers);
+      if (savedUrl && !subUrl) {
+        setSubUrl(savedUrl);
+      }
     } catch (error) {
       console.error('Failed to fetch data', error);
     }
@@ -121,14 +126,20 @@ function App() {
   const handleUpdateSubscription = async () => {
     if (!subUrl) return;
     setUpdatingSub(true);
+    setSubMessage(null);
     try {
-      await api.loadSubscription(subUrl);
-      await fetchData();
-      setSubUrl('');
+      const result = await api.loadSubscription(subUrl);
+      if (result.success) {
+        setSubMessage({ type: 'success', text: `Loaded ${result.server_count} servers` });
+        await fetchData();
+      } else {
+        setSubMessage({ type: 'error', text: result.error || 'Failed to load subscription' });
+      }
     } catch (error) {
-      console.error('Failed to update subscription', error);
+      setSubMessage({ type: 'error', text: 'Network error' });
     } finally {
       setUpdatingSub(false);
+      setTimeout(() => setSubMessage(null), 5000);
     }
   };
 
@@ -425,6 +436,17 @@ function App() {
                       {updatingSub ? 'Updating...' : 'Update'}
                     </Button>
                   </div>
+
+                  {subMessage && (
+                    <div className={cn(
+                      "rounded-md p-3 text-sm",
+                      subMessage.type === 'success' 
+                        ? "bg-emerald-500/10 border border-emerald-500/20 text-emerald-400"
+                        : "bg-red-500/10 border border-red-500/20 text-red-400"
+                    )}>
+                      {subMessage.text}
+                    </div>
+                  )}
                   
                   <div className="bg-blue-500/5 border border-blue-500/10 rounded-md p-4">
                     <div className="flex gap-3">

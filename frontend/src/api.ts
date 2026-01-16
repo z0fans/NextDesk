@@ -6,8 +6,9 @@ declare global {
         stop_engine: () => Promise<boolean>;
         get_status: () => Promise<EngineStatus>;
         save_config: (config: Record<string, unknown>) => Promise<boolean>;
-        load_subscription: (url: string) => Promise<boolean>;
+        load_subscription: (url: string) => Promise<SubscriptionResult>;
         get_servers: () => Promise<Server[]>;
+        get_subscription_url: () => Promise<string>;
         check_for_update: () => Promise<UpdateInfo>;
         get_download_status: () => Promise<DownloadStatus>;
         start_download_update: () => Promise<boolean>;
@@ -30,6 +31,12 @@ export interface Server {
   port: number;
   latency?: number;
   status: 'online' | 'offline' | 'unknown';
+}
+
+export interface SubscriptionResult {
+  success: boolean;
+  error: string | null;
+  server_count: number;
 }
 
 export interface UpdateInfo {
@@ -115,9 +122,9 @@ export const api = {
     return window.pywebview.api.save_config(config);
   },
 
-  loadSubscription: async (url: string): Promise<boolean> => {
+  loadSubscription: async (url: string): Promise<SubscriptionResult> => {
     if (!(await ensurePywebview())) {
-      return true;
+      return { success: false, error: 'API not available', server_count: 0 };
     }
     return window.pywebview.api.load_subscription(url);
   },
@@ -127,6 +134,13 @@ export const api = {
       return [];
     }
     return window.pywebview.api.get_servers();
+  },
+
+  getSubscriptionUrl: async (): Promise<string> => {
+    if (!(await ensurePywebview())) {
+      return '';
+    }
+    return window.pywebview.api.get_subscription_url();
   },
 
   checkForUpdate: async (): Promise<UpdateInfo> => {
