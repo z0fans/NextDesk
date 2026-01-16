@@ -85,9 +85,9 @@ function App() {
   const isRunning = status.clash || status.multidesk;
 
   return (
-    <div className="min-h-screen w-full bg-zinc-950 text-foreground font-sans flex overflow-hidden">
+    <div className="min-h-screen w-full bg-zinc-950 text-foreground font-sans flex">
       {/* Sidebar - Fixed Width w-64 */}
-      <aside className="w-64 border-r border-white/5 bg-zinc-950 flex flex-col fixed inset-y-0 left-0 z-50">
+      <aside className="hidden md:flex md:w-64 md:flex-col md:fixed md:inset-y-0 md:left-0 border-r border-white/5 bg-zinc-950 z-50">
         <div className="p-6 flex items-center gap-3 border-b border-white/5">
           <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-blue-600 to-cyan-600 flex items-center justify-center shadow-lg shadow-blue-900/20">
             <Zap className="h-6 w-6 text-white" />
@@ -163,8 +163,8 @@ function App() {
       </aside>
 
       {/* Main Content - Offset ml-64 */}
-      <main className="flex-1 ml-64 h-screen overflow-y-auto bg-zinc-950">
-        <div className="max-w-6xl mx-auto p-8 space-y-8">
+      <main className="flex-1 md:ml-64 min-h-screen bg-zinc-950">
+        <div className="max-w-6xl mx-auto px-6 py-8 md:px-10 md:py-10 space-y-8">
           
           {/* Header */}
           <div className="flex items-center justify-between">

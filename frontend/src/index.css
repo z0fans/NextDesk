@@ -41,10 +41,14 @@
   --sidebar-ring: oklch(0.704 0.04 256.788);
 }
 
-* {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
 }
 
 body {
@@ -52,10 +56,12 @@ body {
   background-color: hsl(var(--background));
   color: hsl(var(--foreground));
   min-height: 100vh;
+  overflow-x: hidden;
 }
 
 #root {
   min-height: 100vh;
+  overflow-x: hidden;
 }
 
 @theme inline {
