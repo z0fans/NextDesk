@@ -41,6 +41,39 @@ function App() {
   const [currentVersion, setCurrentVersion] = useState('');
   const [subMessage, setSubMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
+  const [testingConnectivity, setTestingConnectivity] = useState(false);
+
+  const getCountryCode = (name: string): string => {
+    const lower = name.toLowerCase();
+    if (lower.includes('hong kong') || lower.includes('hongkong') || lower.startsWith('hk ') || lower.includes(' hk ')) return 'hk';
+    if (lower.includes('singapore') || lower.startsWith('sg ') || lower.includes(' sg ')) return 'sg';
+    if (lower.includes('japan') || lower.startsWith('jp ') || lower.includes(' jp ')) return 'jp';
+    if (lower.includes('taiwan') || lower.startsWith('tw ') || lower.includes(' tw ')) return 'tw';
+    if (lower.includes('korea') || lower.startsWith('kr ') || lower.includes(' kr ')) return 'kr';
+    if (lower.includes('united states') || lower.includes('usa') || lower.startsWith('us ') || lower.includes(' us ')) return 'us';
+    if (lower.includes('united kingdom') || lower.startsWith('uk ') || lower.includes(' uk ')) return 'gb';
+    if (lower.includes('germany') || lower.startsWith('de ') || lower.includes(' de ')) return 'de';
+    if (lower.includes('france') || lower.startsWith('fr ') || lower.includes(' fr ')) return 'fr';
+    if (lower.includes('canada') || lower.startsWith('ca ') || lower.includes(' ca ')) return 'ca';
+    if (lower.includes('australia') || lower.startsWith('au ') || lower.includes(' au ')) return 'au';
+    if (lower.includes('india') || lower.startsWith('in ') || lower.includes(' in ')) return 'in';
+    if (lower.includes('russia') || lower.startsWith('ru ') || lower.includes(' ru ')) return 'ru';
+    if (lower.includes('brazil') || lower.startsWith('br ') || lower.includes(' br ')) return 'br';
+    if (lower.includes('netherlands') || lower.startsWith('nl ') || lower.includes(' nl ')) return 'nl';
+    return 'un';
+  };
+
+  const handleTestConnectivity = async () => {
+    setTestingConnectivity(true);
+    try {
+      const updatedServers = await api.testServersConnectivity();
+      setServers(updatedServers);
+    } catch (error) {
+      console.error('Failed to test connectivity', error);
+    } finally {
+      setTestingConnectivity(false);
+    }
+  };
 
   const fetchData = async () => {
     try {
@@ -258,14 +291,29 @@ function App() {
                 {activeTab === 'settings' && 'Application version and updates'}
               </p>
             </div>
-            <Button 
-              variant="outline" 
-              size="icon" 
-              onClick={fetchData} 
-              className="rounded-full h-10 w-10 border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white hover:bg-zinc-800 hover:border-zinc-700"
-            >
-              <RefreshCw className="h-4 w-4" />
-            </Button>
+            {activeTab === 'servers' ? (
+              <Button 
+                variant="outline" 
+                size="icon" 
+                onClick={handleTestConnectivity}
+                disabled={testingConnectivity || servers.length === 0}
+                className={cn(
+                  "rounded-full h-10 w-10 border-zinc-800 bg-zinc-900 hover:bg-zinc-800 hover:border-zinc-700",
+                  testingConnectivity ? "text-yellow-500" : "text-zinc-400 hover:text-yellow-400"
+                )}
+              >
+                <Zap className={cn("h-4 w-4", testingConnectivity && "animate-pulse")} />
+              </Button>
+            ) : (
+              <Button 
+                variant="outline" 
+                size="icon" 
+                onClick={fetchData} 
+                className="rounded-full h-10 w-10 border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white hover:bg-zinc-800 hover:border-zinc-700"
+              >
+                <RefreshCw className="h-4 w-4" />
+              </Button>
+            )}
           </div>
 
           {/* Dashboard View */}
@@ -380,7 +428,7 @@ function App() {
                               )}
                               <div className="h-6 w-8 rounded overflow-hidden bg-zinc-800">
                                 <img 
-                                  src={`https://flagcdn.com/w80/${server.name.toLowerCase().slice(0, 2) === 'hk' ? 'hk' : server.name.toLowerCase().slice(0, 2) === 'sg' ? 'sg' : 'jp'}.png`} 
+                                  src={`https://flagcdn.com/w80/${getCountryCode(server.name)}.png`} 
                                   className="object-cover w-full h-full opacity-80"
                                   onError={(e) => (e.currentTarget.style.display = 'none')}
                                   alt=""

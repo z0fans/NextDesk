@@ -9,6 +9,7 @@ declare global {
         load_subscription: (url: string) => Promise<SubscriptionResult>;
         get_servers: () => Promise<Server[]>;
         get_subscription_url: () => Promise<string>;
+        test_servers_connectivity: () => Promise<Server[]>;
         check_for_update: () => Promise<UpdateInfo>;
         get_download_status: () => Promise<DownloadStatus>;
         start_download_update: () => Promise<boolean>;
@@ -141,6 +142,13 @@ export const api = {
       return '';
     }
     return window.pywebview.api.get_subscription_url();
+  },
+
+  testServersConnectivity: async (): Promise<Server[]> => {
+    if (!(await ensurePywebview())) {
+      return [];
+    }
+    return window.pywebview.api.test_servers_connectivity();
   },
 
   checkForUpdate: async (): Promise<UpdateInfo> => {

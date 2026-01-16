@@ -1,4 +1,6 @@
 import json
+import socket
+import threading
 from pathlib import Path
 
 from core.launcher import Launcher
@@ -98,6 +100,41 @@ class Api:
 
     def get_current_version(self) -> str:
         return self._updater.get_current_version()
+
+    def test_servers_connectivity(self) -> list[dict]:
+        def test_single(server: dict) -> dict:
+            host = server.get("host", "")
+            port = server.get("port", 3389)
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(3)
+                start = __import__("time").time()
+                sock.connect((host, port))
+                latency = int((__import__("time").time() - start) * 1000)
+                sock.close()
+                return {"id": server["id"], "status": "online", "latency": latency}
+            except Exception:
+                return {"id": server["id"], "status": "offline", "latency": None}
+
+        results = []
+        threads = []
+
+        for server in self._servers:
+            t = threading.Thread(target=lambda s=server: results.append(test_single(s)))
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join(timeout=5)
+
+        for result in results:
+            for server in self._servers:
+                if server["id"] == result["id"]:
+                    server["status"] = result["status"]
+                    server["latency"] = result["latency"]
+                    break
+
+        return self._servers
 
     def _transform_proxies_to_servers(self, proxies: list) -> list[dict]:
         servers = []
