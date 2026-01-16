@@ -8,6 +8,11 @@ declare global {
         save_config: (config: Record<string, unknown>) => Promise<boolean>;
         load_subscription: (url: string) => Promise<boolean>;
         get_servers: () => Promise<Server[]>;
+        check_for_update: () => Promise<UpdateInfo>;
+        get_download_status: () => Promise<DownloadStatus>;
+        start_download_update: () => Promise<boolean>;
+        install_update: () => Promise<boolean>;
+        get_current_version: () => Promise<string>;
       };
     };
   }
@@ -25,6 +30,19 @@ export interface Server {
   port: number;
   latency?: number;
   status: 'online' | 'offline' | 'unknown';
+}
+
+export interface UpdateInfo {
+  has_update: boolean;
+  current_version: string;
+  latest_version: string | null;
+  download_url?: string;
+  error?: string;
+}
+
+export interface DownloadStatus {
+  status: 'idle' | 'downloading' | 'ready' | string;
+  progress: number;
 }
 
 // Check if pywebview API is available (may be injected after page load)
@@ -106,9 +124,43 @@ export const api = {
 
   getServers: async (): Promise<Server[]> => {
     if (!(await ensurePywebview())) {
-      // In dev mode without pywebview, return empty array (not mock data)
       return [];
     }
     return window.pywebview.api.get_servers();
+  },
+
+  checkForUpdate: async (): Promise<UpdateInfo> => {
+    if (!(await ensurePywebview())) {
+      return { has_update: false, current_version: 'dev', latest_version: null };
+    }
+    return window.pywebview.api.check_for_update();
+  },
+
+  getDownloadStatus: async (): Promise<DownloadStatus> => {
+    if (!(await ensurePywebview())) {
+      return { status: 'idle', progress: 0 };
+    }
+    return window.pywebview.api.get_download_status();
+  },
+
+  startDownloadUpdate: async (): Promise<boolean> => {
+    if (!(await ensurePywebview())) {
+      return false;
+    }
+    return window.pywebview.api.start_download_update();
+  },
+
+  installUpdate: async (): Promise<boolean> => {
+    if (!(await ensurePywebview())) {
+      return false;
+    }
+    return window.pywebview.api.install_update();
+  },
+
+  getCurrentVersion: async (): Promise<string> => {
+    if (!(await ensurePywebview())) {
+      return 'dev';
+    }
+    return window.pywebview.api.get_current_version();
   },
 };

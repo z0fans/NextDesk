@@ -8,9 +8,11 @@ import {
   Zap, 
   RefreshCw,
   CheckCircle2,
-  Globe
+  Globe,
+  Download,
+  X
 } from 'lucide-react';
-import { api, type EngineStatus, type Server } from './api';
+import { api, type EngineStatus, type Server, type UpdateInfo, type DownloadStatus } from './api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -32,6 +34,11 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [subUrl, setSubUrl] = useState('');
   const [updatingSub, setUpdatingSub] = useState(false);
+  
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [downloadStatus, setDownloadStatus] = useState<DownloadStatus>({ status: 'idle', progress: 0 });
+  const [showUpdateModal, setShowUpdateModal] = useState(false);
+  const [currentVersion, setCurrentVersion] = useState('');
 
   const fetchData = async () => {
     try {
@@ -46,8 +53,51 @@ function App() {
     }
   };
 
+  const checkForUpdate = async () => {
+    try {
+      const [version, info] = await Promise.all([
+        api.getCurrentVersion(),
+        api.checkForUpdate()
+      ]);
+      setCurrentVersion(version);
+      setUpdateInfo(info);
+      if (info.has_update) {
+        setShowUpdateModal(true);
+      }
+    } catch (error) {
+      console.error('Failed to check for update', error);
+    }
+  };
+
+  const pollDownloadStatus = async () => {
+    try {
+      const status = await api.getDownloadStatus();
+      setDownloadStatus(status);
+      return status;
+    } catch (error) {
+      console.error('Failed to get download status', error);
+      return { status: 'idle', progress: 0 };
+    }
+  };
+
+  const handleStartDownload = async () => {
+    await api.startDownloadUpdate();
+    const interval = setInterval(async () => {
+      const status = await pollDownloadStatus();
+      if (status.status === 'ready' || status.status.startsWith('error')) {
+        clearInterval(interval);
+      }
+    }, 500);
+  };
+
+  const handleInstallUpdate = async () => {
+    await api.installUpdate();
+    window.close();
+  };
+
   useEffect(() => {
     fetchData();
+    checkForUpdate();
     const interval = setInterval(fetchData, 5000);
     return () => clearInterval(interval);
   }, []);
@@ -378,6 +428,83 @@ function App() {
 
         </div>
       </main>
+
+      {/* Update Modal */}
+      {showUpdateModal && updateInfo?.has_update && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-[100]">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 w-full max-w-md mx-4 shadow-2xl">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-3">
+                <div className="h-10 w-10 rounded-lg bg-gradient-to-br from-emerald-600 to-cyan-600 flex items-center justify-center">
+                  <Download className="h-5 w-5 text-white" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold text-white">Update Available</h3>
+                  <p className="text-xs text-zinc-500">A new version is ready to install</p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setShowUpdateModal(false)}
+                className="text-zinc-500 hover:text-white transition-colors"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="bg-zinc-950 rounded-lg p-4 mb-4">
+              <div className="flex justify-between text-sm mb-2">
+                <span className="text-zinc-400">Current Version</span>
+                <span className="text-white font-mono">v{currentVersion}</span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-zinc-400">Latest Version</span>
+                <span className="text-emerald-400 font-mono">v{updateInfo.latest_version}</span>
+              </div>
+            </div>
+
+            {downloadStatus.status === 'idle' && (
+              <Button 
+                onClick={handleStartDownload}
+                className="w-full bg-emerald-600 hover:bg-emerald-500 text-white"
+              >
+                <Download className="h-4 w-4 mr-2" />
+                Download Update
+              </Button>
+            )}
+
+            {downloadStatus.status === 'downloading' && (
+              <div className="space-y-2">
+                <div className="flex justify-between text-sm text-zinc-400">
+                  <span>Downloading...</span>
+                  <span>{Math.round(downloadStatus.progress)}%</span>
+                </div>
+                <div className="h-2 bg-zinc-800 rounded-full overflow-hidden">
+                  <div 
+                    className="h-full bg-gradient-to-r from-emerald-600 to-cyan-600 transition-all duration-300"
+                    style={{ width: `${downloadStatus.progress}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {downloadStatus.status === 'ready' && (
+              <Button 
+                onClick={handleInstallUpdate}
+                className="w-full bg-blue-600 hover:bg-blue-500 text-white"
+              >
+                <CheckCircle2 className="h-4 w-4 mr-2" />
+                Install and Restart
+              </Button>
+            )}
+
+            {downloadStatus.status.startsWith('error') && (
+              <div className="text-red-400 text-sm text-center">
+                Download failed. Please try again later.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
