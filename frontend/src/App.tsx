@@ -398,9 +398,11 @@ function App() {
                               "border-0 bg-opacity-10",
                               server.status === 'online' 
                                 ? "bg-emerald-500 text-emerald-500" 
+                                : server.status === 'unknown'
+                                ? "bg-zinc-500 text-zinc-400"
                                 : "bg-red-500 text-red-500"
                             )}>
-                              {server.status === 'online' ? 'Online' : 'Offline'}
+                              {server.status === 'online' ? 'Online' : server.status === 'unknown' ? 'Unknown' : 'Offline'}
                             </Badge>
                           </TableCell>
                         </TableRow>

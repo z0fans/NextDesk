@@ -24,7 +24,7 @@ class SubscriptionLoader:
             response = requests.get(
                 url.strip(),
                 timeout=15,
-                headers={"User-Agent": "ClashForWindows/0.20.0"},
+                headers={"User-Agent": "clash-verge/v1.7.7"},
             )
             response.raise_for_status()
         except requests.exceptions.Timeout:
