@@ -24,7 +24,7 @@ class Api:
     def _ensure_default_configs(self):
         multidesk_path = Path(__file__).parent / "MultiDesk.multidesk"
         if not multidesk_path.exists():
-            self._config_gen.generate_multidesk_xml([])
+            self._config_gen.generate_multidesk_xml()
 
         clash_path = Path(__file__).parent / "runtime_clash.yaml"
         if not clash_path.exists():
