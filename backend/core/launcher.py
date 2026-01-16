@@ -1,6 +1,8 @@
 import subprocess
 import sys
 import os
+import threading
+import time
 from pathlib import Path
 
 CREATION_FLAGS = (
@@ -15,12 +17,16 @@ class Launcher:
         else:
             base_path = Path(__file__).parent.parent
         self._bin_dir = base_path / "bin"
+        self._config_dir = base_path
         self._clash_proc = None
         self._multidesk_proc = None
+        self._title_hijack_thread = None
+        self._stop_hijack = False
 
     def start(self) -> bool:
         try:
             self._start_clash()
+            time.sleep(1)
             self._start_multidesk()
             return True
         except Exception as e:
@@ -29,6 +35,7 @@ class Launcher:
 
     def stop(self) -> bool:
         try:
+            self._stop_hijack = True
             if self._clash_proc:
                 self._clash_proc.terminate()
                 self._clash_proc = None
@@ -50,7 +57,7 @@ class Launcher:
     def _start_clash(self):
         network_path = self._bin_dir / "network.dat"
         if network_path.exists():
-            config_path = self._bin_dir.parent / "runtime_clash.yaml"
+            config_path = self._config_dir / "runtime_clash.yaml"
             args = [str(network_path)]
             if config_path.exists():
                 args.extend(["-f", str(config_path)])
@@ -62,11 +69,69 @@ class Launcher:
 
     def _start_multidesk(self):
         core_path = self._bin_dir / "core.dat"
-        if core_path.exists():
-            env = os.environ.copy()
-            self._multidesk_proc = subprocess.Popen(
-                [str(core_path)],
-                creationflags=0 if sys.platform == "win32" else 0,
-                cwd=str(self._bin_dir),
-                env=env,
+        if not core_path.exists():
+            print(f"MultiDesk not found: {core_path}")
+            return
+
+        config_path = self._config_dir / "MultiDesk.multidesk"
+        args = [str(core_path)]
+        if config_path.exists():
+            args.append(str(config_path))
+
+        env = os.environ.copy()
+        self._multidesk_proc = subprocess.Popen(
+            args,
+            creationflags=0,
+            cwd=str(self._bin_dir),
+            env=env,
+        )
+
+        if sys.platform == "win32":
+            self._stop_hijack = False
+            self._title_hijack_thread = threading.Thread(
+                target=self._hijack_window_title, daemon=True
             )
+            self._title_hijack_thread.start()
+
+    def _hijack_window_title(self):
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            EnumWindows = user32.EnumWindows
+            GetWindowTextW = user32.GetWindowTextW
+            SetWindowTextW = user32.SetWindowTextW
+            GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+
+            WNDENUMPROC = ctypes.WINFUNCTYPE(
+                wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+            )
+
+            target_pid = self._multidesk_proc.pid if self._multidesk_proc else 0
+            target_title = "NextDesk Workspace"
+
+            def enum_callback(hwnd, lParam):
+                pid = wintypes.DWORD()
+                GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value == target_pid:
+                    buf = ctypes.create_unicode_buffer(256)
+                    GetWindowTextW(hwnd, buf, 256)
+                    current_title = buf.value
+                    if current_title and current_title != target_title:
+                        if (
+                            "multidesk" in current_title.lower()
+                            or "syvik" in current_title.lower()
+                        ):
+                            SetWindowTextW(hwnd, target_title)
+                return True
+
+            callback = WNDENUMPROC(enum_callback)
+
+            for _ in range(100):
+                if self._stop_hijack:
+                    break
+                EnumWindows(callback, 0)
+                time.sleep(0.5)
+        except Exception as e:
+            print(f"Title hijack error: {e}")

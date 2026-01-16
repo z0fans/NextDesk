@@ -27,51 +27,88 @@ export interface Server {
   status: 'online' | 'offline' | 'unknown';
 }
 
-const isDev = !window.pywebview;
+// Check if pywebview API is available (may be injected after page load)
+const hasPywebview = (): boolean => {
+  return !!(window.pywebview?.api);
+};
 
-const mockStatus: EngineStatus = { clash: false, multidesk: false };
-const mockServers: Server[] = [
-  { id: '1', name: 'Tokyo-01', host: '103.x.x.1', port: 3389, latency: 45, status: 'online' },
-  { id: '2', name: 'Singapore-02', host: '103.x.x.2', port: 3389, latency: 68, status: 'online' },
-  { id: '3', name: 'HongKong-03', host: '103.x.x.3', port: 3389, status: 'offline' },
-];
+// Wait for pywebview to be ready (with timeout)
+const waitForPywebview = (): Promise<boolean> => {
+  return new Promise((resolve) => {
+    if (hasPywebview()) {
+      resolve(true);
+      return;
+    }
+    
+    // Check every 100ms for up to 3 seconds
+    let attempts = 0;
+    const maxAttempts = 30;
+    const interval = setInterval(() => {
+      attempts++;
+      if (hasPywebview()) {
+        clearInterval(interval);
+        resolve(true);
+      } else if (attempts >= maxAttempts) {
+        clearInterval(interval);
+        resolve(false);
+      }
+    }, 100);
+  });
+};
+
+// Initialize: wait for pywebview on first call
+let pywebviewReady: boolean | null = null;
+
+const ensurePywebview = async (): Promise<boolean> => {
+  if (pywebviewReady === null) {
+    pywebviewReady = await waitForPywebview();
+    console.log('[NextDesk] pywebview ready:', pywebviewReady);
+  }
+  return pywebviewReady;
+};
 
 export const api = {
   startEngine: async (): Promise<boolean> => {
-    if (isDev) {
-      mockStatus.clash = true;
-      mockStatus.multidesk = true;
+    if (!(await ensurePywebview())) {
+      console.warn('[NextDesk] pywebview not available, using mock');
       return true;
     }
     return window.pywebview.api.start_engine();
   },
 
   stopEngine: async (): Promise<boolean> => {
-    if (isDev) {
-      mockStatus.clash = false;
-      mockStatus.multidesk = false;
+    if (!(await ensurePywebview())) {
       return true;
     }
     return window.pywebview.api.stop_engine();
   },
 
   getStatus: async (): Promise<EngineStatus> => {
-    if (isDev) return mockStatus;
+    if (!(await ensurePywebview())) {
+      return { clash: false, multidesk: false };
+    }
     return window.pywebview.api.get_status();
   },
 
   saveConfig: async (config: Record<string, unknown>): Promise<boolean> => {
-    if (isDev) return true;
+    if (!(await ensurePywebview())) {
+      return true;
+    }
     return window.pywebview.api.save_config(config);
   },
 
   loadSubscription: async (url: string): Promise<boolean> => {
-    if (isDev) return true;
+    if (!(await ensurePywebview())) {
+      return true;
+    }
     return window.pywebview.api.load_subscription(url);
   },
 
   getServers: async (): Promise<Server[]> => {
-    if (isDev) return mockServers;
+    if (!(await ensurePywebview())) {
+      // In dev mode without pywebview, return empty array (not mock data)
+      return [];
+    }
     return window.pywebview.api.get_servers();
   },
 };
