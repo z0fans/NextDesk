@@ -8,10 +8,7 @@ import {
   Zap, 
   RefreshCw,
   CheckCircle2,
-  Globe,
-  Shield,
-  Radio,
-  ChevronRight
+  Globe
 } from 'lucide-react';
 import { api, type EngineStatus, type Server } from './api';
 import { Button } from '@/components/ui/button';
@@ -88,76 +85,76 @@ function App() {
   const isRunning = status.clash || status.multidesk;
 
   return (
-    <div className="flex h-screen w-full bg-[#030303] text-foreground font-sans selection:bg-cyan-500/30 overflow-hidden relative">
-      {/* Background Effects */}
-      <div className="fixed inset-0 z-0 pointer-events-none">
-        <div className="absolute top-[-20%] left-[-10%] w-[50%] h-[50%] rounded-full bg-blue-900/10 blur-[120px]" />
-        <div className="absolute bottom-[-20%] right-[-10%] w-[50%] h-[50%] rounded-full bg-cyan-900/10 blur-[120px]" />
-        <div className="absolute inset-0 bg-grid-pattern opacity-[0.15]" />
-      </div>
-
-      {/* Sidebar */}
-      <aside className="w-72 border-r border-white/5 bg-black/40 backdrop-blur-2xl flex flex-col fixed inset-y-0 left-0 z-50 transition-all duration-300">
-        <div className="p-8 flex items-center gap-4">
-          <div className="relative">
-            <div className="absolute inset-0 bg-gradient-to-br from-blue-500 to-cyan-500 blur-lg opacity-40 rounded-xl" />
-            <div className="relative h-10 w-10 rounded-xl bg-gradient-to-br from-blue-500 to-cyan-500 flex items-center justify-center shadow-inner shadow-white/20">
-              <Zap className="h-6 w-6 text-white" />
-            </div>
+    <div className="min-h-screen w-full bg-zinc-950 text-foreground font-sans flex overflow-hidden">
+      {/* Sidebar - Fixed Width w-64 */}
+      <aside className="w-64 border-r border-white/5 bg-zinc-950 flex flex-col fixed inset-y-0 left-0 z-50">
+        <div className="p-6 flex items-center gap-3 border-b border-white/5">
+          <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-blue-600 to-cyan-600 flex items-center justify-center shadow-lg shadow-blue-900/20">
+            <Zap className="h-6 w-6 text-white" />
           </div>
           <div>
-            <span className="font-bold text-xl tracking-tight bg-gradient-to-r from-white via-white to-white/60 bg-clip-text text-transparent block">
+            <span className="font-bold text-lg text-white block leading-none mb-1">
               NextDesk
             </span>
-            <span className="text-[10px] font-medium text-blue-400 tracking-wider uppercase">Network Accelerator</span>
+            <span className="text-[10px] font-medium text-zinc-500 uppercase tracking-wider block leading-none">
+              Accelerator
+            </span>
           </div>
         </div>
 
-        <nav className="flex-1 px-4 py-6 space-y-2">
-          {[
-            { id: 'dashboard', icon: LayoutDashboard, label: 'Dashboard', color: 'blue' },
-            { id: 'servers', icon: ServerIcon, label: 'Servers', color: 'cyan' },
-            { id: 'settings', icon: Settings, label: 'Settings', color: 'emerald' },
-          ].map((item) => (
-            <Button
-              key={item.id}
-              variant="ghost"
-              onClick={() => setActiveTab(item.id as any)}
-              className={cn(
-                "w-full justify-start gap-3 h-12 text-base font-medium transition-all duration-300 relative overflow-hidden group",
-                activeTab === item.id 
-                  ? `bg-${item.color}-500/10 text-${item.color}-400 shadow-[0_0_20px_rgba(0,0,0,0.2)]` 
-                  : "text-zinc-400 hover:text-white hover:bg-white/5"
-              )}
-            >
-              <div className={cn(
-                "absolute left-0 top-0 bottom-0 w-1 transition-all duration-300",
-                activeTab === item.id ? `bg-${item.color}-500` : "bg-transparent group-hover:bg-white/10"
-              )} />
-              <item.icon className={cn("h-5 w-5 transition-colors", activeTab === item.id ? `text-${item.color}-500` : "text-zinc-500 group-hover:text-zinc-300")} />
-              {item.label}
-              {activeTab === item.id && (
-                <div className={cn(
-                  "absolute right-4 h-2 w-2 rounded-full shadow-[0_0_10px_currentColor]", 
-                  `bg-${item.color}-500`
-                )} />
-              )}
-            </Button>
-          ))}
+        <nav className="flex-1 px-3 py-6 space-y-1">
+          <Button
+            variant="ghost"
+            onClick={() => setActiveTab('dashboard')}
+            className={cn(
+              "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
+              activeTab === 'dashboard' 
+                ? "bg-blue-500/10 text-blue-400 hover:bg-blue-500/15 hover:text-blue-300" 
+                : "text-zinc-400 hover:text-white hover:bg-white/5"
+            )}
+          >
+            <LayoutDashboard className={cn("h-4 w-4", activeTab === 'dashboard' ? "text-blue-500" : "text-zinc-500")} />
+            Dashboard
+          </Button>
+
+          <Button
+            variant="ghost"
+            onClick={() => setActiveTab('servers')}
+            className={cn(
+              "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
+              activeTab === 'servers' 
+                ? "bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/15 hover:text-cyan-300" 
+                : "text-zinc-400 hover:text-white hover:bg-white/5"
+            )}
+          >
+            <ServerIcon className={cn("h-4 w-4", activeTab === 'servers' ? "text-cyan-500" : "text-zinc-500")} />
+            Servers
+          </Button>
+
+          <Button
+            variant="ghost"
+            onClick={() => setActiveTab('settings')}
+            className={cn(
+              "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
+              activeTab === 'settings' 
+                ? "bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/15 hover:text-emerald-300" 
+                : "text-zinc-400 hover:text-white hover:bg-white/5"
+            )}
+          >
+            <Settings className={cn("h-4 w-4", activeTab === 'settings' ? "text-emerald-500" : "text-zinc-500")} />
+            Settings
+          </Button>
         </nav>
 
         <div className="p-4 border-t border-white/5">
-          <div className="bg-gradient-to-br from-zinc-900/80 to-black/80 rounded-xl p-4 border border-white/5 backdrop-blur-md relative overflow-hidden group">
-            <div className="absolute inset-0 bg-gradient-to-r from-blue-500/5 to-cyan-500/5 opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
-            <div className="flex items-center justify-between mb-3 relative z-10">
-              <span className="text-xs font-medium text-zinc-400 uppercase tracking-wider">Engine Status</span>
-              <div className={cn("h-2 w-2 rounded-full shadow-[0_0_8px_currentColor] transition-colors duration-500", isRunning ? 'bg-emerald-500 text-emerald-500 animate-pulse' : 'bg-zinc-700 text-zinc-700')} />
+          <div className="bg-zinc-900 rounded-lg p-3 border border-zinc-800">
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider">Status</span>
+              <div className={cn("h-1.5 w-1.5 rounded-full transition-colors", isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-zinc-700')} />
             </div>
-            <div className="flex items-center gap-2 relative z-10">
-              <div className={cn("p-1.5 rounded-lg", isRunning ? "bg-emerald-500/10" : "bg-zinc-800")}>
-                <Activity className={cn("h-4 w-4", isRunning ? "text-emerald-500" : "text-zinc-500")} />
-              </div>
-              <div className="text-sm font-semibold text-white">
+            <div className="flex items-center gap-2">
+              <Activity className={cn("h-3.5 w-3.5", isRunning ? "text-emerald-500" : "text-zinc-600")} />
+              <div className="text-sm font-medium text-white">
                 {isRunning ? 'System Active' : 'System Idle'}
               </div>
             </div>
@@ -165,207 +162,177 @@ function App() {
         </div>
       </aside>
 
-      {/* Main Content */}
-      <main className="flex-1 ml-72 p-10 relative z-10 overflow-y-auto h-full">
-        <div className="max-w-6xl mx-auto space-y-10">
+      {/* Main Content - Offset ml-64 */}
+      <main className="flex-1 ml-64 h-screen overflow-y-auto bg-zinc-950">
+        <div className="max-w-6xl mx-auto p-8 space-y-8">
           
           {/* Header */}
-          <div className="flex items-center justify-between gap-4">
-            <div className="space-y-1 flex-1 min-w-0">
-              <h1 className="text-4xl font-bold text-white tracking-tight">
-                {activeTab.charAt(0).toUpperCase() + activeTab.slice(1)}
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-3xl font-bold text-white tracking-tight mb-1">
+                {activeTab === 'dashboard' && 'Dashboard'}
+                {activeTab === 'servers' && 'Server List'}
+                {activeTab === 'settings' && 'Settings'}
               </h1>
-              <p className="text-zinc-400 text-lg truncate">Manage your network acceleration environment</p>
+              <p className="text-zinc-400">
+                {activeTab === 'dashboard' && 'Overview of your network status'}
+                {activeTab === 'servers' && 'Manage available connection nodes'}
+                {activeTab === 'settings' && 'Configure application preferences'}
+              </p>
             </div>
             <Button 
               variant="outline" 
               size="icon" 
               onClick={fetchData} 
-              className="rounded-full h-12 w-12 border-white/10 bg-white/5 hover:bg-white/10 hover:border-white/20 text-white shadow-lg transition-all duration-300 hover:rotate-180 shrink-0"
+              className="rounded-full h-10 w-10 border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white hover:bg-zinc-800 hover:border-zinc-700"
             >
-              <RefreshCw className="h-5 w-5" />
+              <RefreshCw className="h-4 w-4" />
             </Button>
           </div>
 
           {/* Dashboard View */}
           {activeTab === 'dashboard' && (
-            <div className="space-y-12 animate-in fade-in slide-in-from-bottom-8 duration-700">
+            <div className="space-y-10">
               
-              {/* Status Cards */}
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+              {/* Status Cards - Grid Layout */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                
                 {/* Clash Card */}
-                <Card className="bg-zinc-900/40 border-white/5 backdrop-blur-md overflow-hidden relative group hover:border-blue-500/30 transition-all duration-500">
-                  <div className="absolute inset-0 bg-gradient-to-br from-blue-500/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
-                  <CardHeader className="relative z-10">
-                    <CardTitle className="flex items-center gap-3 text-white text-xl">
-                      <div className="p-2 rounded-lg bg-blue-500/10 text-blue-400">
-                        <Globe className="h-6 w-6" />
-                      </div>
-                      Clash Engine
-                    </CardTitle>
-                    <CardDescription className="text-zinc-400 text-base">Core routing engine status</CardDescription>
+                <Card className="bg-zinc-900 border-zinc-800 shadow-sm">
+                  <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                    <CardTitle className="text-base font-medium text-white">Clash Engine</CardTitle>
+                    <Globe className="h-4 w-4 text-blue-500" />
                   </CardHeader>
-                  <CardContent className="relative z-10">
-                    <div className="flex items-center justify-between mt-2">
-                      <div className="flex items-center gap-3">
-                        <Badge variant="outline" className={cn("text-sm px-3 py-1.5 border transition-colors duration-300", 
-                          status.clash 
-                            ? 'bg-blue-500/10 text-blue-400 border-blue-500/30 shadow-[0_0_15px_rgba(59,130,246,0.2)]' 
-                            : 'bg-zinc-800/50 text-zinc-500 border-zinc-700'
-                        )}>
-                          {status.clash ? 'RUNNING' : 'STOPPED'}
-                        </Badge>
-                        {status.clash && <span className="text-xs text-blue-400/80 animate-pulse">● Active</span>}
-                      </div>
-                      <Shield className={cn("h-8 w-8 opacity-20 transition-colors duration-500", status.clash ? 'text-blue-500' : 'text-zinc-500')} />
+                  <CardContent>
+                    <div className="text-2xl font-bold text-white mb-1">
+                      {status.clash ? 'Running' : 'Stopped'}
                     </div>
+                    <p className="text-xs text-zinc-500 mb-4">Core routing service</p>
+                    <Badge variant="secondary" className={cn(
+                      "rounded-sm px-2 py-0.5 text-xs font-normal border",
+                      status.clash 
+                        ? "bg-blue-500/10 text-blue-400 border-blue-500/20" 
+                        : "bg-zinc-800 text-zinc-500 border-zinc-700"
+                    )}>
+                      {status.clash ? 'ACTIVE' : 'INACTIVE'}
+                    </Badge>
                   </CardContent>
                 </Card>
 
                 {/* MultiDesk Card */}
-                <Card className="bg-zinc-900/40 border-white/5 backdrop-blur-md overflow-hidden relative group hover:border-cyan-500/30 transition-all duration-500">
-                  <div className="absolute inset-0 bg-gradient-to-br from-cyan-500/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
-                  <CardHeader className="relative z-10">
-                    <CardTitle className="flex items-center gap-3 text-white text-xl">
-                      <div className="p-2 rounded-lg bg-cyan-500/10 text-cyan-400">
-                        <ServerIcon className="h-6 w-6" />
-                      </div>
-                      MultiDesk
-                    </CardTitle>
-                    <CardDescription className="text-zinc-400 text-base">RDP acceleration service</CardDescription>
+                <Card className="bg-zinc-900 border-zinc-800 shadow-sm">
+                  <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                    <CardTitle className="text-base font-medium text-white">MultiDesk</CardTitle>
+                    <ServerIcon className="h-4 w-4 text-cyan-500" />
                   </CardHeader>
-                  <CardContent className="relative z-10">
-                    <div className="flex items-center justify-between mt-2">
-                      <div className="flex items-center gap-3">
-                        <Badge variant="outline" className={cn("text-sm px-3 py-1.5 border transition-colors duration-300", 
-                          status.multidesk 
-                            ? 'bg-cyan-500/10 text-cyan-400 border-cyan-500/30 shadow-[0_0_15px_rgba(6,182,212,0.2)]' 
-                            : 'bg-zinc-800/50 text-zinc-500 border-zinc-700'
-                        )}>
-                          {status.multidesk ? 'ACTIVE' : 'INACTIVE'}
-                        </Badge>
-                        {status.multidesk && <span className="text-xs text-cyan-400/80 animate-pulse">● Connected</span>}
-                      </div>
-                      <Radio className={cn("h-8 w-8 opacity-20 transition-colors duration-500", status.multidesk ? 'text-cyan-500' : 'text-zinc-500')} />
+                  <CardContent>
+                    <div className="text-2xl font-bold text-white mb-1">
+                      {status.multidesk ? 'Connected' : 'Disconnected'}
                     </div>
+                    <p className="text-xs text-zinc-500 mb-4">RDP acceleration service</p>
+                    <Badge variant="secondary" className={cn(
+                      "rounded-sm px-2 py-0.5 text-xs font-normal border",
+                      status.multidesk 
+                        ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/20" 
+                        : "bg-zinc-800 text-zinc-500 border-zinc-700"
+                    )}>
+                      {status.multidesk ? 'ACTIVE' : 'INACTIVE'}
+                    </Badge>
                   </CardContent>
                 </Card>
               </div>
 
-              {/* Power Button */}
-              <div className="flex justify-center py-8">
-                <div className="relative group">
-                  <div className={cn("absolute inset-0 rounded-full blur-[80px] transition-all duration-700", 
-                    isRunning ? 'bg-blue-600/30 group-hover:bg-blue-600/40' : 'bg-transparent'
-                  )} />
-                  <div className={cn("absolute inset-0 rounded-full blur-3xl transition-all duration-700 opacity-50", 
-                    isRunning ? 'bg-cyan-500/20' : 'bg-zinc-800/10'
-                  )} />
-                  
-                  <button
+              {/* Power Button - Centered */}
+              <div className="flex justify-center py-4">
+                 <button
                     onClick={handleToggleEngine}
                     disabled={loading}
                     className={cn(
-                      "relative w-56 h-56 rounded-full flex flex-col items-center justify-center gap-4 transition-all duration-500 border-[6px]",
+                      "group relative w-40 h-40 rounded-full flex flex-col items-center justify-center transition-all duration-300 border-4",
                       isRunning 
-                        ? 'bg-gradient-to-b from-zinc-900 to-black border-blue-500/50 shadow-[0_0_60px_rgba(59,130,246,0.3),inset_0_0_20px_rgba(59,130,246,0.2)] hover:scale-105 active:scale-95' 
-                        : 'bg-zinc-900 border-zinc-800 hover:border-zinc-700 hover:bg-zinc-800 shadow-xl hover:scale-105 active:scale-95'
+                        ? 'bg-zinc-900 border-blue-500/50 shadow-[0_0_40px_rgba(59,130,246,0.2)]' 
+                        : 'bg-zinc-900 border-zinc-800 hover:border-zinc-700'
                     )}
                   >
-                    <div className={cn("absolute inset-2 rounded-full border border-white/5")} />
-                    
-                    <Power className={cn("h-20 w-20 transition-all duration-500", 
-                      isRunning ? 'text-blue-500 drop-shadow-[0_0_15px_rgba(59,130,246,1)]' : 'text-zinc-600'
+                    <Power className={cn("h-12 w-12 mb-2 transition-colors duration-300", 
+                      isRunning ? 'text-blue-500' : 'text-zinc-600 group-hover:text-zinc-500'
                     )} />
-                    
-                    <div className="flex flex-col items-center">
-                      <span className={cn("text-2xl font-bold tracking-widest transition-all duration-500", 
-                        isRunning ? 'text-blue-400 drop-shadow-[0_0_8px_rgba(59,130,246,0.8)]' : 'text-zinc-600'
-                      )}>
-                        {loading ? '...' : isRunning ? 'ON' : 'OFF'}
-                      </span>
-                      {isRunning && (
-                        <span className="text-[10px] text-blue-500/60 font-medium tracking-widest uppercase mt-1 animate-pulse">
-                          Accelerating
-                        </span>
-                      )}
-                    </div>
+                    <span className={cn("text-sm font-bold tracking-widest transition-colors duration-300", 
+                      isRunning ? 'text-blue-400' : 'text-zinc-600 group-hover:text-zinc-500'
+                    )}>
+                      {loading ? '...' : isRunning ? 'ON' : 'OFF'}
+                    </span>
                   </button>
-                </div>
               </div>
             </div>
           )}
 
           {/* Servers View */}
           {activeTab === 'servers' && (
-            <Card className="bg-zinc-900/40 border-white/5 backdrop-blur-md animate-in fade-in slide-in-from-bottom-8 duration-700 overflow-hidden">
+            <Card className="bg-zinc-900 border-zinc-800">
               <CardContent className="p-0">
                 <Table>
                   <TableHeader>
-                    <TableRow className="hover:bg-white/5 border-white/5 bg-white/[0.02]">
-                      <TableHead className="text-zinc-400 pl-6 h-14">Server Name</TableHead>
-                      <TableHead className="text-zinc-400 h-14">Host</TableHead>
-                      <TableHead className="text-zinc-400 h-14">Latency</TableHead>
-                      <TableHead className="text-zinc-400 h-14">Status</TableHead>
-                      <TableHead className="text-zinc-400 h-14 text-right pr-6">Action</TableHead>
+                    <TableRow className="border-zinc-800 hover:bg-transparent">
+                      <TableHead className="text-zinc-500 pl-6">Server Name</TableHead>
+                      <TableHead className="text-zinc-500">Host</TableHead>
+                      <TableHead className="text-zinc-500">Latency</TableHead>
+                      <TableHead className="text-zinc-500">Status</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {servers.map((server, i) => (
-                      <TableRow key={server.id} className="hover:bg-white/5 border-white/5 transition-colors group" style={{ animationDelay: `${i * 50}ms` }}>
-                        <TableCell className="font-medium text-white pl-6 py-4">
-                          <div className="flex items-center gap-3">
-                            <div className="h-8 w-10 relative overflow-hidden rounded shadow-sm">
-                              <img 
-                                src={`https://flagcdn.com/w80/${server.name.toLowerCase().slice(0, 2) === 'hk' ? 'hk' : server.name.toLowerCase().slice(0, 2) === 'sg' ? 'sg' : 'jp'}.png`} 
-                                className="object-cover w-full h-full opacity-90"
-                                onError={(e) => (e.currentTarget.style.display = 'none')}
-                                alt=""
-                              />
-                            </div>
-                            <span className="group-hover:text-blue-400 transition-colors">{server.name}</span>
-                          </div>
-                        </TableCell>
-                        <TableCell className="text-zinc-400 font-mono text-xs">{server.host}</TableCell>
-                        <TableCell>
-                          {server.latency ? (
-                            <div className="flex items-center gap-2">
-                              <div className={cn("w-16 h-1.5 rounded-full bg-zinc-800 overflow-hidden")}>
-                                <div 
-                                  className={cn("h-full rounded-full", 
-                                    server.latency < 100 ? 'bg-emerald-500' : server.latency < 200 ? 'bg-yellow-500' : 'bg-red-500'
-                                  )} 
-                                  style={{ width: `${Math.min(100, (server.latency / 300) * 100)}%` }}
+                    {servers.length === 0 ? (
+                       <TableRow className="border-zinc-800 hover:bg-transparent">
+                         <TableCell colSpan={4} className="h-24 text-center text-zinc-500">
+                           No servers available
+                         </TableCell>
+                       </TableRow>
+                    ) : (
+                      servers.map((server) => (
+                        <TableRow key={server.id} className="border-zinc-800 hover:bg-zinc-800/50">
+                          <TableCell className="font-medium text-white pl-6">
+                            <div className="flex items-center gap-3">
+                              <div className="h-6 w-8 rounded overflow-hidden bg-zinc-800">
+                                <img 
+                                  src={`https://flagcdn.com/w80/${server.name.toLowerCase().slice(0, 2) === 'hk' ? 'hk' : server.name.toLowerCase().slice(0, 2) === 'sg' ? 'sg' : 'jp'}.png`} 
+                                  className="object-cover w-full h-full opacity-80"
+                                  onError={(e) => (e.currentTarget.style.display = 'none')}
+                                  alt=""
                                 />
                               </div>
-                              <span className={cn("text-xs font-bold", 
-                                server.latency < 100 ? 'text-emerald-400' : server.latency < 200 ? 'text-yellow-400' : 'text-red-400'
-                              )}>
-                                {server.latency}ms
-                              </span>
+                              {server.name}
                             </div>
-                          ) : (
-                            <span className="text-zinc-600 text-xs">-</span>
-                          )}
-                        </TableCell>
-                        <TableCell>
-                          {server.status === 'online' ? (
-                            <Badge variant="outline" className="bg-emerald-500/10 text-emerald-500 border-emerald-500/20 hover:bg-emerald-500/20">
-                              Online
+                          </TableCell>
+                          <TableCell className="text-zinc-400 font-mono text-xs">{server.host}</TableCell>
+                          <TableCell>
+                            {server.latency ? (
+                              <div className="flex items-center gap-2">
+                                <div className={cn("w-1.5 h-1.5 rounded-full", 
+                                  server.latency < 100 ? 'bg-emerald-500' : server.latency < 200 ? 'bg-yellow-500' : 'bg-red-500'
+                                )} />
+                                <span className={cn("text-xs font-medium", 
+                                  server.latency < 100 ? 'text-emerald-500' : server.latency < 200 ? 'text-yellow-500' : 'text-red-500'
+                                )}>
+                                  {server.latency}ms
+                                </span>
+                              </div>
+                            ) : (
+                              <span className="text-zinc-600 text-xs">-</span>
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            <Badge variant="outline" className={cn(
+                              "border-0 bg-opacity-10",
+                              server.status === 'online' 
+                                ? "bg-emerald-500 text-emerald-500" 
+                                : "bg-red-500 text-red-500"
+                            )}>
+                              {server.status === 'online' ? 'Online' : 'Offline'}
                             </Badge>
-                          ) : (
-                            <Badge variant="outline" className="bg-red-500/10 text-red-500 border-red-500/20 hover:bg-red-500/20">
-                              Offline
-                            </Badge>
-                          )}
-                        </TableCell>
-                        <TableCell className="text-right pr-6">
-                           <Button variant="ghost" size="icon" className="h-8 w-8 text-zinc-500 hover:text-white hover:bg-white/10">
-                              <ChevronRight className="h-4 w-4" />
-                           </Button>
-                        </TableCell>
-                      </TableRow>
-                    ))}
+                          </TableCell>
+                        </TableRow>
+                      ))
+                    )}
                   </TableBody>
                 </Table>
               </CardContent>
@@ -374,47 +341,36 @@ function App() {
 
           {/* Settings View */}
           {activeTab === 'settings' && (
-            <div className="max-w-3xl animate-in fade-in slide-in-from-bottom-8 duration-700">
-              <Card className="bg-zinc-900/40 border-white/5 backdrop-blur-md">
+            <div className="max-w-2xl">
+              <Card className="bg-zinc-900 border-zinc-800">
                 <CardHeader>
-                  <CardTitle className="text-white text-xl flex items-center gap-2">
-                    <Zap className="h-5 w-5 text-yellow-500" />
-                    Subscription Configuration
-                  </CardTitle>
-                  <CardDescription className="text-zinc-400">Manage your server subscription source</CardDescription>
+                  <CardTitle className="text-lg text-white">Subscription</CardTitle>
+                  <CardDescription className="text-zinc-500">Manage your server subscription source</CardDescription>
                 </CardHeader>
-                <CardContent className="space-y-6">
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-zinc-300 ml-1">Subscription URL</label>
-                    <div className="flex gap-4">
-                      <div className="relative flex-1">
-                        <Input
-                          placeholder="https://subscribe.nextdesk.net/api/v1/client/subscribe..."
-                          value={subUrl}
-                          onChange={(e) => setSubUrl(e.target.value)}
-                          className="bg-zinc-950/50 border-white/10 text-white placeholder:text-zinc-700 focus-visible:ring-emerald-500/50 h-12 pl-4"
-                        />
-                      </div>
-                      <Button 
-                        onClick={handleUpdateSubscription} 
-                        disabled={updatingSub || !subUrl}
-                        className="bg-emerald-600 hover:bg-emerald-500 text-white h-12 px-6 shadow-lg shadow-emerald-900/20 font-medium tracking-wide"
-                      >
-                        {updatingSub ? 'Updating...' : 'Update'}
-                      </Button>
-                    </div>
+                <CardContent className="space-y-4">
+                  <div className="flex gap-3">
+                    <Input
+                      placeholder="Subscription URL..."
+                      value={subUrl}
+                      onChange={(e) => setSubUrl(e.target.value)}
+                      className="bg-zinc-950 border-zinc-800 text-white placeholder:text-zinc-600 focus-visible:ring-zinc-700"
+                    />
+                    <Button 
+                      onClick={handleUpdateSubscription} 
+                      disabled={updatingSub || !subUrl}
+                      className="bg-emerald-600 hover:bg-emerald-500 text-white"
+                    >
+                      {updatingSub ? 'Updating...' : 'Update'}
+                    </Button>
                   </div>
                   
-                  <div className="rounded-lg bg-blue-500/5 border border-blue-500/10 p-4">
+                  <div className="bg-blue-500/5 border border-blue-500/10 rounded-md p-4">
                     <div className="flex gap-3">
-                      <div className="p-2 rounded bg-blue-500/10 h-fit">
-                        <CheckCircle2 className="h-4 w-4 text-blue-400" />
-                      </div>
-                      <div className="space-y-1">
-                        <h4 className="text-sm font-medium text-blue-200">Auto-Update Enabled</h4>
-                        <p className="text-xs text-blue-300/60 leading-relaxed">
-                          Your server list will be automatically synchronized with the subscription server every 24 hours.
-                          Manual updates can be triggered above.
+                      <CheckCircle2 className="h-5 w-5 text-blue-500 shrink-0" />
+                      <div>
+                        <h4 className="text-sm font-medium text-blue-400 mb-1">Auto-Update Enabled</h4>
+                        <p className="text-xs text-blue-400/60 leading-relaxed">
+                          Server list automatically syncs every 24 hours.
                         </p>
                       </div>
                     </div>
