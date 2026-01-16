@@ -22,70 +22,14 @@ class ConfigGenerator:
             yaml.dump(config, f, allow_unicode=True)
         return config_path
 
-    def generate_multidesk_xml(self, servers: list) -> Path:
+    def generate_multidesk_xml(self, servers: list = None) -> Path:
         xml_path = self._config_dir / "MultiDesk.multidesk"
-        xml_content = self._build_xml(servers)
+        xml_content = self._build_xml()
         with open(xml_path, "w", encoding="utf-8") as f:
             f.write(xml_content)
         return xml_path
 
-    def _build_xml(self, servers: list) -> str:
-        server_entries = []
-        for server in servers:
-            name = self._escape_xml(server.get("name", "Server"))
-            host = self._escape_xml(server.get("host", ""))
-            server_entries.append(f"""			<Server>
-				<Name>{name}</Name>
-				<Description/>
-				<Server>{host}</Server>
-				<MacAddress/>
-				<UseVMBus>0</UseVMBus>
-				<EnhancedMode>0</EnhancedMode>
-				<VMId/>
-				<InheritGeneral>0</InheritGeneral>
-				<EnableCredSspSupport>1</EnableCredSspSupport>
-				<InheritProxy>1</InheritProxy>
-				<InheritDisplay>1</InheritDisplay>
-				<RedirectPrinters>0</RedirectPrinters>
-				<RedirectClipboard>1</RedirectClipboard>
-				<RedirectPorts>0</RedirectPorts>
-				<RedirectSmartCards>0</RedirectSmartCards>
-				<RedirectDrives>0</RedirectDrives>
-				<DriveCollection/>
-				<AudioRedirectionMode>0</AudioRedirectionMode>
-				<AudioCaptureRedirectionMode>0</AudioCaptureRedirectionMode>
-				<KeyboardHookMode>1</KeyboardHookMode>
-				<StartProgramOnConnection>0</StartProgramOnConnection>
-				<StartProgram/>
-				<WorkDir/>
-				<PerformanceFlags>384</PerformanceFlags>
-				<BitmapPersistence>1</BitmapPersistence>
-				<AutoReconnect>0</AutoReconnect>
-				<BandwidthDetection>1</BandwidthDetection>
-				<AuthenticationLevel>0</AuthenticationLevel>
-				<GatewayProfileUsageMethod>0</GatewayProfileUsageMethod>
-				<GatewayUsageMethod>1</GatewayUsageMethod>
-				<GatewayHostname/>
-				<GatewayCredsSource>4</GatewayCredsSource>
-				<GatewayUserName/>
-				<GatewayPassword/>
-				<GatewayDomain/>
-				<GatewayUseGeneralCred>1</GatewayUseGeneralCred>
-				<UseClientName>0</UseClientName>
-				<ClientName/>
-				<ProxyType>0</ProxyType>
-				<SocksHostname>127.0.0.1</SocksHostname>
-				<SocksPort>{SOCKS_PORT}</SocksPort>
-				<SocksUserName/>
-				<SocksPassword/>
-				<UserName>Administrator</UserName>
-				<Domain/>
-				<Password/>
-				<RDPPort>3389</RDPPort>
-			</Server>""")
-
-        servers_xml = "\n".join(server_entries) if server_entries else ""
-
+    def _build_xml(self) -> str:
         return f"""<?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <MultiDesk>
 	<Servers>
@@ -115,7 +59,6 @@ class ConfigGenerator:
 				<ConnectToServerConsole>0</ConnectToServerConsole>
 				<SmartSizing>1</SmartSizing>
 			</Properties>
-{servers_xml}
 		</Group>
 		<Properties>
 			<Name/>
@@ -133,12 +76,3 @@ class ConfigGenerator:
 		<ExternalTool Title="&amp;Query Session" Command="%comspec%" Arguments="/k query session /server:%server%" StartPath=""/>
 	</ExternalTools>
 </MultiDesk>"""
-
-    def _escape_xml(self, text: str) -> str:
-        return (
-            text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-            .replace("'", "&apos;")
-        )

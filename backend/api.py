@@ -78,7 +78,6 @@ class Api:
 
         self._servers = self._transform_proxies_to_servers(result.proxies)
         self._config_gen.generate_clash_config(result.proxies)
-        self._config_gen.generate_multidesk_xml(self._servers)
 
         return {
             "success": True,

@@ -60,6 +60,17 @@ function App() {
     if (lower.includes('russia') || lower.startsWith('ru ') || lower.includes(' ru ')) return 'ru';
     if (lower.includes('brazil') || lower.startsWith('br ') || lower.includes(' br ')) return 'br';
     if (lower.includes('netherlands') || lower.startsWith('nl ') || lower.includes(' nl ')) return 'nl';
+    if (lower.includes('indonesia') || lower.startsWith('id ') || lower.includes(' id ')) return 'id';
+    if (lower.includes('malaysia') || lower.startsWith('my ') || lower.includes(' my ')) return 'my';
+    if (lower.includes('thailand') || lower.startsWith('th ') || lower.includes(' th ')) return 'th';
+    if (lower.includes('vietnam') || lower.startsWith('vn ') || lower.includes(' vn ')) return 'vn';
+    if (lower.includes('nigeria') || lower.startsWith('ng ') || lower.includes(' ng ')) return 'ng';
+    if (lower.includes('philippines') || lower.startsWith('ph ') || lower.includes(' ph ')) return 'ph';
+    if (lower.includes('turkey') || lower.startsWith('tr ') || lower.includes(' tr ')) return 'tr';
+    if (lower.includes('argentina') || lower.startsWith('ar ') || lower.includes(' ar ')) return 'ar';
+    if (lower.includes('mexico') || lower.startsWith('mx ') || lower.includes(' mx ')) return 'mx';
+    if (lower.includes('south africa') || lower.startsWith('za ') || lower.includes(' za ')) return 'za';
+    if (lower.includes('china') || lower.startsWith('cn ') || lower.includes(' cn ')) return 'cn';
     return 'un';
   };
 
