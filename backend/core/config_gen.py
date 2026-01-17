@@ -83,8 +83,8 @@ class ConfigGenerator:
 				<ProxyType>1</ProxyType>
 				<SocksHostname>127.0.0.1</SocksHostname>
 				<SocksPort>{SOCKS_PORT}</SocksPort>
-				<SocksUserName>librascloud</SocksUserName>
-				<SocksPassword>$1$4c2a95fa3aa1be1f4f2cbfb3eac012d0$323383454e7ed34f0f92e4349be5f866a74020f2d0122890f890d107594d5b7c</SocksPassword>
+				<SocksUserName/>
+				<SocksPassword/>
 				<InheritDisplay>0</InheritDisplay>
 				<GroupCollapsed>0</GroupCollapsed>
 				<UserName>Administrator</UserName>
