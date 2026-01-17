@@ -32,6 +32,8 @@ class ConfigGenerator:
             "socks-port": SOCKS_PORT,
             "allow-lan": False,
             "mode": raw_config.get("mode", "rule"),
+            "geodata-mode": False,
+            "geo-auto-update": False,
             "proxies": raw_config.get("proxies", []),
             "proxy-groups": raw_config.get("proxy-groups", []),
             "rules": raw_config.get("rules", []),
@@ -56,6 +58,8 @@ class ConfigGenerator:
             "socks-port": SOCKS_PORT,
             "allow-lan": False,
             "mode": "rule",
+            "geodata-mode": False,
+            "geo-auto-update": False,
             "proxies": proxies,
             "proxy-groups": [
                 {
