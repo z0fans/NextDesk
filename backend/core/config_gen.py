@@ -71,6 +71,55 @@ class ConfigGenerator:
 				<ConnectToServerConsole>0</ConnectToServerConsole>
 				<SmartSizing>1</SmartSizing>
 			</Properties>
+			<Server>
+				<Name>Please add your server here</Name>
+				<Description/>
+				<Server>Server IP</Server>
+				<MacAddress/>
+				<UseVMBus>0</UseVMBus>
+				<EnhancedMode>0</EnhancedMode>
+				<VMId/>
+				<InheritGeneral>0</InheritGeneral>
+				<EnableCredSspSupport>1</EnableCredSspSupport>
+				<InheritProxy>1</InheritProxy>
+				<InheritDisplay>1</InheritDisplay>
+				<RedirectPrinters>0</RedirectPrinters>
+				<RedirectClipboard>1</RedirectClipboard>
+				<RedirectPorts>0</RedirectPorts>
+				<RedirectSmartCards>0</RedirectSmartCards>
+				<RedirectDrives>0</RedirectDrives>
+				<DriveCollection/>
+				<AudioRedirectionMode>0</AudioRedirectionMode>
+				<AudioCaptureRedirectionMode>0</AudioCaptureRedirectionMode>
+				<KeyboardHookMode>1</KeyboardHookMode>
+				<StartProgramOnConnection>0</StartProgramOnConnection>
+				<StartProgram/>
+				<WorkDir/>
+				<PerformanceFlags>384</PerformanceFlags>
+				<BitmapPersistence>1</BitmapPersistence>
+				<AutoReconnect>0</AutoReconnect>
+				<BandwidthDetection>1</BandwidthDetection>
+				<AuthenticationLevel>0</AuthenticationLevel>
+				<GatewayProfileUsageMethod>0</GatewayProfileUsageMethod>
+				<GatewayUsageMethod>1</GatewayUsageMethod>
+				<GatewayHostname/>
+				<GatewayCredsSource>4</GatewayCredsSource>
+				<GatewayUserName/>
+				<GatewayPassword/>
+				<GatewayDomain/>
+				<GatewayUseGeneralCred>1</GatewayUseGeneralCred>
+				<UseClientName>0</UseClientName>
+				<ClientName/>
+				<ProxyType>0</ProxyType>
+				<SocksHostname>127.0.0.1</SocksHostname>
+				<SocksPort>{SOCKS_PORT}</SocksPort>
+				<SocksUserName/>
+				<SocksPassword/>
+				<UserName>Administrator</UserName>
+				<Domain/>
+				<Password/>
+				<RDPPort>3389</RDPPort>
+			</Server>
 		</Group>
 		<Properties>
 			<Name/>
@@ -86,5 +135,6 @@ class ConfigGenerator:
 		<ExternalTool Title="P&amp;ing" Command="%comspec%" Arguments="/k ping -t %server%" StartPath=""/>
 		<ExternalTool Title="&amp;Query User" Command="%comspec%" Arguments="/k query user /server:%server%" StartPath=""/>
 		<ExternalTool Title="&amp;Query Session" Command="%comspec%" Arguments="/k query session /server:%server%" StartPath=""/>
+		<ExternalTool Title="&amp;Shadow Session" Command="%windir%\\system32\\mstsc.exe" Arguments="/shadow:%session% /v:%server% /control" StartPath=""/>
 	</ExternalTools>
 </MultiDesk>"""
