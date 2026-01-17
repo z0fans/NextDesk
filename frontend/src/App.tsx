@@ -10,21 +10,15 @@ import {
   CheckCircle2,
   Globe,
   Download,
-  X
+  X,
+  ChevronDown,
+  ChevronRight
 } from 'lucide-react';
 import { api, type EngineStatus, type Server, type UpdateInfo, type DownloadStatus, type ProxyGroup } from './api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table';
 import { cn } from '@/lib/utils';
 
 function App() {
@@ -40,39 +34,44 @@ function App() {
   const [showUpdateModal, setShowUpdateModal] = useState(false);
   const [currentVersion, setCurrentVersion] = useState('');
   const [subMessage, setSubMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-  const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
-  const [testingConnectivity, setTestingConnectivity] = useState(false);
   const [proxyGroups, setProxyGroups] = useState<ProxyGroup[]>([]);
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const [selectedProxies, setSelectedProxies] = useState<Record<string, string>>({});
+  const [testingConnectivity, setTestingConnectivity] = useState(false);
 
-  const getCountryCode = (name: string): string => {
-    const lower = name.toLowerCase();
-    if (lower.includes('hong kong') || lower.includes('hongkong') || lower.startsWith('hk ') || lower.includes(' hk ')) return 'hk';
-    if (lower.includes('singapore') || lower.startsWith('sg ') || lower.includes(' sg ')) return 'sg';
-    if (lower.includes('japan') || lower.startsWith('jp ') || lower.includes(' jp ')) return 'jp';
-    if (lower.includes('taiwan') || lower.startsWith('tw ') || lower.includes(' tw ')) return 'tw';
-    if (lower.includes('korea') || lower.startsWith('kr ') || lower.includes(' kr ')) return 'kr';
-    if (lower.includes('united states') || lower.includes('usa') || lower.startsWith('us ') || lower.includes(' us ')) return 'us';
-    if (lower.includes('united kingdom') || lower.startsWith('uk ') || lower.includes(' uk ')) return 'gb';
-    if (lower.includes('germany') || lower.startsWith('de ') || lower.includes(' de ')) return 'de';
-    if (lower.includes('france') || lower.startsWith('fr ') || lower.includes(' fr ')) return 'fr';
-    if (lower.includes('canada') || lower.startsWith('ca ') || lower.includes(' ca ')) return 'ca';
-    if (lower.includes('australia') || lower.startsWith('au ') || lower.includes(' au ')) return 'au';
-    if (lower.includes('india') || lower.startsWith('in ') || lower.includes(' in ')) return 'in';
-    if (lower.includes('russia') || lower.startsWith('ru ') || lower.includes(' ru ')) return 'ru';
-    if (lower.includes('brazil') || lower.startsWith('br ') || lower.includes(' br ')) return 'br';
-    if (lower.includes('netherlands') || lower.startsWith('nl ') || lower.includes(' nl ')) return 'nl';
-    if (lower.includes('indonesia') || lower.startsWith('id ') || lower.includes(' id ')) return 'id';
-    if (lower.includes('malaysia') || lower.startsWith('my ') || lower.includes(' my ')) return 'my';
-    if (lower.includes('thailand') || lower.startsWith('th ') || lower.includes(' th ')) return 'th';
-    if (lower.includes('vietnam') || lower.startsWith('vn ') || lower.includes(' vn ')) return 'vn';
-    if (lower.includes('nigeria') || lower.startsWith('ng ') || lower.includes(' ng ')) return 'ng';
-    if (lower.includes('philippines') || lower.startsWith('ph ') || lower.includes(' ph ')) return 'ph';
-    if (lower.includes('turkey') || lower.startsWith('tr ') || lower.includes(' tr ')) return 'tr';
-    if (lower.includes('argentina') || lower.startsWith('ar ') || lower.includes(' ar ')) return 'ar';
-    if (lower.includes('mexico') || lower.startsWith('mx ') || lower.includes(' mx ')) return 'mx';
-    if (lower.includes('south africa') || lower.startsWith('za ') || lower.includes(' za ')) return 'za';
-    if (lower.includes('china') || lower.startsWith('cn ') || lower.includes(' cn ')) return 'cn';
-    return 'un';
+  useEffect(() => {
+    if (proxyGroups.length > 0) {
+      setSelectedProxies(prev => {
+        const next = { ...prev };
+        let changed = false;
+        proxyGroups.forEach(group => {
+          if (!next[group.name] && group.proxies.length > 0) {
+            next[group.name] = group.proxies[0];
+            changed = true;
+          }
+        });
+        return changed ? next : prev;
+      });
+    }
+  }, [proxyGroups]);
+
+  const toggleGroupExpansion = (groupName: string) => {
+    setExpandedGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(groupName)) {
+        next.delete(groupName);
+      } else {
+        next.add(groupName);
+      }
+      return next;
+    });
+  };
+
+  const handleProxySelect = (groupName: string, proxyName: string) => {
+    setSelectedProxies(prev => ({
+      ...prev,
+      [groupName]: proxyName
+    }));
   };
 
   const handleTestConnectivity = async () => {
@@ -405,90 +404,79 @@ function App() {
 
           {/* Servers View */}
           {activeTab === 'servers' && (
-            <Card className="bg-zinc-900 border-zinc-800">
-              <CardContent className="p-0">
-                <Table>
-                  <TableHeader>
-                    <TableRow className="border-zinc-800 hover:bg-transparent">
-                      <TableHead className="text-zinc-500 pl-6">Server Name</TableHead>
-                      <TableHead className="text-zinc-500">Host</TableHead>
-                      <TableHead className="text-zinc-500">Latency</TableHead>
-                      <TableHead className="text-zinc-500">Status</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {servers.length === 0 ? (
-                       <TableRow className="border-zinc-800 hover:bg-transparent">
-                         <TableCell colSpan={4} className="h-24 text-center text-zinc-500">
-                           No servers available
-                         </TableCell>
-                       </TableRow>
-                    ) : (
-                      servers.map((server) => (
-                        <TableRow 
-                          key={server.id} 
-                          onClick={() => setSelectedServerId(server.id)}
-                          className={cn(
-                            "border-zinc-800 cursor-pointer transition-colors",
-                            selectedServerId === server.id 
-                              ? "bg-blue-500/10 hover:bg-blue-500/15" 
-                              : "hover:bg-zinc-800/50"
-                          )}
-                        >
-                          <TableCell className="font-medium text-white pl-6">
-                            <div className="flex items-center gap-3">
-                              {selectedServerId === server.id && (
-                                <div className="w-1 h-6 bg-blue-500 rounded-full -ml-3 mr-2" />
-                              )}
-                              <div className="h-6 w-8 rounded overflow-hidden bg-zinc-800">
-                                <img 
-                                  src={`https://flagcdn.com/w80/${getCountryCode(server.name)}.png`} 
-                                  className="object-cover w-full h-full opacity-80"
-                                  onError={(e) => (e.currentTarget.style.display = 'none')}
-                                  alt=""
-                                />
-                              </div>
-                              <span className={cn(selectedServerId === server.id && "text-blue-400")}>
-                                {server.name}
-                              </span>
-                            </div>
-                          </TableCell>
-                          <TableCell className="text-zinc-400 font-mono text-xs">{server.host}</TableCell>
-                          <TableCell>
-                            {server.latency ? (
-                              <div className="flex items-center gap-2">
-                                <div className={cn("w-1.5 h-1.5 rounded-full", 
-                                  server.latency < 100 ? 'bg-emerald-500' : server.latency < 200 ? 'bg-yellow-500' : 'bg-red-500'
-                                )} />
-                                <span className={cn("text-xs font-medium", 
-                                  server.latency < 100 ? 'text-emerald-500' : server.latency < 200 ? 'text-yellow-500' : 'text-red-500'
-                                )}>
-                                  {server.latency}ms
-                                </span>
-                              </div>
-                            ) : (
-                              <span className="text-zinc-600 text-xs">-</span>
-                            )}
-                          </TableCell>
-                          <TableCell>
-                            <Badge variant="outline" className={cn(
-                              "border-0 bg-opacity-10",
-                              server.status === 'online' 
-                                ? "bg-emerald-500 text-emerald-500" 
-                                : server.status === 'unknown'
-                                ? "bg-zinc-500 text-zinc-400"
-                                : "bg-red-500 text-red-500"
-                            )}>
-                              {server.status === 'online' ? 'Online' : server.status === 'unknown' ? 'Unknown' : 'Offline'}
-                            </Badge>
-                          </TableCell>
-                        </TableRow>
-                      ))
-                    )}
-                  </TableBody>
-                </Table>
-              </CardContent>
-            </Card>
+            <div className="space-y-4">
+              {proxyGroups.length === 0 ? (
+                <Card className="bg-zinc-900 border-zinc-800">
+                  <CardContent className="p-6 text-center text-zinc-500">
+                    No proxy groups available
+                  </CardContent>
+                </Card>
+              ) : (
+                proxyGroups.map((group) => {
+                  const isExpanded = expandedGroups.has(group.name);
+                  const selectedProxy = selectedProxies[group.name] || group.proxies[0];
+                  
+                  const badgeColor = group.type.toLowerCase().includes('select') 
+                    ? 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20'
+                    : group.type.toLowerCase().includes('url') 
+                    ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                    : 'bg-amber-500/10 text-amber-400 border-amber-500/20';
+
+                  return (
+                    <div key={group.name} className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden transition-all">
+                      <div 
+                        className="p-4 flex items-center justify-between cursor-pointer hover:bg-zinc-800/50 transition-colors"
+                        onClick={() => toggleGroupExpansion(group.name)}
+                      >
+                        <div className="flex items-center gap-4">
+                           <div className="flex items-center gap-3">
+                             <span className="font-bold text-white text-lg">{group.name}</span>
+                             <Badge variant="outline" className={cn("text-[10px] uppercase tracking-wider border", badgeColor)}>
+                               {group.type}
+                             </Badge>
+                           </div>
+                           <div className="hidden sm:flex text-zinc-500 text-sm items-center gap-2">
+                             <span className="text-zinc-600">Active:</span>
+                             <span className="text-blue-400 font-medium">{selectedProxy}</span>
+                           </div>
+                        </div>
+                        
+                        {isExpanded ? (
+                          <ChevronDown className="h-5 w-5 text-zinc-500" />
+                        ) : (
+                          <ChevronRight className="h-5 w-5 text-zinc-500" />
+                        )}
+                      </div>
+
+                      {isExpanded && (
+                        <div className="bg-zinc-950 p-4 border-t border-zinc-800 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3">
+                          {group.proxies.map(proxy => {
+                             const isSelected = selectedProxy === proxy;
+                             return (
+                               <button
+                                 key={proxy}
+                                 onClick={(e) => {
+                                   e.stopPropagation();
+                                   handleProxySelect(group.name, proxy);
+                                 }}
+                                 className={cn(
+                                   "px-3 py-1.5 rounded-lg text-sm font-medium transition-all text-left truncate",
+                                   isSelected 
+                                     ? "bg-blue-500/20 text-blue-400 border border-blue-500/30" 
+                                     : "bg-zinc-800 text-zinc-400 border border-transparent hover:bg-zinc-700"
+                                 )}
+                               >
+                                 {proxy}
+                               </button>
+                             );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
           )}
 
           {/* Proxy View */}
@@ -538,47 +526,6 @@ function App() {
                       </div>
                     </div>
                   </div>
-                </CardContent>
-              </Card>
-
-              <Card className="bg-zinc-900 border-zinc-800">
-                <CardHeader>
-                  <CardTitle className="text-lg text-white">Proxy Groups</CardTitle>
-                  <CardDescription className="text-zinc-500">Select active proxies for each group</CardDescription>
-                </CardHeader>
-                <CardContent className="space-y-4">
-                  {proxyGroups.length === 0 ? (
-                    <div className="text-zinc-500 text-sm">No proxy groups available</div>
-                  ) : (
-                    <div className="grid gap-4">
-                      {proxyGroups.map((group) => (
-                        <div key={group.name} className="flex flex-col gap-3 p-4 rounded-lg border border-zinc-800 bg-zinc-950/50">
-                          <div className="flex items-center justify-between">
-                            <div className="font-medium text-white">{group.name}</div>
-                            <Badge variant="secondary" className="bg-zinc-800 text-zinc-400 text-[10px] uppercase tracking-wider border-zinc-700">
-                              {group.type}
-                            </Badge>
-                          </div>
-                          <div className="relative">
-                            <select 
-                              className="w-full appearance-none bg-zinc-900 border border-zinc-800 rounded-md py-2 px-3 pr-8 text-sm text-zinc-300 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-colors"
-                            >
-                              {group.proxies.map((proxy) => (
-                                <option key={proxy} value={proxy}>
-                                  {proxy}
-                                </option>
-                              ))}
-                            </select>
-                            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-zinc-400">
-                              <svg className="h-4 w-4 fill-current" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
-                                <path d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" />
-                              </svg>
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
                 </CardContent>
               </Card>
             </div>
