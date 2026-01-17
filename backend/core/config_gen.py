@@ -40,6 +40,9 @@ class ConfigGenerator:
         if raw_config.get("dns"):
             config["dns"] = raw_config["dns"]
 
+        if raw_config.get("rule-providers"):
+            config["rule-providers"] = raw_config["rule-providers"]
+
         config_path = self._config_dir / "runtime_clash.yaml"
         with open(config_path, "w", encoding="utf-8") as f:
             yaml.dump(config, f, allow_unicode=True)
