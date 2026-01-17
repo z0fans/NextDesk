@@ -30,9 +30,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "dist\NextDesk\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "MultiDesk.multidesk,config.json"
-Source: "dist\NextDesk\MultiDesk.multidesk"; DestDir: "{app}"; Flags: onlyifdoesntexist
-Source: "dist\NextDesk\config.json"; DestDir: "{app}"; Flags: onlyifdoesntexist
+Source: "dist\NextDesk\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "backend\bin\WebView2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall; Check: not IsWebView2Installed
 
 [Icons]
