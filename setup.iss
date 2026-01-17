@@ -94,3 +94,20 @@ begin
       InstallWebView2;
   end;
 end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  UserDataPath: String;
+begin
+  if CurUninstallStep = usPostUninstall then
+  begin
+    UserDataPath := ExpandConstant('{userappdata}\NextDesk');
+    if DirExists(UserDataPath) then
+    begin
+      if MsgBox('Do you want to delete user data and settings?' + #13#10 + #13#10 + 'Location: ' + UserDataPath, mbConfirmation, MB_YESNO) = IDYES then
+      begin
+        DelTree(UserDataPath, True, True, True);
+      end;
+    end;
+  end;
+end;
