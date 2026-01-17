@@ -124,6 +124,15 @@ class Api:
     def get_current_version(self) -> str:
         return self._updater.get_current_version()
 
+    def get_clash_log(self) -> str:
+        log_path = self._user_config_dir / "clash.log"
+        if log_path.exists():
+            try:
+                return log_path.read_text(encoding="utf-8")[-5000:]
+            except Exception:
+                return ""
+        return ""
+
     def test_servers_connectivity(self) -> list[dict]:
         def test_single(server: dict) -> dict:
             host = server.get("host", "")

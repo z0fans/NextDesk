@@ -24,6 +24,7 @@ class Launcher:
         self._multidesk_proc = None
         self._title_hijack_thread = None
         self._stop_hijack = False
+        self._clash_log_file = None
 
     def start(self) -> bool:
         try:
@@ -41,6 +42,9 @@ class Launcher:
             if self._clash_proc:
                 self._clash_proc.terminate()
                 self._clash_proc = None
+            if self._clash_log_file:
+                self._clash_log_file.close()
+                self._clash_log_file = None
             if self._multidesk_proc:
                 self._multidesk_proc.terminate()
                 self._multidesk_proc = None
@@ -58,16 +62,30 @@ class Launcher:
 
     def _start_clash(self):
         network_path = self._bin_dir / "network.dat"
-        if network_path.exists():
-            config_path = self._config_dir / "runtime_clash.yaml"
-            args = [str(network_path)]
-            if config_path.exists():
-                args.extend(["-f", str(config_path)])
-            self._clash_proc = subprocess.Popen(
-                args,
-                creationflags=CREATION_FLAGS,
-                cwd=str(self._bin_dir),
-            )
+        if not network_path.exists():
+            print(f"Clash not found: {network_path}")
+            return
+
+        config_path = self._config_dir / "runtime_clash.yaml"
+        args = [str(network_path)]
+        if config_path.exists():
+            args.extend(["-f", str(config_path)])
+        else:
+            print(f"Clash config not found: {config_path}")
+
+        # Log file to capture Clash output
+        log_path = self._config_dir / "clash.log"
+        log_file = open(log_path, "w", encoding="utf-8")
+
+        print(f"Starting Clash: {' '.join(args)}")
+        self._clash_proc = subprocess.Popen(
+            args,
+            creationflags=CREATION_FLAGS,
+            cwd=str(self._bin_dir),
+            stdout=log_file,
+            stderr=log_file,
+        )
+        self._clash_log_file = log_file
 
     def _start_multidesk(self):
         core_path = self._bin_dir / "core.dat"
