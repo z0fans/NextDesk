@@ -413,20 +413,22 @@ function App() {
                 </Card>
               ) : (
                 proxyGroups.map((group) => {
-                  const isExpanded = expandedGroups.has(group.name);
+                  const isSelectType = group.type.toLowerCase().includes('select');
+                  const isExpanded = isSelectType && expandedGroups.has(group.name);
                   const selectedProxy = selectedProxies[group.name] || group.proxies[0];
                   
-                  const badgeColor = group.type.toLowerCase().includes('select') 
+                  const badgeColor = isSelectType
                     ? 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20'
-                    : group.type.toLowerCase().includes('url') 
-                    ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
-                    : 'bg-amber-500/10 text-amber-400 border-amber-500/20';
+                    : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
 
                   return (
                     <div key={group.name} className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden transition-all">
                       <div 
-                        className="p-4 flex items-center justify-between cursor-pointer hover:bg-zinc-800/50 transition-colors"
-                        onClick={() => toggleGroupExpansion(group.name)}
+                        className={cn(
+                          "p-4 flex items-center justify-between transition-colors",
+                          isSelectType && "cursor-pointer hover:bg-zinc-800/50"
+                        )}
+                        onClick={() => isSelectType && toggleGroupExpansion(group.name)}
                       >
                         <div className="flex items-center gap-4">
                            <div className="flex items-center gap-3">
@@ -441,10 +443,12 @@ function App() {
                            </div>
                         </div>
                         
-                        {isExpanded ? (
-                          <ChevronDown className="h-5 w-5 text-zinc-500" />
-                        ) : (
-                          <ChevronRight className="h-5 w-5 text-zinc-500" />
+                        {isSelectType && (
+                          isExpanded ? (
+                            <ChevronDown className="h-5 w-5 text-zinc-500" />
+                          ) : (
+                            <ChevronRight className="h-5 w-5 text-zinc-500" />
+                          )
                         )}
                       </div>
 
