@@ -41,6 +41,8 @@ class ConfigGenerator:
         group_names = {g.get("name", "") for g in filtered_groups}
         filtered = []
         for rule in rules:
+            if rule.startswith("RULE-SET,"):
+                continue
             parts = rule.split(",")
             if len(parts) >= 2:
                 target = parts[-1].strip()
