@@ -61,9 +61,14 @@ class Launcher:
         }
 
     def _start_clash(self):
+        log_path = self._config_dir / "clash.log"
+
         network_path = self._bin_dir / "network.dat"
         if not network_path.exists():
-            print(f"Clash not found: {network_path}")
+            log_path.write_text(
+                f"ERROR: Clash not found at {network_path}\nbin_dir: {self._bin_dir}",
+                encoding="utf-8",
+            )
             return
 
         config_path = self._config_dir / "runtime_clash.yaml"
@@ -71,13 +76,15 @@ class Launcher:
         if config_path.exists():
             args.extend(["-f", str(config_path)])
         else:
-            print(f"Clash config not found: {config_path}")
+            log_path.write_text(
+                f"ERROR: Config not found at {config_path}", encoding="utf-8"
+            )
+            return
 
-        # Log file to capture Clash output
-        log_path = self._config_dir / "clash.log"
         log_file = open(log_path, "w", encoding="utf-8")
+        log_file.write(f"Starting Clash: {' '.join(args)}\n")
+        log_file.flush()
 
-        print(f"Starting Clash: {' '.join(args)}")
         self._clash_proc = subprocess.Popen(
             args,
             creationflags=CREATION_FLAGS,

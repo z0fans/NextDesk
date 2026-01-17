@@ -36,13 +36,21 @@ class Api:
             try:
                 data = json.loads(self._config_file.read_text(encoding="utf-8"))
                 self._subscription_url = data.get("subscription_url", "")
+                self._servers = data.get("servers", [])
+                self._proxy_groups = data.get("proxy_groups", [])
             except Exception:
                 pass
 
     def _save_config(self):
         try:
-            data = {"subscription_url": self._subscription_url}
-            self._config_file.write_text(json.dumps(data), encoding="utf-8")
+            data = {
+                "subscription_url": self._subscription_url,
+                "servers": self._servers,
+                "proxy_groups": self._proxy_groups,
+            }
+            self._config_file.write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8"
+            )
         except Exception:
             pass
 
