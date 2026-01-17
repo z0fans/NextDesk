@@ -5,6 +5,8 @@ import threading
 import time
 from pathlib import Path
 
+from core.config_gen import get_user_config_dir
+
 CREATION_FLAGS = (
     getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 )
@@ -17,7 +19,7 @@ class Launcher:
         else:
             base_path = Path(__file__).parent.parent
         self._bin_dir = base_path / "bin"
-        self._config_dir = base_path
+        self._config_dir = get_user_config_dir()
         self._clash_proc = None
         self._multidesk_proc = None
         self._title_hijack_thread = None

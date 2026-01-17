@@ -1,10 +1,9 @@
 import json
 import socket
 import threading
-from pathlib import Path
 
 from core.launcher import Launcher
-from core.config_gen import ConfigGenerator
+from core.config_gen import ConfigGenerator, get_user_config_dir
 from core.sub_loader import SubscriptionLoader
 from core.updater import Updater
 
@@ -17,16 +16,17 @@ class Api:
         self._updater = Updater()
         self._servers: list[dict] = []
         self._subscription_url: str = ""
-        self._config_file = Path(__file__).parent / "config.json"
+        self._user_config_dir = get_user_config_dir()
+        self._config_file = self._user_config_dir / "config.json"
         self._load_saved_config()
         self._ensure_default_configs()
 
     def _ensure_default_configs(self):
-        multidesk_path = Path(__file__).parent / "MultiDesk.multidesk"
+        multidesk_path = self._user_config_dir / "MultiDesk.multidesk"
         if not multidesk_path.exists():
             self._config_gen.generate_multidesk_xml()
 
-        clash_path = Path(__file__).parent / "runtime_clash.yaml"
+        clash_path = self._user_config_dir / "runtime_clash.yaml"
         if not clash_path.exists():
             self._config_gen.generate_clash_config([])
 

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import yaml
 
@@ -5,9 +6,20 @@ import yaml
 SOCKS_PORT = 17897
 
 
+def get_user_config_dir() -> Path:
+    """Get user config directory: %APPDATA%/NextDesk on Windows, ~/.config/NextDesk on others"""
+    if os.name == "nt":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.path.expanduser("~/.config")
+    config_dir = Path(base) / "NextDesk"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir
+
+
 class ConfigGenerator:
     def __init__(self):
-        self._config_dir = Path(__file__).parent.parent
+        self._config_dir = get_user_config_dir()
 
     def generate_clash_config(self, proxies: list) -> Path:
         config = {
