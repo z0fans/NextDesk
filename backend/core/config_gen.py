@@ -22,11 +22,41 @@ def get_log_dir() -> Path:
     return log_dir
 
 
+RDP_GROUP_KEYWORDS = ["server-", "auto-"]
+
+
 class ConfigGenerator:
     def __init__(self):
         self._config_dir = get_user_config_dir()
 
+    def _filter_rdp_groups(self, proxy_groups: list) -> list:
+        filtered = []
+        for group in proxy_groups:
+            name = group.get("name", "").lower()
+            if any(kw in name for kw in RDP_GROUP_KEYWORDS):
+                filtered.append(group)
+        return filtered
+
+    def _filter_rdp_rules(self, rules: list, filtered_groups: list) -> list:
+        group_names = {g.get("name", "") for g in filtered_groups}
+        filtered = []
+        for rule in rules:
+            parts = rule.split(",")
+            if len(parts) >= 2:
+                target = parts[-1].strip()
+                if target in group_names or target in ["DIRECT", "REJECT"]:
+                    filtered.append(rule)
+        if not any("MATCH" in r for r in filtered):
+            filtered.append("MATCH,DIRECT")
+        return filtered
+
     def generate_clash_config_from_subscription(self, raw_config: dict) -> Path:
+        proxy_groups = raw_config.get("proxy-groups", [])
+        filtered_groups = self._filter_rdp_groups(proxy_groups)
+        filtered_rules = self._filter_rdp_rules(
+            raw_config.get("rules", []), filtered_groups
+        )
+
         config = {
             "port": 17890,
             "socks-port": SOCKS_PORT,
@@ -35,15 +65,12 @@ class ConfigGenerator:
             "geodata-mode": False,
             "geo-auto-update": False,
             "proxies": raw_config.get("proxies", []),
-            "proxy-groups": raw_config.get("proxy-groups", []),
-            "rules": raw_config.get("rules", []),
+            "proxy-groups": filtered_groups,
+            "rules": filtered_rules,
         }
 
         if raw_config.get("dns"):
             config["dns"] = raw_config["dns"]
-
-        if raw_config.get("rule-providers"):
-            config["rule-providers"] = raw_config["rule-providers"]
 
         config_path = self._config_dir / "runtime_clash.yaml"
         with open(config_path, "w", encoding="utf-8") as f:

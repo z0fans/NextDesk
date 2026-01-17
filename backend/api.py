@@ -5,7 +5,10 @@ import threading
 from core.launcher import Launcher
 from core.config_gen import ConfigGenerator, get_user_config_dir, get_log_dir
 from core.sub_loader import SubscriptionLoader
+
 from core.updater import Updater
+
+RDP_GROUP_KEYWORDS = ["server-", "auto-"]
 
 
 class Api:
@@ -108,13 +111,15 @@ class Api:
         transformed = []
         for group in groups:
             if isinstance(group, dict):
-                transformed.append(
-                    {
-                        "name": group.get("name", ""),
-                        "type": group.get("type", "select"),
-                        "proxies": group.get("proxies", []),
-                    }
-                )
+                name = group.get("name", "")
+                if any(kw in name.lower() for kw in RDP_GROUP_KEYWORDS):
+                    transformed.append(
+                        {
+                            "name": name,
+                            "type": group.get("type", "select"),
+                            "proxies": group.get("proxies", []),
+                        }
+                    )
         return transformed
 
     def check_for_update(self) -> dict:
