@@ -11,6 +11,7 @@ declare global {
         get_proxy_groups: () => Promise<ProxyGroup[]>;
         get_subscription_url: () => Promise<string>;
         test_servers_connectivity: () => Promise<Server[]>;
+        test_group_delays: (groupName: string) => Promise<Record<string, number>>;
         check_for_update: () => Promise<UpdateInfo>;
         get_download_status: () => Promise<DownloadStatus>;
         start_download_update: () => Promise<boolean>;
@@ -164,6 +165,13 @@ export const api = {
       return [];
     }
     return window.pywebview.api.test_servers_connectivity();
+  },
+
+  testGroupDelays: async (groupName: string): Promise<Record<string, number>> => {
+    if (!(await ensurePywebview())) {
+      return {};
+    }
+    return window.pywebview.api.test_group_delays(groupName);
   },
 
   checkForUpdate: async (): Promise<UpdateInfo> => {

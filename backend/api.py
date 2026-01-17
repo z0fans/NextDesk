@@ -1,6 +1,8 @@
 import json
 import socket
 import threading
+import requests
+from urllib.parse import quote as url_quote
 
 from core.launcher import Launcher
 from core.config_gen import ConfigGenerator, get_user_config_dir, get_log_dir
@@ -9,6 +11,7 @@ from core.sub_loader import SubscriptionLoader
 from core.updater import Updater
 
 RDP_GROUP_KEYWORDS = ["server-", "auto-"]
+CLASH_API_BASE = "http://127.0.0.1:17890"
 
 
 class Api:
@@ -194,3 +197,47 @@ class Api:
                 }
             )
         return servers
+
+    def test_group_delays(self, group_name: str) -> dict:
+        """Test delay for all proxies in a group using Clash API."""
+        result = {}
+        group = None
+        for g in self._proxy_groups:
+            if isinstance(g, dict) and g.get("name") == group_name:
+                group = g
+                break
+
+        if not group:
+            return result
+
+        proxies = group.get("proxies", [])
+
+        def test_single(proxy_name: str):
+            try:
+                url = f"{CLASH_API_BASE}/proxies/{url_quote(proxy_name)}/delay"
+                resp = requests.get(
+                    url,
+                    params={
+                        "url": "http://www.gstatic.com/generate_204",
+                        "timeout": 5000,
+                    },
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    result[proxy_name] = data.get("delay", -1)
+                else:
+                    result[proxy_name] = -1
+            except Exception:
+                result[proxy_name] = -1
+
+        threads = []
+        for proxy in proxies:
+            t = threading.Thread(target=test_single, args=(proxy,))
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join(timeout=10)
+
+        return result

@@ -24,7 +24,7 @@ import { cn } from '@/lib/utils';
 function App() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'servers' | 'proxy' | 'settings'>('dashboard');
   const [status, setStatus] = useState<EngineStatus>({ clash: false, multidesk: false });
-  const [servers, setServers] = useState<Server[]>([]);
+  const [, setServers] = useState<Server[]>([]);
   const [loading, setLoading] = useState(false);
   const [subUrl, setSubUrl] = useState('');
   const [updatingSub, setUpdatingSub] = useState(false);
@@ -38,6 +38,7 @@ function App() {
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [selectedProxies, setSelectedProxies] = useState<Record<string, string>>({});
   const [testingConnectivity, setTestingConnectivity] = useState(false);
+  const [nodeDelays, setNodeDelays] = useState<Record<string, number>>({});
 
   useEffect(() => {
     if (proxyGroups.length > 0) {
@@ -75,10 +76,17 @@ function App() {
   };
 
   const handleTestConnectivity = async () => {
+    const expandedGroupNames = Array.from(expandedGroups);
+    if (expandedGroupNames.length === 0) {
+      return;
+    }
+    
     setTestingConnectivity(true);
     try {
-      const updatedServers = await api.testServersConnectivity();
-      setServers(updatedServers);
+      for (const groupName of expandedGroupNames) {
+        const delays = await api.testGroupDelays(groupName);
+        setNodeDelays(prev => ({ ...prev, ...delays }));
+      }
     } catch (error) {
       console.error('Failed to test connectivity', error);
     } finally {
@@ -309,11 +317,12 @@ function App() {
                 variant="outline" 
                 size="icon" 
                 onClick={handleTestConnectivity}
-                disabled={testingConnectivity || servers.length === 0}
+                disabled={testingConnectivity || expandedGroups.size === 0}
                 className={cn(
                   "rounded-full h-10 w-10 border-zinc-800 bg-zinc-900 hover:bg-zinc-800 hover:border-zinc-700",
                   testingConnectivity ? "text-yellow-500" : "text-zinc-400 hover:text-yellow-400"
                 )}
+                title={expandedGroups.size === 0 ? "Expand a group first" : "Test node delays"}
               >
                 <Zap className={cn("h-4 w-4", testingConnectivity && "animate-pulse")} />
               </Button>
@@ -456,6 +465,24 @@ function App() {
                         <div className="bg-zinc-950 p-4 border-t border-zinc-800 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3">
                           {group.proxies.map(proxy => {
                              const isSelected = selectedProxy === proxy;
+                             const delay = nodeDelays[proxy];
+                             const hasDelay = delay !== undefined;
+                             const isTimeout = delay === -1;
+                             
+                             const getDelayColor = () => {
+                               if (!hasDelay) return '';
+                               if (isTimeout) return 'text-red-400';
+                               if (delay < 100) return 'text-emerald-400';
+                               if (delay < 300) return 'text-yellow-400';
+                               return 'text-orange-400';
+                             };
+                             
+                             const getDelayText = () => {
+                               if (!hasDelay) return null;
+                               if (isTimeout) return '--';
+                               return `${delay}ms`;
+                             };
+                             
                              return (
                                <button
                                  key={proxy}
@@ -464,13 +491,18 @@ function App() {
                                    handleProxySelect(group.name, proxy);
                                  }}
                                  className={cn(
-                                   "px-3 py-1.5 rounded-lg text-sm font-medium transition-all text-left truncate",
+                                   "px-3 py-1.5 rounded-lg text-sm font-medium transition-all text-left truncate flex items-center justify-between gap-2",
                                    isSelected 
                                      ? "bg-blue-500/20 text-blue-400 border border-blue-500/30" 
                                      : "bg-zinc-800 text-zinc-400 border border-transparent hover:bg-zinc-700"
                                  )}
                                >
-                                 {proxy}
+                                 <span className="truncate">{proxy}</span>
+                                 {hasDelay && (
+                                   <span className={cn("text-xs font-mono shrink-0", getDelayColor())}>
+                                     {getDelayText()}
+                                   </span>
+                                 )}
                                </button>
                              );
                           })}
