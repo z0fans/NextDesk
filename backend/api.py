@@ -3,7 +3,7 @@ import socket
 import threading
 
 from core.launcher import Launcher
-from core.config_gen import ConfigGenerator, get_user_config_dir
+from core.config_gen import ConfigGenerator, get_user_config_dir, get_log_dir
 from core.sub_loader import SubscriptionLoader
 from core.updater import Updater
 
@@ -18,6 +18,7 @@ class Api:
         self._proxy_groups: list[dict] = []
         self._subscription_url: str = ""
         self._user_config_dir = get_user_config_dir()
+        self._log_dir = get_log_dir()
         self._config_file = self._user_config_dir / "config.json"
         self._load_saved_config()
         self._ensure_default_configs()
@@ -84,10 +85,9 @@ class Api:
             }
 
         self._subscription_url = url
-        self._save_config()
-
         self._servers = self._transform_proxies_to_servers(result.proxies)
         self._proxy_groups = result.proxy_groups
+        self._save_config()
 
         if result.raw_config:
             self._config_gen.generate_clash_config_from_subscription(result.raw_config)
@@ -133,7 +133,7 @@ class Api:
         return self._updater.get_current_version()
 
     def get_clash_log(self) -> str:
-        log_path = self._user_config_dir / "clash.log"
+        log_path = self._log_dir / "clash.log"
         if log_path.exists():
             try:
                 return log_path.read_text(encoding="utf-8")[-5000:]

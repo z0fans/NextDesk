@@ -5,7 +5,7 @@ import threading
 import time
 from pathlib import Path
 
-from core.config_gen import get_user_config_dir
+from core.config_gen import get_user_config_dir, get_log_dir
 
 CREATION_FLAGS = (
     getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
@@ -25,6 +25,7 @@ class Launcher:
         self._title_hijack_thread = None
         self._stop_hijack = False
         self._clash_log_file = None
+        self._log_dir = get_log_dir()
 
     def start(self) -> bool:
         try:
@@ -61,7 +62,7 @@ class Launcher:
         }
 
     def _start_clash(self):
-        log_path = self._config_dir / "clash.log"
+        log_path = self._log_dir / "clash.log"
 
         network_path = self._bin_dir / "network.dat"
         if not network_path.exists():

@@ -7,7 +7,6 @@ SOCKS_PORT = 17897
 
 
 def get_user_config_dir() -> Path:
-    """Get user config directory: %APPDATA%/NextDesk on Windows, ~/.config/NextDesk on others"""
     if os.name == "nt":
         base = os.environ.get("APPDATA", os.path.expanduser("~"))
     else:
@@ -15,6 +14,12 @@ def get_user_config_dir() -> Path:
     config_dir = Path(base) / "NextDesk"
     config_dir.mkdir(parents=True, exist_ok=True)
     return config_dir
+
+
+def get_log_dir() -> Path:
+    log_dir = get_user_config_dir() / "log"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir
 
 
 class ConfigGenerator:
