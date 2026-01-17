@@ -22,12 +22,22 @@ class ConfigGenerator:
         self._config_dir = get_user_config_dir()
 
     def generate_clash_config(self, proxies: list) -> Path:
+        proxy_names = [p.get("name", f"proxy-{i}") for i, p in enumerate(proxies)]
+
         config = {
             "port": 17890,
             "socks-port": SOCKS_PORT,
             "allow-lan": False,
             "mode": "rule",
             "proxies": proxies,
+            "proxy-groups": [
+                {
+                    "name": "PROXY",
+                    "type": "select",
+                    "proxies": proxy_names if proxy_names else ["DIRECT"],
+                }
+            ],
+            "rules": ["MATCH,PROXY"],
         }
         config_path = self._config_dir / "runtime_clash.yaml"
         with open(config_path, "w", encoding="utf-8") as f:
