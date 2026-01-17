@@ -60,6 +60,7 @@ class ConfigGenerator:
         config = {
             "port": 17890,
             "socks-port": SOCKS_PORT,
+            "external-controller": "127.0.0.1:17891",
             "allow-lan": False,
             "mode": raw_config.get("mode", "rule"),
             "geodata-mode": False,
@@ -83,6 +84,7 @@ class ConfigGenerator:
         config = {
             "port": 17890,
             "socks-port": SOCKS_PORT,
+            "external-controller": "127.0.0.1:17891",
             "allow-lan": False,
             "mode": "rule",
             "geodata-mode": False,

@@ -11,7 +11,7 @@ from core.sub_loader import SubscriptionLoader
 from core.updater import Updater
 
 RDP_GROUP_KEYWORDS = ["server-", "auto-"]
-CLASH_API_BASE = "http://127.0.0.1:17890"
+CLASH_API_BASE = "http://127.0.0.1:17891"
 
 
 class Api:
