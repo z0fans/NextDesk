@@ -53,6 +53,8 @@ jobs:
 
       - name: Build installer
         run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          (Get-Content setup.iss) -replace '#define MyAppVersion "1.0.0"', "#define MyAppVersion `"$version`"" | Set-Content setup.iss
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" setup.iss
 
       - name: Upload artifacts
