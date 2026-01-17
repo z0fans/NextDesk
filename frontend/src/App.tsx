@@ -12,7 +12,7 @@ import {
   Download,
   X
 } from 'lucide-react';
-import { api, type EngineStatus, type Server, type UpdateInfo, type DownloadStatus } from './api';
+import { api, type EngineStatus, type Server, type UpdateInfo, type DownloadStatus, type ProxyGroup } from './api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -42,6 +42,7 @@ function App() {
   const [subMessage, setSubMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
   const [testingConnectivity, setTestingConnectivity] = useState(false);
+  const [proxyGroups, setProxyGroups] = useState<ProxyGroup[]>([]);
 
   const getCountryCode = (name: string): string => {
     const lower = name.toLowerCase();
@@ -88,16 +89,18 @@ function App() {
 
   const fetchData = async () => {
     try {
-      const [newStatus, newServers, savedUrl] = await Promise.all([
+      const [newStatus, newServers, savedUrl, newProxyGroups] = await Promise.all([
         api.getStatus(),
         api.getServers(),
-        api.getSubscriptionUrl()
+        api.getSubscriptionUrl(),
+        api.getProxyGroups()
       ]);
       setStatus(newStatus);
       setServers(newServers);
       if (savedUrl && !subUrl) {
         setSubUrl(savedUrl);
       }
+      setProxyGroups(newProxyGroups);
     } catch (error) {
       console.error('Failed to fetch data', error);
     }
@@ -490,7 +493,7 @@ function App() {
 
           {/* Proxy View */}
           {activeTab === 'proxy' && (
-            <div className="max-w-2xl">
+            <div className="max-w-2xl space-y-6">
               <Card className="bg-zinc-900 border-zinc-800">
                 <CardHeader>
                   <CardTitle className="text-lg text-white">Subscription</CardTitle>
@@ -535,6 +538,47 @@ function App() {
                       </div>
                     </div>
                   </div>
+                </CardContent>
+              </Card>
+
+              <Card className="bg-zinc-900 border-zinc-800">
+                <CardHeader>
+                  <CardTitle className="text-lg text-white">Proxy Groups</CardTitle>
+                  <CardDescription className="text-zinc-500">Select active proxies for each group</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  {proxyGroups.length === 0 ? (
+                    <div className="text-zinc-500 text-sm">No proxy groups available</div>
+                  ) : (
+                    <div className="grid gap-4">
+                      {proxyGroups.map((group) => (
+                        <div key={group.name} className="flex flex-col gap-3 p-4 rounded-lg border border-zinc-800 bg-zinc-950/50">
+                          <div className="flex items-center justify-between">
+                            <div className="font-medium text-white">{group.name}</div>
+                            <Badge variant="secondary" className="bg-zinc-800 text-zinc-400 text-[10px] uppercase tracking-wider border-zinc-700">
+                              {group.type}
+                            </Badge>
+                          </div>
+                          <div className="relative">
+                            <select 
+                              className="w-full appearance-none bg-zinc-900 border border-zinc-800 rounded-md py-2 px-3 pr-8 text-sm text-zinc-300 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-colors"
+                            >
+                              {group.proxies.map((proxy) => (
+                                <option key={proxy} value={proxy}>
+                                  {proxy}
+                                </option>
+                              ))}
+                            </select>
+                            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-zinc-400">
+                              <svg className="h-4 w-4 fill-current" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+                                <path d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" />
+                              </svg>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </CardContent>
               </Card>
             </div>

@@ -15,6 +15,7 @@ class Api:
         self._sub_loader = SubscriptionLoader()
         self._updater = Updater()
         self._servers: list[dict] = []
+        self._proxy_groups: list[dict] = []
         self._subscription_url: str = ""
         self._user_config_dir = get_user_config_dir()
         self._config_file = self._user_config_dir / "config.json"
@@ -71,19 +72,42 @@ class Api:
                 "success": False,
                 "error": result.error,
                 "server_count": 0,
+                "proxy_groups": [],
             }
 
         self._subscription_url = url
         self._save_config()
 
         self._servers = self._transform_proxies_to_servers(result.proxies)
-        self._config_gen.generate_clash_config(result.proxies)
+        self._proxy_groups = result.proxy_groups
+
+        if result.raw_config:
+            self._config_gen.generate_clash_config_from_subscription(result.raw_config)
+        else:
+            self._config_gen.generate_clash_config(result.proxies)
 
         return {
             "success": True,
             "error": None,
             "server_count": len(self._servers),
+            "proxy_groups": self._transform_proxy_groups(result.proxy_groups),
         }
+
+    def get_proxy_groups(self) -> list[dict]:
+        return self._transform_proxy_groups(self._proxy_groups)
+
+    def _transform_proxy_groups(self, groups: list) -> list[dict]:
+        transformed = []
+        for group in groups:
+            if isinstance(group, dict):
+                transformed.append(
+                    {
+                        "name": group.get("name", ""),
+                        "type": group.get("type", "select"),
+                        "proxies": group.get("proxies", []),
+                    }
+                )
+        return transformed
 
     def check_for_update(self) -> dict:
         return self._updater.check_for_update()

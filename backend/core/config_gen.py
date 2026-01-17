@@ -21,6 +21,25 @@ class ConfigGenerator:
     def __init__(self):
         self._config_dir = get_user_config_dir()
 
+    def generate_clash_config_from_subscription(self, raw_config: dict) -> Path:
+        config = {
+            "port": 17890,
+            "socks-port": SOCKS_PORT,
+            "allow-lan": False,
+            "mode": raw_config.get("mode", "rule"),
+            "proxies": raw_config.get("proxies", []),
+            "proxy-groups": raw_config.get("proxy-groups", []),
+            "rules": raw_config.get("rules", []),
+        }
+
+        if raw_config.get("dns"):
+            config["dns"] = raw_config["dns"]
+
+        config_path = self._config_dir / "runtime_clash.yaml"
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config, f, allow_unicode=True)
+        return config_path
+
     def generate_clash_config(self, proxies: list) -> Path:
         proxy_names = [p.get("name", f"proxy-{i}") for i, p in enumerate(proxies)]
 

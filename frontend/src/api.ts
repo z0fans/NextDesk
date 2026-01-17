@@ -8,6 +8,7 @@ declare global {
         save_config: (config: Record<string, unknown>) => Promise<boolean>;
         load_subscription: (url: string) => Promise<SubscriptionResult>;
         get_servers: () => Promise<Server[]>;
+        get_proxy_groups: () => Promise<ProxyGroup[]>;
         get_subscription_url: () => Promise<string>;
         test_servers_connectivity: () => Promise<Server[]>;
         check_for_update: () => Promise<UpdateInfo>;
@@ -34,10 +35,17 @@ export interface Server {
   status: 'online' | 'offline' | 'unknown';
 }
 
+export interface ProxyGroup {
+  name: string;
+  type: string;
+  proxies: string[];
+}
+
 export interface SubscriptionResult {
   success: boolean;
   error: string | null;
   server_count: number;
+  proxy_groups?: ProxyGroup[];
 }
 
 export interface UpdateInfo {
@@ -135,6 +143,13 @@ export const api = {
       return [];
     }
     return window.pywebview.api.get_servers();
+  },
+
+  getProxyGroups: async (): Promise<ProxyGroup[]> => {
+    if (!(await ensurePywebview())) {
+      return [];
+    }
+    return window.pywebview.api.get_proxy_groups();
   },
 
   getSubscriptionUrl: async (): Promise<string> => {

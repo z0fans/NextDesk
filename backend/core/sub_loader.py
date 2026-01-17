@@ -1,7 +1,7 @@
 import base64
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -12,6 +12,9 @@ import requests
 class SubscriptionResult:
     success: bool
     proxies: list
+    proxy_groups: list = field(default_factory=list)
+    rules: list = field(default_factory=list)
+    raw_config: dict = field(default_factory=dict)
     error: Optional[str] = None
 
 
@@ -42,18 +45,18 @@ class SubscriptionLoader:
         except Exception as e:
             return SubscriptionResult(success=False, proxies=[], error=str(e))
 
-        proxies, parse_error = self._parse(response.text)
-        if parse_error:
-            return SubscriptionResult(success=False, proxies=[], error=parse_error)
+        result = self._parse(response.text)
+        if result.error:
+            return result
 
-        if not proxies:
+        if not result.proxies:
             return SubscriptionResult(
                 success=False, proxies=[], error="No proxies found"
             )
 
-        return SubscriptionResult(success=True, proxies=proxies)
+        return result
 
-    def _parse(self, content: str) -> tuple[list, Optional[str]]:
+    def _parse(self, content: str) -> SubscriptionResult:
         content = content.strip()
 
         decoded_content = None
@@ -67,14 +70,14 @@ class SubscriptionLoader:
                 continue
 
             if text.startswith("{") or text.startswith("["):
-                proxies = self._parse_json(text)
-                if proxies:
-                    return proxies, None
+                result = self._parse_json(text)
+                if result.proxies:
+                    return result
 
             if "proxies:" in text or text.startswith("port:"):
-                proxies, _ = self._parse_clash_yaml(text)
-                if proxies:
-                    return proxies, None
+                result = self._parse_clash_yaml(text)
+                if result.proxies:
+                    return result
 
             if any(
                 scheme in text
@@ -82,34 +85,64 @@ class SubscriptionLoader:
             ):
                 proxies = self._parse_uri_list(text)
                 if proxies:
-                    return proxies, None
+                    return SubscriptionResult(success=True, proxies=proxies)
 
-        return [], "Unsupported subscription format"
+        return SubscriptionResult(
+            success=False, proxies=[], error="Unsupported subscription format"
+        )
 
-    def _parse_clash_yaml(self, content: str) -> tuple[list, Optional[str]]:
+    def _parse_clash_yaml(self, content: str) -> SubscriptionResult:
         import yaml
 
         try:
             data = yaml.safe_load(content)
             if not isinstance(data, dict):
-                return [], "Invalid YAML format"
+                return SubscriptionResult(
+                    success=False, proxies=[], error="Invalid YAML format"
+                )
+
             proxies = data.get("proxies", [])
             if not isinstance(proxies, list):
-                return [], "Invalid proxies format"
-            return proxies, None
-        except Exception as e:
-            return [], f"YAML error: {str(e)[:50]}"
+                return SubscriptionResult(
+                    success=False, proxies=[], error="Invalid proxies format"
+                )
 
-    def _parse_json(self, content: str) -> list:
+            proxy_groups = data.get("proxy-groups", [])
+            rules = data.get("rules", [])
+
+            return SubscriptionResult(
+                success=True,
+                proxies=proxies,
+                proxy_groups=proxy_groups,
+                rules=rules,
+                raw_config=data,
+            )
+        except Exception as e:
+            return SubscriptionResult(
+                success=False, proxies=[], error=f"YAML error: {str(e)[:50]}"
+            )
+
+    def _parse_json(self, content: str) -> SubscriptionResult:
         try:
             data = json.loads(content)
             if isinstance(data, list):
-                return data
+                return SubscriptionResult(success=True, proxies=data)
             if isinstance(data, dict):
-                return data.get("proxies", data.get("outbounds", []))
+                proxies = data.get("proxies", data.get("outbounds", []))
+                proxy_groups = data.get("proxy-groups", [])
+                rules = data.get("rules", [])
+                return SubscriptionResult(
+                    success=True,
+                    proxies=proxies,
+                    proxy_groups=proxy_groups,
+                    rules=rules,
+                    raw_config=data,
+                )
         except Exception:
             pass
-        return []
+        return SubscriptionResult(
+            success=False, proxies=[], error="Invalid JSON format"
+        )
 
     def _parse_uri_list(self, content: str) -> list:
         proxies = []
