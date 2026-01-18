@@ -42,12 +42,22 @@ class Launcher:
             self._stop_hijack = True
             if self._clash_proc:
                 self._clash_proc.terminate()
+                try:
+                    self._clash_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._clash_proc.kill()
+                    self._clash_proc.wait(timeout=2)
                 self._clash_proc = None
             if self._clash_log_file:
                 self._clash_log_file.close()
                 self._clash_log_file = None
             if self._multidesk_proc:
                 self._multidesk_proc.terminate()
+                try:
+                    self._multidesk_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._multidesk_proc.kill()
+                    self._multidesk_proc.wait(timeout=2)
                 self._multidesk_proc = None
             return True
         except Exception as e:
