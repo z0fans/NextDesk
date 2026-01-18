@@ -34,6 +34,13 @@ class ConfigGenerator:
         for group in proxy_groups:
             name = group.get("name", "").lower()
             if any(kw in name for kw in RDP_GROUP_KEYWORDS):
+                group_type = group.get("type", "").lower()
+                if group_type in ["select", "url-test"]:
+                    group = dict(group)
+                    group["type"] = "fallback"
+                    group["url"] = "http://www.gstatic.com/generate_204"
+                    group["interval"] = 30
+                    group["timeout"] = 2000
                 filtered.append(group)
         return filtered
 
@@ -106,7 +113,7 @@ class ConfigGenerator:
             yaml.dump(config, f, allow_unicode=True)
         return config_path
 
-    def generate_multidesk_xml(self, servers: list = None) -> Path:
+    def generate_multidesk_xml(self) -> Path:
         xml_path = self._config_dir / "MultiDesk.multidesk"
         xml_content = self._build_xml()
         with open(xml_path, "w", encoding="utf-8") as f:
