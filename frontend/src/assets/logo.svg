@@ -1,0 +1,61 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Background Verticals Gradient: Deep Blue to Blue -->
+    <linearGradient id="grad-node" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1e3a8a" /> <!-- Blue 900 -->
+      <stop offset="100%" stop-color="#2563eb" /> <!-- Blue 600 -->
+    </linearGradient>
+
+    <!-- Foreground Diagonal Gradient: Electric Blue to Cyan (The "Accelerator") -->
+    <linearGradient id="grad-beam" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#3b82f6" /> <!-- Blue 500 -->
+      <stop offset="40%" stop-color="#06b6d4" /> <!-- Cyan 500 -->
+      <stop offset="100%" stop-color="#22d3ee" /> <!-- Cyan 400 -->
+    </linearGradient>
+
+    <!-- Shadow for Depth -->
+    <filter id="depth-shadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="8" />
+      <feOffset dx="4" dy="8" result="offsetblur" />
+      <feFlood flood-color="#000000" flood-opacity="0.3" />
+      <feComposite in2="offsetblur" operator="in" />
+      <feMerge>
+        <feMergeNode />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+
+    <!-- Subtle Inner Glow/Sheen for 3D feel -->
+    <linearGradient id="sheen" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="white" stop-opacity="0.2" />
+      <stop offset="100%" stop-color="white" stop-opacity="0" />
+    </linearGradient>
+  </defs>
+
+  <!-- Group centered with padding consideration if needed, but we drew coordinates directly -->
+  <g>
+    <!-- Left Node (Pill) -->
+    <rect x="80" y="64" width="100" height="384" rx="50" fill="url(#grad-node)" />
+    
+    <!-- Right Node (Pill) -->
+    <rect x="332" y="64" width="100" height="384" rx="50" fill="url(#grad-node)" />
+
+    <!-- The Accelerator (Diagonal) -->
+    <!-- Drawn as a thick stroke with rounded caps to match the pills -->
+    <!-- Coordinates calculated to align caps with the top/bottom of verticals -->
+    <!-- Top-Left Center: (130, 114) -> Radius 50 -> Top Edge 64 -->
+    <!-- Bottom-Right Center: (382, 398) -> Radius 50 -> Bottom Edge 448 -->
+    <line x1="130" y1="114" x2="382" y2="398" 
+          stroke="url(#grad-beam)" 
+          stroke-width="100" 
+          stroke-linecap="round" 
+          filter="url(#depth-shadow)" />
+          
+    <!-- Optional: Sheen Overlay on Diagonal for extra "glassy" 2025 feel -->
+    <line x1="130" y1="114" x2="382" y2="398" 
+          stroke="url(#sheen)" 
+          stroke-width="100" 
+          stroke-linecap="round" 
+          style="mix-blend-mode: overlay;" />
+  </g>
+</svg>
