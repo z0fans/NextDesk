@@ -41,6 +41,7 @@ export interface ProxyGroup {
   name: string;
   type: string;
   proxies: string[];
+  now?: string;
 }
 
 export interface SubscriptionResult {

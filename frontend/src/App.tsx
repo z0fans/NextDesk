@@ -387,7 +387,7 @@ function App() {
                 {/* Clash Card */}
                 <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 shadow-sm">
                   <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-base font-medium text-white">Clash Engine</h3>
+                    <h3 className="text-base font-medium text-white">Core Engine</h3>
                     <Globe className="h-4 w-4 text-blue-500" />
                   </div>
                   <div className="text-2xl font-bold text-white mb-1">
@@ -407,7 +407,7 @@ function App() {
                 {/* MultiDesk Card */}
                 <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 shadow-sm">
                   <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-base font-medium text-white">MultiDesk</h3>
+                    <h3 className="text-base font-medium text-white">NextDesk</h3>
                     <ServerIcon className="h-4 w-4 text-cyan-500" />
                   </div>
                   <div className="text-2xl font-bold text-white mb-1">
@@ -463,7 +463,7 @@ function App() {
                 proxyGroups.map((group) => {
                   const isSelectType = group.type.toLowerCase().includes('select');
                   const isExpanded = isSelectType && expandedGroups.has(group.name);
-                  const selectedProxy = selectedProxies[group.name] || group.proxies[0];
+                  const selectedProxy = group.now || selectedProxies[group.name] || group.proxies[0];
                   
                   const badgeColor = isSelectType
                     ? 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20'

@@ -110,17 +110,30 @@ class Api:
     def get_proxy_groups(self) -> list[dict]:
         return self._transform_proxy_groups(self._proxy_groups)
 
+    def _get_active_proxy(self, group_name: str) -> str | None:
+        try:
+            resp = requests.get(
+                f"{CLASH_API_BASE}/proxies/{url_quote(group_name)}", timeout=2
+            )
+            if resp.status_code == 200:
+                return resp.json().get("now")
+        except Exception:
+            pass
+        return None
+
     def _transform_proxy_groups(self, groups: list) -> list[dict]:
         transformed = []
         for group in groups:
             if isinstance(group, dict):
                 name = group.get("name", "")
                 if any(kw in name.lower() for kw in RDP_GROUP_KEYWORDS):
+                    now = self._get_active_proxy(name)
                     transformed.append(
                         {
                             "name": name,
                             "type": group.get("type", "select"),
                             "proxies": group.get("proxies", []),
+                            "now": now,
                         }
                     )
         return transformed

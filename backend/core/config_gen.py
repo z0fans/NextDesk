@@ -34,13 +34,6 @@ class ConfigGenerator:
         for group in proxy_groups:
             name = group.get("name", "").lower()
             if any(kw in name for kw in RDP_GROUP_KEYWORDS):
-                group_type = group.get("type", "").lower()
-                if group_type in ["select", "url-test"]:
-                    group = dict(group)
-                    group["type"] = "fallback"
-                    group["url"] = "http://www.gstatic.com/generate_204"
-                    group["interval"] = 30
-                    group["timeout"] = 2000
                 filtered.append(group)
         return filtered
 
