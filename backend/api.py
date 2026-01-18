@@ -264,3 +264,14 @@ class Api:
         except Exception:
             pass
         return {"connections": [], "downloadTotal": 0, "uploadTotal": 0}
+
+    def switch_proxy(self, group_name: str, proxy_name: str) -> bool:
+        try:
+            resp = requests.put(
+                f"{CLASH_API_BASE}/proxies/{url_quote(group_name)}",
+                json={"name": proxy_name},
+                timeout=5,
+            )
+            return resp.status_code == 204
+        except Exception:
+            return False

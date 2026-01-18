@@ -79,11 +79,14 @@ function App() {
     });
   };
 
-  const handleProxySelect = (groupName: string, proxyName: string) => {
-    setSelectedProxies(prev => ({
-      ...prev,
-      [groupName]: proxyName
-    }));
+  const handleProxySelect = async (groupName: string, proxyName: string) => {
+    const success = await api.switchProxy(groupName, proxyName);
+    if (success) {
+      setSelectedProxies(prev => ({
+        ...prev,
+        [groupName]: proxyName
+      }));
+    }
   };
 
   const handleTestConnectivity = async () => {

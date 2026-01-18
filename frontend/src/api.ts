@@ -18,6 +18,7 @@ declare global {
         install_update: () => Promise<boolean>;
         get_current_version: () => Promise<string>;
         get_connections: () => Promise<ConnectionsData>;
+        switch_proxy: (groupName: string, proxyName: string) => Promise<boolean>;
       };
     };
   }
@@ -243,5 +244,12 @@ export const api = {
       return { connections: [], downloadTotal: 0, uploadTotal: 0 };
     }
     return window.pywebview.api.get_connections();
+  },
+
+  switchProxy: async (groupName: string, proxyName: string): Promise<boolean> => {
+    if (!(await ensurePywebview())) {
+      return false;
+    }
+    return window.pywebview.api.switch_proxy(groupName, proxyName);
   },
 };
