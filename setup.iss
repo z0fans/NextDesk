@@ -22,6 +22,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 DisableProgramGroupPage=yes
 LicenseFile=
 WizardStyle=modern
+SetupIconFile=assets\icons\NextDesk.ico
+UninstallDisplayIcon={app}\NextDesk.exe
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

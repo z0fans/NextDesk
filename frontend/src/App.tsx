@@ -12,17 +12,26 @@ import {
   Download,
   X,
   ChevronDown,
-  ChevronRight
+  ChevronRight,
+  FileText
 } from 'lucide-react';
-import { api, type EngineStatus, type Server, type UpdateInfo, type DownloadStatus, type ProxyGroup } from './api';
+import { api, type EngineStatus, type Server, type UpdateInfo, type DownloadStatus, type ProxyGroup, type Connection } from './api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
 
+const formatBytes = (bytes: number): string => {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+};
+
 function App() {
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'servers' | 'proxy' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'servers' | 'proxy' | 'logs' | 'settings'>('dashboard');
   const [status, setStatus] = useState<EngineStatus>({ clash: false, multidesk: false });
   const [, setServers] = useState<Server[]>([]);
   const [loading, setLoading] = useState(false);
@@ -39,6 +48,7 @@ function App() {
   const [selectedProxies, setSelectedProxies] = useState<Record<string, string>>({});
   const [testingConnectivity, setTestingConnectivity] = useState(false);
   const [nodeDelays, setNodeDelays] = useState<Record<string, number>>({});
+  const [connections, setConnections] = useState<Connection[]>([]);
 
   useEffect(() => {
     if (proxyGroups.length > 0) {
@@ -162,6 +172,18 @@ function App() {
     return () => clearInterval(interval);
   }, []);
 
+  useEffect(() => {
+    if (activeTab === 'logs') {
+      const fetchConnections = async () => {
+        const data = await api.getConnections();
+        setConnections(data.connections || []);
+      };
+      fetchConnections();
+      const interval = setInterval(fetchConnections, 2000);
+      return () => clearInterval(interval);
+    }
+  }, [activeTab]);
+
   const handleToggleEngine = async () => {
     setLoading(true);
     try {
@@ -263,6 +285,20 @@ function App() {
 
           <Button
             variant="ghost"
+            onClick={() => setActiveTab('logs')}
+            className={cn(
+              "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
+              activeTab === 'logs' 
+                ? "bg-amber-500/10 text-amber-400 hover:bg-amber-500/15 hover:text-amber-300" 
+                : "text-zinc-400 hover:text-white hover:bg-white/5"
+            )}
+          >
+            <FileText className={cn("h-4 w-4", activeTab === 'logs' ? "text-amber-500" : "text-zinc-500")} />
+            Logs
+          </Button>
+
+          <Button
+            variant="ghost"
             onClick={() => setActiveTab('settings')}
             className={cn(
               "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
@@ -303,12 +339,14 @@ function App() {
                 {activeTab === 'dashboard' && 'Dashboard'}
                 {activeTab === 'servers' && 'Server List'}
                 {activeTab === 'proxy' && 'Proxy'}
+                {activeTab === 'logs' && 'Logs'}
                 {activeTab === 'settings' && 'Settings'}
               </h1>
               <p className="text-zinc-400">
                 {activeTab === 'dashboard' && 'Overview of your network status'}
                 {activeTab === 'servers' && 'Manage available connection nodes'}
                 {activeTab === 'proxy' && 'Configure subscription and proxy settings'}
+                {activeTab === 'logs' && 'Real-time connection logs'}
                 {activeTab === 'settings' && 'Application version and updates'}
               </p>
             </div>
@@ -564,6 +602,83 @@ function App() {
                   </div>
                 </CardContent>
               </Card>
+            </div>
+          )}
+
+          {/* Logs View */}
+          {activeTab === 'logs' && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between mb-4">
+                <div className="text-sm text-zinc-400">
+                  Active connections: <span className="text-white font-medium">{connections.length}</span>
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={async () => {
+                    const data = await api.getConnections();
+                    setConnections(data.connections || []);
+                  }}
+                  className="border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white hover:bg-zinc-800"
+                >
+                  <RefreshCw className="h-3 w-3 mr-2" />
+                  Refresh
+                </Button>
+              </div>
+
+              {connections.length === 0 ? (
+                <Card className="bg-zinc-900 border-zinc-800">
+                  <CardContent className="p-6 text-center text-zinc-500">
+                    No active connections. Start the engine and connect to RDP.
+                  </CardContent>
+                </Card>
+              ) : (
+                <div className="space-y-2">
+                  {connections.map((conn) => (
+                    <div 
+                      key={conn.id} 
+                      className="bg-zinc-900 border border-zinc-800 rounded-lg p-4"
+                    >
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-2">
+                            <Badge variant="outline" className="bg-blue-500/10 text-blue-400 border-blue-500/20 text-xs">
+                              {conn.metadata.network.toUpperCase()}
+                            </Badge>
+                            <Badge variant="outline" className="bg-violet-500/10 text-violet-400 border-violet-500/20 text-xs">
+                              {conn.metadata.type}
+                            </Badge>
+                            {conn.rule && (
+                              <Badge variant="outline" className="bg-zinc-800 text-zinc-400 border-zinc-700 text-xs">
+                                {conn.rule}
+                              </Badge>
+                            )}
+                          </div>
+                          <div className="text-sm text-white font-mono truncate">
+                            {conn.metadata.host || conn.metadata.destinationIP}:{conn.metadata.destinationPort}
+                          </div>
+                          <div className="text-xs text-zinc-500 mt-1">
+                            {conn.metadata.sourceIP}:{conn.metadata.sourcePort} → {conn.metadata.destinationIP}:{conn.metadata.destinationPort}
+                          </div>
+                          {conn.chains.length > 0 && (
+                            <div className="text-xs text-amber-400/80 mt-2">
+                              Chain: {conn.chains.join(' → ')}
+                            </div>
+                          )}
+                        </div>
+                        <div className="text-right shrink-0">
+                          <div className="text-xs text-emerald-400">
+                            ↓ {formatBytes(conn.download)}
+                          </div>
+                          <div className="text-xs text-blue-400">
+                            ↑ {formatBytes(conn.upload)}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 

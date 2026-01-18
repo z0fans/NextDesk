@@ -242,3 +242,12 @@ class Api:
             t.join(timeout=10)
 
         return result
+
+    def get_connections(self) -> dict:
+        try:
+            resp = requests.get(f"{CLASH_API_BASE}/connections", timeout=5)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass
+        return {"connections": [], "downloadTotal": 0, "uploadTotal": 0}

@@ -17,6 +17,7 @@ declare global {
         start_download_update: () => Promise<boolean>;
         install_update: () => Promise<boolean>;
         get_current_version: () => Promise<string>;
+        get_connections: () => Promise<ConnectionsData>;
       };
     };
   }
@@ -60,6 +61,33 @@ export interface UpdateInfo {
 export interface DownloadStatus {
   status: 'idle' | 'downloading' | 'ready' | string;
   progress: number;
+}
+
+export interface Connection {
+  id: string;
+  metadata: {
+    network: string;
+    type: string;
+    sourceIP: string;
+    destinationIP: string;
+    sourcePort: string;
+    destinationPort: string;
+    host: string;
+    dnsMode: string;
+    processPath: string;
+  };
+  upload: number;
+  download: number;
+  start: string;
+  chains: string[];
+  rule: string;
+  rulePayload: string;
+}
+
+export interface ConnectionsData {
+  connections: Connection[];
+  downloadTotal: number;
+  uploadTotal: number;
 }
 
 // Check if pywebview API is available (may be injected after page load)
@@ -207,5 +235,12 @@ export const api = {
       return 'dev';
     }
     return window.pywebview.api.get_current_version();
+  },
+
+  getConnections: async (): Promise<ConnectionsData> => {
+    if (!(await ensurePywebview())) {
+      return { connections: [], downloadTotal: 0, uploadTotal: 0 };
+    }
+    return window.pywebview.api.get_connections();
   },
 };
