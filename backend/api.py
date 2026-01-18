@@ -272,6 +272,23 @@ class Api:
                 json={"name": proxy_name},
                 timeout=5,
             )
-            return resp.status_code == 204
+            if resp.status_code == 204:
+                self._close_all_connections()
+                return True
+            return False
         except Exception:
             return False
+
+    def _close_all_connections(self):
+        try:
+            resp = requests.get(f"{CLASH_API_BASE}/connections", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                for conn in data.get("connections", []):
+                    conn_id = conn.get("id")
+                    if conn_id:
+                        requests.delete(
+                            f"{CLASH_API_BASE}/connections/{conn_id}", timeout=2
+                        )
+        except Exception:
+            pass
