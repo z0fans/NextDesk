@@ -18,6 +18,7 @@ import {
 import { api, type EngineStatus, type Server, type UpdateInfo, type DownloadStatus, type ProxyGroup, type Connection } from './api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
+import { Logo } from '@/components/Logo';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
@@ -227,8 +228,8 @@ function App() {
       {/* Sidebar - Fixed Width w-64 */}
       <aside className="hidden md:flex md:w-64 md:flex-col md:fixed md:inset-y-0 md:left-0 border-r border-white/5 bg-zinc-950 z-50">
         <div className="p-6 flex items-center gap-3 border-b border-white/5">
-          <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-blue-600 to-cyan-600 flex items-center justify-center shadow-lg shadow-blue-900/20">
-            <Zap className="h-6 w-6 text-white" />
+          <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-blue-600 to-cyan-600 flex items-center justify-center shadow-lg shadow-blue-900/20 overflow-hidden">
+            <Logo className="h-7 w-7" />
           </div>
           <div>
             <span className="font-bold text-lg text-white block leading-none mb-1">
