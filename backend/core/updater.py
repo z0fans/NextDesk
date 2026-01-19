@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional, Callable
 import requests
 
-CURRENT_VERSION = "1.0.48"
+CURRENT_VERSION = "1.0.50"
 GITHUB_REPO = "z0fans/NextDesk"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
