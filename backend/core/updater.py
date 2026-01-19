@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional, Callable
 import requests
 
-CURRENT_VERSION = "1.0.52"
+CURRENT_VERSION = "1.0.53"
 GITHUB_REPO = "z0fans/NextDesk"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -114,8 +114,13 @@ class Updater:
             if sys.platform == "win32":
                 subprocess.Popen(
                     [str(installer_path), "/SILENT"],
-                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                    | subprocess.DETACHED_PROCESS,
                 )
+                import time
+
+                time.sleep(0.5)
+                os._exit(0)
             return True
         except Exception:
             return False
