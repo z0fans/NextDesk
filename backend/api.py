@@ -231,7 +231,7 @@ class Api:
                 resp = requests.get(
                     url,
                     params={
-                        "url": "https://www.gstatic.com/generate_204",
+                        "url": "http://www.gstatic.com/generate_204",
                         "timeout": 5000,
                         "unified": "true",
                     },
