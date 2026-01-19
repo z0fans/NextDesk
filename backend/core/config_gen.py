@@ -200,6 +200,7 @@ class ConfigGenerator:
 			<InheritProxy>0</InheritProxy>
 			<InheritDisplay>0</InheritDisplay>
 			<GroupCollapsed>0</GroupCollapsed>
+			<UserName>Administrator</UserName>
 			<UserName/>
 			<Domain/>
 			<Password>$1$149f7517dc8e61dee9277d35ce09bef0$0bad825600398f03ca52df0d7035eb52980bd775fe092b8810017a0600d4efe1</Password>
