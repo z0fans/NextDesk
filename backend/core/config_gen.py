@@ -28,6 +28,13 @@ RDP_GROUP_KEYWORDS = ["server-", "auto-"]
 class ConfigGenerator:
     def __init__(self):
         self._config_dir = get_user_config_dir()
+        self._proxy_port = SOCKS_PORT
+
+    def set_proxy_port(self, port: int):
+        self._proxy_port = port
+
+    def get_proxy_port(self) -> int:
+        return self._proxy_port
 
     def _filter_rdp_groups(self, proxy_groups: list) -> list:
         filtered = []
@@ -114,28 +121,29 @@ class ConfigGenerator:
         return xml_path
 
     def _build_xml(self) -> str:
+        port = self._proxy_port
         return f"""<?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <MultiDesk>
-	<Servers>
-		<Group>
-			<Properties>
-				<Name>LibrasService-Asia-Group</Name>
-				<Description/>
-				<InheritGeneral>0</InheritGeneral>
-				<InheritProxy>1</InheritProxy>
-				<ProxyType>1</ProxyType>
-				<SocksHostname>127.0.0.1</SocksHostname>
-				<SocksPort>{SOCKS_PORT}</SocksPort>
-				<SocksUserName>librascloud</SocksUserName>
-				<SocksPassword>$1$4c2a95fa3aa1be1f4f2cbfb3eac012d0$323383454e7ed34f0f92e4349be5f866a74020f2d0122890f890d107594d5b7c</SocksPassword>
-				<InheritDisplay>1</InheritDisplay>
-				<GroupCollapsed>0</GroupCollapsed>
-				<UserName>administrator</UserName>
-				<Domain/>
-				<Password>$1$4721fdb4852584c619bf2fab37b350d3$7a2429768746cbe2eceea00915d4fd26c721072d80291518623d68e3d5b842f7</Password>
-				<RDPPort>3389</RDPPort>
-				<DesktopHeight>0</DesktopHeight>
-				<DesktopWidth>0</DesktopWidth>
+\t<Servers>
+\t\t<Group>
+\t\t\t<Properties>
+\t\t\t\t<Name>LibrasService-Asia-Group</Name>
+\t\t\t\t<Description/>
+\t\t\t\t<InheritGeneral>0</InheritGeneral>
+\t\t\t\t<InheritProxy>1</InheritProxy>
+\t\t\t\t<ProxyType>1</ProxyType>
+\t\t\t\t<SocksHostname>127.0.0.1</SocksHostname>
+\t\t\t\t<SocksPort>{port}</SocksPort>
+\t\t\t\t<SocksUserName>librascloud</SocksUserName>
+\t\t\t\t<SocksPassword>$1$4c2a95fa3aa1be1f4f2cbfb3eac012d0$323383454e7ed34f0f92e4349be5f866a74020f2d0122890f890d107594d5b7c</SocksPassword>
+\t\t\t\t<InheritDisplay>1</InheritDisplay>
+\t\t\t\t<GroupCollapsed>0</GroupCollapsed>
+\t\t\t\t<UserName>administrator</UserName>
+\t\t\t\t<Domain/>
+\t\t\t\t<Password>$1$4721fdb4852584c619bf2fab37b350d3$7a2429768746cbe2eceea00915d4fd26c721072d80291518623d68e3d5b842f7</Password>
+\t\t\t\t<RDPPort>3389</RDPPort>
+\t\t\t\t<DesktopHeight>0</DesktopHeight>
+\t\t\t\t<DesktopWidth>0</DesktopWidth>
 				<ZoomLevel>100</ZoomLevel>
 				<DesktopScaleFactor>0</DesktopScaleFactor>
 				<ColorDepth>24</ColorDepth>
@@ -184,7 +192,7 @@ class ConfigGenerator:
 				<ClientName>$1$306d20e9bbd269b79d4f4ace00e1c068$49d8bc37e92571ef41534e6d188a8dad320931dc9a813f0306ecbf4d85250914</ClientName>
 				<ProxyType>0</ProxyType>
 				<SocksHostname>127.0.0.1</SocksHostname>
-				<SocksPort>{SOCKS_PORT}</SocksPort>
+\t\t\t\t<SocksPort>{port}</SocksPort>
 				<SocksUserName/>
 				<SocksPassword/>
 				<UserName>Administrator</UserName>
@@ -207,7 +215,7 @@ class ConfigGenerator:
 			<RDPPort>3389</RDPPort>
 			<ProxyType>1</ProxyType>
 			<SocksHostname>127.0.0.1</SocksHostname>
-			<SocksPort>{SOCKS_PORT}</SocksPort>
+\t\t\t<SocksPort>{port}</SocksPort>
 			<SocksUserName>LibrasCloud</SocksUserName>
 			<SocksPassword>$1$1ca28dd147ccd2f242e43a01775ddc10$5c4492b2704ed64e7e08dd06998d9d9d0cc2a38a93b1e98f6775ca5b34d0f0ac</SocksPassword>
 			<DesktopHeight>-10</DesktopHeight>

@@ -15,7 +15,7 @@ import {
   ChevronRight,
   FileText
 } from 'lucide-react';
-import { api, type EngineStatus, type Server, type UpdateInfo, type DownloadStatus, type ProxyGroup, type Connection } from './api';
+import { api, type EngineStatus, type Server, type UpdateInfo, type DownloadStatus, type ProxyGroup, type Connection, type RunMode } from './api';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Logo } from '@/components/Logo';
@@ -50,6 +50,7 @@ function App() {
   const [testingConnectivity, setTestingConnectivity] = useState(false);
   const [nodeDelays, setNodeDelays] = useState<Record<string, number>>({});
   const [connections, setConnections] = useState<Connection[]>([]);
+  const [runMode, setRunMode] = useState<RunMode>({ reuse_mode: false, clash_api: '', proxy_port: 17897 });
 
   useEffect(() => {
     if (proxyGroups.length > 0) {
@@ -110,11 +111,12 @@ function App() {
 
   const fetchData = async () => {
     try {
-      const [newStatus, newServers, savedUrl, newProxyGroups] = await Promise.all([
+      const [newStatus, newServers, savedUrl, newProxyGroups, newRunMode] = await Promise.all([
         api.getStatus(),
         api.getServers(),
         api.getSubscriptionUrl(),
-        api.getProxyGroups()
+        api.getProxyGroups(),
+        api.getRunMode()
       ]);
       setStatus(newStatus);
       setServers(newServers);
@@ -122,6 +124,7 @@ function App() {
         setSubUrl(savedUrl);
       }
       setProxyGroups(newProxyGroups);
+      setRunMode(newRunMode);
     } catch (error) {
       console.error('Failed to fetch data', error);
     }
@@ -394,16 +397,20 @@ function App() {
                     <Globe className="h-4 w-4 text-blue-500" />
                   </div>
                   <div className="text-2xl font-bold text-white mb-1">
-                    {status.clash ? 'Running' : 'Stopped'}
+                    {runMode.reuse_mode ? 'Clash Verge' : (status.clash ? 'Running' : 'Stopped')}
                   </div>
-                  <p className="text-xs text-zinc-500 mb-4">Core routing service</p>
+                  <p className="text-xs text-zinc-500 mb-4">
+                    {runMode.reuse_mode ? `Reuse mode (port ${runMode.proxy_port})` : 'Core routing service'}
+                  </p>
                   <Badge variant="secondary" className={cn(
                     "rounded-sm px-2 py-0.5 text-xs font-normal border",
-                    status.clash 
-                      ? "bg-blue-500/10 text-blue-400 border-blue-500/20" 
-                      : "bg-zinc-800 text-zinc-500 border-zinc-700"
+                    runMode.reuse_mode
+                      ? "bg-green-500/10 text-green-400 border-green-500/20"
+                      : status.clash 
+                        ? "bg-blue-500/10 text-blue-400 border-blue-500/20" 
+                        : "bg-zinc-800 text-zinc-500 border-zinc-700"
                   )}>
-                    {status.clash ? 'ACTIVE' : 'INACTIVE'}
+                    {runMode.reuse_mode ? 'REUSE' : (status.clash ? 'ACTIVE' : 'INACTIVE')}
                   </Badge>
                 </div>
 

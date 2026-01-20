@@ -3,6 +3,7 @@ import socket
 import threading
 import requests
 from urllib.parse import quote as url_quote
+from typing import Optional
 
 from core.launcher import Launcher
 from core.config_gen import ConfigGenerator, get_user_config_dir, get_log_dir
@@ -11,7 +12,30 @@ from core.sub_loader import SubscriptionLoader
 from core.updater import Updater
 
 RDP_GROUP_KEYWORDS = ["server-", "auto-"]
-CLASH_API_BASE = "http://127.0.0.1:17891"
+CLASH_API_PORTS = [9090, 9097, 7891, 7890]
+DEFAULT_CLASH_API = "http://127.0.0.1:17891"
+
+
+def detect_external_clash() -> Optional[tuple[str, int]]:
+    for port in CLASH_API_PORTS:
+        try:
+            resp = requests.get(f"http://127.0.0.1:{port}/version", timeout=1)
+            if resp.status_code == 200:
+                return ("127.0.0.1", port)
+        except Exception:
+            pass
+    return None
+
+
+def get_clash_proxy_port(api_host: str, api_port: int) -> int:
+    try:
+        resp = requests.get(f"http://{api_host}:{api_port}/configs", timeout=2)
+        if resp.status_code == 200:
+            config = resp.json()
+            return config.get("mixed-port") or config.get("socks-port") or 7897
+    except Exception:
+        pass
+    return 7897
 
 
 class Api:
@@ -26,8 +50,37 @@ class Api:
         self._user_config_dir = get_user_config_dir()
         self._log_dir = get_log_dir()
         self._config_file = self._user_config_dir / "config.json"
+
+        self._external_clash: Optional[tuple[str, int]] = None
+        self._clash_api_base: str = DEFAULT_CLASH_API
+        self._proxy_port: int = 17897
+        self._reuse_mode: bool = False
+
+        self._detect_and_configure_clash()
         self._load_saved_config()
         self._ensure_default_configs()
+
+    def _detect_and_configure_clash(self):
+        external = detect_external_clash()
+        if external:
+            self._external_clash = external
+            self._clash_api_base = f"http://{external[0]}:{external[1]}"
+            self._proxy_port = get_clash_proxy_port(external[0], external[1])
+            self._reuse_mode = True
+            self._config_gen.set_proxy_port(self._proxy_port)
+            self._launcher.set_reuse_mode(True)
+        else:
+            self._clash_api_base = DEFAULT_CLASH_API
+            self._proxy_port = 17897
+            self._reuse_mode = False
+            self._launcher.set_reuse_mode(False)
+
+    def get_run_mode(self) -> dict:
+        return {
+            "reuse_mode": self._reuse_mode,
+            "clash_api": self._clash_api_base,
+            "proxy_port": self._proxy_port,
+        }
 
     def _ensure_default_configs(self):
         multidesk_path = self._user_config_dir / "MultiDesk.multidesk"
@@ -108,12 +161,37 @@ class Api:
         }
 
     def get_proxy_groups(self) -> list[dict]:
+        if self._reuse_mode:
+            return self._fetch_external_proxy_groups()
         return self._transform_proxy_groups(self._proxy_groups)
+
+    def _fetch_external_proxy_groups(self) -> list[dict]:
+        try:
+            resp = requests.get(f"{self._clash_api_base}/proxies", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                proxies = data.get("proxies", {})
+                groups = []
+                for name, info in proxies.items():
+                    if info.get("type") == "Selector":
+                        if any(kw in name.lower() for kw in RDP_GROUP_KEYWORDS):
+                            groups.append(
+                                {
+                                    "name": name,
+                                    "type": "select",
+                                    "proxies": info.get("all", []),
+                                    "now": info.get("now"),
+                                }
+                            )
+                return groups
+        except Exception:
+            pass
+        return []
 
     def _get_active_proxy(self, group_name: str) -> str | None:
         try:
             resp = requests.get(
-                f"{CLASH_API_BASE}/proxies/{url_quote(group_name)}", timeout=2
+                f"{self._clash_api_base}/proxies/{url_quote(group_name)}", timeout=2
             )
             if resp.status_code == 200:
                 return resp.json().get("now")
@@ -212,22 +290,36 @@ class Api:
         return servers
 
     def test_group_delays(self, group_name: str) -> dict:
-        """Test delay for all proxies in a group using Clash API."""
         result = {}
-        group = None
-        for g in self._proxy_groups:
-            if isinstance(g, dict) and g.get("name") == group_name:
-                group = g
-                break
+        proxies = []
 
-        if not group:
+        if self._reuse_mode:
+            try:
+                resp = requests.get(
+                    f"{self._clash_api_base}/proxies/{url_quote(group_name)}", timeout=5
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    proxies = data.get("all", [])
+            except Exception:
+                pass
+        else:
+            group = None
+            for g in self._proxy_groups:
+                if isinstance(g, dict) and g.get("name") == group_name:
+                    group = g
+                    break
+            if group:
+                proxies = group.get("proxies", [])
+
+        if not proxies:
             return result
 
-        proxies = group.get("proxies", [])
+        api_base = self._clash_api_base
 
         def test_single(proxy_name: str):
             try:
-                url = f"{CLASH_API_BASE}/proxies/{url_quote(proxy_name)}/delay"
+                url = f"{api_base}/proxies/{url_quote(proxy_name)}/delay"
                 resp = requests.get(
                     url,
                     params={
@@ -258,7 +350,7 @@ class Api:
 
     def get_connections(self) -> dict:
         try:
-            resp = requests.get(f"{CLASH_API_BASE}/connections", timeout=5)
+            resp = requests.get(f"{self._clash_api_base}/connections", timeout=5)
             if resp.status_code == 200:
                 return resp.json()
         except Exception:
@@ -268,7 +360,7 @@ class Api:
     def switch_proxy(self, group_name: str, proxy_name: str) -> bool:
         try:
             resp = requests.put(
-                f"{CLASH_API_BASE}/proxies/{url_quote(group_name)}",
+                f"{self._clash_api_base}/proxies/{url_quote(group_name)}",
                 json={"name": proxy_name},
                 timeout=5,
             )

@@ -19,9 +19,16 @@ declare global {
         get_current_version: () => Promise<string>;
         get_connections: () => Promise<ConnectionsData>;
         switch_proxy: (groupName: string, proxyName: string) => Promise<boolean>;
+        get_run_mode: () => Promise<RunMode>;
       };
     };
   }
+}
+
+export interface RunMode {
+  reuse_mode: boolean;
+  clash_api: string;
+  proxy_port: number;
 }
 
 export interface EngineStatus {
@@ -251,5 +258,12 @@ export const api = {
       return false;
     }
     return window.pywebview.api.switch_proxy(groupName, proxyName);
+  },
+
+  getRunMode: async (): Promise<RunMode> => {
+    if (!(await ensurePywebview())) {
+      return { reuse_mode: false, clash_api: '', proxy_port: 17897 };
+    }
+    return window.pywebview.api.get_run_mode();
   },
 };

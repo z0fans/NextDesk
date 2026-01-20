@@ -26,11 +26,16 @@ class Launcher:
         self._stop_hijack = False
         self._clash_log_file = None
         self._log_dir = get_log_dir()
+        self._reuse_mode = False
+
+    def set_reuse_mode(self, enabled: bool):
+        self._reuse_mode = enabled
 
     def start(self) -> bool:
         try:
-            self._start_clash()
-            time.sleep(1)
+            if not self._reuse_mode:
+                self._start_clash()
+                time.sleep(1)
             self._start_multidesk()
             return True
         except Exception as e:
