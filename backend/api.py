@@ -38,6 +38,14 @@ def get_clash_proxy_port(api_host: str, api_port: int) -> int:
     return 7897
 
 
+def trigger_geodata_update(api_base: str) -> bool:
+    try:
+        resp = requests.post(f"{api_base}/configs/geo", timeout=30)
+        return resp.status_code in (200, 204)
+    except Exception:
+        return False
+
+
 class Api:
     def __init__(self):
         self._launcher = Launcher()
@@ -70,6 +78,11 @@ class Api:
             self._config_gen.set_proxy_port(self._proxy_port)
             self._config_gen.update_multidesk_proxy_port(self._proxy_port)
             self._launcher.set_reuse_mode(True)
+            threading.Thread(
+                target=trigger_geodata_update,
+                args=(self._clash_api_base,),
+                daemon=True,
+            ).start()
         else:
             self._clash_api_base = DEFAULT_CLASH_API
             self._proxy_port = 17897
