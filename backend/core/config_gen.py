@@ -120,6 +120,24 @@ class ConfigGenerator:
             f.write(xml_content)
         return xml_path
 
+    def update_multidesk_proxy_port(self, new_port: int) -> bool:
+        import re
+
+        xml_path = self._config_dir / "MultiDesk.multidesk"
+        if not xml_path.exists():
+            return False
+        try:
+            content = xml_path.read_text(encoding="utf-8")
+            updated = re.sub(
+                r"<SocksPort>\d+</SocksPort>",
+                f"<SocksPort>{new_port}</SocksPort>",
+                content,
+            )
+            xml_path.write_text(updated, encoding="utf-8")
+            return True
+        except Exception:
+            return False
+
     def _build_xml(self) -> str:
         port = self._proxy_port
         return f"""<?xml version="1.0" encoding="utf-8" standalone="yes"?>

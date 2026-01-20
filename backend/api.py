@@ -68,6 +68,7 @@ class Api:
             self._proxy_port = get_clash_proxy_port(external[0], external[1])
             self._reuse_mode = True
             self._config_gen.set_proxy_port(self._proxy_port)
+            self._config_gen.update_multidesk_proxy_port(self._proxy_port)
             self._launcher.set_reuse_mode(True)
         else:
             self._clash_api_base = DEFAULT_CLASH_API
