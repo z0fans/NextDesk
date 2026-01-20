@@ -718,7 +718,7 @@ function AppContent() {
                   <CardDescription className="text-muted-foreground">{t('settingsDesc')}</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
-                  <div className="bg-zinc-950 rounded-lg p-4">
+                  <div className="bg-muted dark:bg-zinc-950 rounded-lg p-4">
                     <div className="flex justify-between text-sm mb-2">
                       <span className="text-muted-foreground">{t('currentVersion')}</span>
                       <span className="text-foreground font-mono">v{currentVersion || '...'}</span>
@@ -746,7 +746,7 @@ function AppContent() {
                       "w-full",
                       updateInfo?.has_update 
                         ? "bg-emerald-600 hover:bg-emerald-500 text-white"
-                        : "bg-zinc-800 hover:bg-zinc-700 text-zinc-300"
+                        : "bg-muted dark:bg-zinc-800 hover:bg-muted-foreground/10 dark:hover:bg-zinc-700 text-foreground dark:text-zinc-300"
                     )}
                   >
                     <Download className="h-4 w-4 mr-2" />
