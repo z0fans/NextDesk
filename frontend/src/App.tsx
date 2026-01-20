@@ -23,6 +23,9 @@ import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
 import { ThemeToggle } from '@/components/ThemeToggle';
+import { LanguageProvider } from '@/i18n/LanguageProvider';
+import { useTranslation } from '@/i18n/useTranslation';
+import { LanguageToggle } from '@/components/LanguageToggle';
 
 const formatBytes = (bytes: number): string => {
   if (bytes === 0) return '0 B';
@@ -32,7 +35,8 @@ const formatBytes = (bytes: number): string => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
 };
 
-function App() {
+function AppContent() {
+  const { t } = useTranslation();
   const [activeTab, setActiveTab] = useState<'dashboard' | 'servers' | 'proxy' | 'logs' | 'settings'>('dashboard');
   const [status, setStatus] = useState<EngineStatus>({ clash: false, multidesk: false });
   const [, setServers] = useState<Server[]>([]);
@@ -215,13 +219,13 @@ function App() {
     try {
       const result = await api.loadSubscription(subUrl);
       if (result.success) {
-        setSubMessage({ type: 'success', text: `Loaded ${result.server_count} servers` });
+        setSubMessage({ type: 'success', text: t('loadedServers', { count: result.server_count }) });
         await fetchData();
       } else {
-        setSubMessage({ type: 'error', text: result.error || 'Failed to load subscription' });
+        setSubMessage({ type: 'error', text: result.error || t('failedToLoadSub') });
       }
     } catch (error) {
-      setSubMessage({ type: 'error', text: 'Network error' });
+      setSubMessage({ type: 'error', text: t('networkError') });
     } finally {
       setUpdatingSub(false);
       setTimeout(() => setSubMessage(null), 5000);
@@ -243,7 +247,7 @@ function App() {
               NextDesk
             </span>
             <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider block leading-none">
-              Accelerator
+              {t('accelerator')}
             </span>
           </div>
         </div>
@@ -260,7 +264,7 @@ function App() {
             )}
           >
             <LayoutDashboard className={cn("h-4 w-4", activeTab === 'dashboard' ? "text-blue-500" : "text-muted-foreground")} />
-            Dashboard
+            {t('dashboard')}
           </Button>
 
           <Button
@@ -274,7 +278,7 @@ function App() {
             )}
           >
             <ServerIcon className={cn("h-4 w-4", activeTab === 'servers' ? "text-cyan-500" : "text-muted-foreground")} />
-            Servers
+            {t('servers')}
           </Button>
 
           <Button
@@ -288,7 +292,7 @@ function App() {
             )}
           >
             <Globe className={cn("h-4 w-4", activeTab === 'proxy' ? "text-violet-500" : "text-muted-foreground")} />
-            Proxy
+            {t('proxy')}
           </Button>
 
           <Button
@@ -302,7 +306,7 @@ function App() {
             )}
           >
             <FileText className={cn("h-4 w-4", activeTab === 'logs' ? "text-amber-500" : "text-muted-foreground")} />
-            Logs
+            {t('logs')}
           </Button>
 
           <Button
@@ -316,25 +320,31 @@ function App() {
             )}
           >
             <Settings className={cn("h-4 w-4", activeTab === 'settings' ? "text-emerald-500" : "text-muted-foreground")} />
-            Settings
+            {t('settings')}
           </Button>
         </nav>
 
-        <div className="px-6 pb-4 flex items-center justify-between">
-           <span className="text-xs font-medium text-muted-foreground dark:text-muted-foreground">Appearance</span>
-           <ThemeToggle />
+        <div className="px-6 pb-4 space-y-4">
+           <div className="flex items-center justify-between">
+             <span className="text-xs font-medium text-muted-foreground dark:text-muted-foreground">{t('appearance')}</span>
+             <ThemeToggle />
+           </div>
+           <div className="flex items-center justify-between">
+             <span className="text-xs font-medium text-muted-foreground dark:text-muted-foreground">{t('language')}</span>
+             <LanguageToggle />
+           </div>
         </div>
 
         <div className="p-4 border-t border-sidebar-border">
           <div className="bg-sidebar-accent rounded-lg p-3 border border-sidebar-border">
             <div className="flex items-center justify-between mb-2">
-              <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">Status</span>
+              <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">{t('status')}</span>
               <div className={cn("h-1.5 w-1.5 rounded-full transition-colors", isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-muted-foreground/30')} />
             </div>
             <div className="flex items-center gap-2">
               <Activity className={cn("h-3.5 w-3.5", isRunning ? "text-emerald-500" : "text-muted-foreground")} />
               <div className="text-sm font-medium text-sidebar-foreground">
-                {isRunning ? 'System Active' : 'System Idle'}
+                {isRunning ? t('systemActive') : t('systemIdle')}
               </div>
             </div>
           </div>
@@ -349,18 +359,18 @@ function App() {
           <div className="flex items-center justify-between">
             <div>
               <h1 className="text-3xl font-bold text-foreground tracking-tight mb-1">
-                {activeTab === 'dashboard' && 'Dashboard'}
-                {activeTab === 'servers' && 'Server List'}
-                {activeTab === 'proxy' && 'Proxy'}
-                {activeTab === 'logs' && 'Logs'}
-                {activeTab === 'settings' && 'Settings'}
+                {activeTab === 'dashboard' && t('dashboard')}
+                {activeTab === 'servers' && t('serverList')}
+                {activeTab === 'proxy' && t('proxy')}
+                {activeTab === 'logs' && t('logs')}
+                {activeTab === 'settings' && t('settings')}
               </h1>
               <p className="text-muted-foreground">
-                {activeTab === 'dashboard' && 'Overview of your network status'}
-                {activeTab === 'servers' && 'Manage available connection nodes'}
-                {activeTab === 'proxy' && 'Configure subscription and proxy settings'}
-                {activeTab === 'logs' && 'Real-time connection logs'}
-                {activeTab === 'settings' && 'Application version and updates'}
+                {activeTab === 'dashboard' && t('dashboardDesc')}
+                {activeTab === 'servers' && t('serversDesc')}
+                {activeTab === 'proxy' && t('proxyDesc')}
+                {activeTab === 'logs' && t('logsDesc')}
+                {activeTab === 'settings' && t('settingsDesc')}
               </p>
             </div>
             {activeTab === 'servers' ? (
@@ -373,7 +383,7 @@ function App() {
                   "rounded-full h-10 w-10 border-input bg-card hover:bg-accent hover:border-accent",
                   testingConnectivity ? "text-yellow-500" : "text-muted-foreground hover:text-yellow-400"
                 )}
-                title={expandedGroups.size === 0 ? "Expand a group first" : "Test node delays"}
+                title={expandedGroups.size === 0 ? t('expandGroupFirst') : t('testNodeDelays')}
               >
                 <Zap className={cn("h-4 w-4", testingConnectivity && "animate-pulse")} />
               </Button>
@@ -399,14 +409,14 @@ function App() {
                 {/* Clash Card */}
                 <div className="bg-card border border-border rounded-xl p-6 shadow-sm">
                   <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-base font-medium text-foreground">Core Engine</h3>
+                    <h3 className="text-base font-medium text-foreground">{t('coreEngine')}</h3>
                     <Globe className="h-4 w-4 text-blue-500" />
                   </div>
                   <div className="text-2xl font-bold text-foreground mb-1">
-                    {runMode.reuse_mode ? 'Clash Verge' : (status.clash ? 'Running' : 'Stopped')}
+                    {runMode.reuse_mode ? t('clashVerge') : (status.clash ? t('running') : t('stopped'))}
                   </div>
                   <p className="text-xs text-muted-foreground mb-4">
-                    {runMode.reuse_mode ? `Reuse mode (port ${runMode.proxy_port})` : 'Core routing service'}
+                    {runMode.reuse_mode ? `${t('reuseMode')} (port ${runMode.proxy_port})` : t('coreRoutingService')}
                   </p>
                   <Badge variant="secondary" className={cn(
                     "rounded-sm px-2 py-0.5 text-xs font-normal border",
@@ -416,27 +426,27 @@ function App() {
                         ? "bg-blue-500/10 text-blue-400 border-blue-500/20" 
                         : "bg-muted text-muted-foreground border-border"
                   )}>
-                    {runMode.reuse_mode ? 'REUSE' : (status.clash ? 'ACTIVE' : 'INACTIVE')}
+                    {runMode.reuse_mode ? t('reuse') : (status.clash ? t('active') : t('inactive'))}
                   </Badge>
                 </div>
 
                 {/* MultiDesk Card */}
                 <div className="bg-card border border-border rounded-xl p-6 shadow-sm">
                   <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-base font-medium text-foreground">NextDesk</h3>
+                    <h3 className="text-base font-medium text-foreground">{t('nextDesk')}</h3>
                     <ServerIcon className="h-4 w-4 text-cyan-500" />
                   </div>
                   <div className="text-2xl font-bold text-foreground mb-1">
-                    {status.multidesk ? 'Connected' : 'Disconnected'}
+                    {status.multidesk ? t('connected') : t('disconnected')}
                   </div>
-                  <p className="text-xs text-muted-foreground mb-4">RDP acceleration service</p>
+                  <p className="text-xs text-muted-foreground mb-4">{t('rdpAcceleration')}</p>
                   <Badge variant="secondary" className={cn(
                     "rounded-sm px-2 py-0.5 text-xs font-normal border",
                     status.multidesk 
                       ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/20" 
                       : "bg-muted text-muted-foreground border-border"
                   )}>
-                    {status.multidesk ? 'ACTIVE' : 'INACTIVE'}
+                    {status.multidesk ? t('active') : t('inactive')}
                   </Badge>
                 </div>
               </div>
@@ -459,7 +469,7 @@ function App() {
                     <span className={cn("text-sm font-bold tracking-widest transition-colors duration-300", 
                       isRunning ? 'text-blue-400' : 'text-muted-foreground group-hover:text-foreground'
                     )}>
-                      {loading ? '...' : isRunning ? 'ON' : 'OFF'}
+                      {loading ? '...' : isRunning ? t('on') : t('off')}
                     </span>
                   </button>
               </div>
@@ -472,7 +482,7 @@ function App() {
               {proxyGroups.length === 0 ? (
                 <Card className="bg-card border-border">
                   <CardContent className="p-6 text-center text-muted-foreground">
-                    No proxy groups available
+                    {t('noProxyGroups')}
                   </CardContent>
                 </Card>
               ) : (
@@ -502,7 +512,7 @@ function App() {
                              </Badge>
                            </div>
                            <div className="hidden sm:flex text-muted-foreground text-sm items-center gap-2">
-                             <span className="text-muted-foreground">Active:</span>
+                             <span className="text-muted-foreground">{t('activeLabel')}:</span>
                              <span className="text-blue-400 font-medium">{selectedProxy}</span>
                            </div>
                         </div>
@@ -575,13 +585,13 @@ function App() {
             <div className="max-w-2xl space-y-6">
               <Card className="bg-card border-border">
                 <CardHeader>
-                  <CardTitle className="text-lg text-foreground">Subscription</CardTitle>
-                  <CardDescription className="text-muted-foreground">Manage your server subscription source</CardDescription>
+                  <CardTitle className="text-lg text-foreground">{t('subscription')}</CardTitle>
+                  <CardDescription className="text-muted-foreground">{t('manageSubscription')}</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
                   <div className="flex gap-3">
                     <Input
-                      placeholder="Subscription URL..."
+                      placeholder={t('subUrlPlaceholder')}
                       value={subUrl}
                       onChange={(e) => setSubUrl(e.target.value)}
                       className="bg-background border-input text-foreground placeholder:text-muted-foreground focus-visible:ring-ring"
@@ -591,7 +601,7 @@ function App() {
                       disabled={updatingSub || !subUrl}
                       className="bg-emerald-600 hover:bg-emerald-500 text-white"
                     >
-                      {updatingSub ? 'Updating...' : 'Update'}
+                      {updatingSub ? t('updating') : t('update')}
                     </Button>
                   </div>
 
@@ -610,9 +620,9 @@ function App() {
                     <div className="flex gap-3">
                       <CheckCircle2 className="h-5 w-5 text-blue-500 shrink-0" />
                       <div>
-                        <h4 className="text-sm font-medium text-blue-400 mb-1">Auto-Update Enabled</h4>
+                        <h4 className="text-sm font-medium text-blue-400 mb-1">{t('autoUpdateEnabled')}</h4>
                         <p className="text-xs text-blue-400/60 leading-relaxed">
-                          Server list automatically syncs every 24 hours.
+                          {t('serverListSync')}
                         </p>
                       </div>
                     </div>
@@ -627,7 +637,7 @@ function App() {
             <div className="space-y-4">
               <div className="flex items-center justify-between mb-4">
                 <div className="text-sm text-muted-foreground">
-                  Active connections: <span className="text-foreground font-medium">{connections.length}</span>
+                  {t('activeConnections')}: <span className="text-foreground font-medium">{connections.length}</span>
                 </div>
                 <Button
                   variant="outline"
@@ -639,14 +649,14 @@ function App() {
                   className="border-input bg-card text-muted-foreground hover:text-foreground hover:bg-zinc-800"
                 >
                   <RefreshCw className="h-3 w-3 mr-2" />
-                  Refresh
+                  {t('refresh')}
                 </Button>
               </div>
 
               {connections.length === 0 ? (
                 <Card className="bg-card border-border">
                   <CardContent className="p-6 text-center text-muted-foreground">
-                    No active connections. Start the engine and connect to RDP.
+                    {t('noActiveConnections')}
                   </CardContent>
                 </Card>
               ) : (
@@ -679,7 +689,7 @@ function App() {
                           </div>
                           {conn.chains.length > 0 && (
                             <div className="text-xs text-amber-400/80 mt-2">
-                              Chain: {conn.chains.join(' → ')}
+                              {t('chain')}: {conn.chains.join(' → ')}
                             </div>
                           )}
                         </div>
@@ -704,17 +714,17 @@ function App() {
             <div className="max-w-md">
               <Card className="bg-card border-border">
                 <CardHeader>
-                  <CardTitle className="text-lg text-foreground">About</CardTitle>
-                  <CardDescription className="text-muted-foreground">Application version and updates</CardDescription>
+                  <CardTitle className="text-lg text-foreground">{t('about')}</CardTitle>
+                  <CardDescription className="text-muted-foreground">{t('settingsDesc')}</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
                   <div className="bg-zinc-950 rounded-lg p-4">
                     <div className="flex justify-between text-sm mb-2">
-                      <span className="text-muted-foreground">Current Version</span>
+                      <span className="text-muted-foreground">{t('currentVersion')}</span>
                       <span className="text-foreground font-mono">v{currentVersion || '...'}</span>
                     </div>
                     <div className="flex justify-between text-sm">
-                      <span className="text-muted-foreground">Latest Version</span>
+                      <span className="text-muted-foreground">{t('latestVersion')}</span>
                       <span className={cn(
                         "font-mono",
                         updateInfo?.has_update ? "text-emerald-400" : "text-muted-foreground"
@@ -740,12 +750,12 @@ function App() {
                     )}
                   >
                     <Download className="h-4 w-4 mr-2" />
-                    {updateInfo?.has_update ? 'Download Update' : 'Check for Updates'}
+                    {updateInfo?.has_update ? t('downloadUpdate') : t('checkForUpdates')}
                   </Button>
 
                   {updateInfo && !updateInfo.has_update && !updateInfo.error && (
                     <div className="text-center text-xs text-muted-foreground">
-                      You're on the latest version
+                      {t('latestVersionMsg')}
                     </div>
                   )}
                 </CardContent>
@@ -766,8 +776,8 @@ function App() {
                   <Download className="h-5 w-5 text-white" />
                 </div>
                 <div>
-                  <h3 className="text-lg font-semibold text-foreground">Update Available</h3>
-                  <p className="text-xs text-muted-foreground">A new version is ready to install</p>
+                  <h3 className="text-lg font-semibold text-foreground">{t('updateAvailable')}</h3>
+                  <p className="text-xs text-muted-foreground">{t('newVersionReady')}</p>
                 </div>
               </div>
               <button 
@@ -780,11 +790,11 @@ function App() {
 
             <div className="bg-muted/50 rounded-lg p-4 mb-4">
               <div className="flex justify-between text-sm mb-2">
-                <span className="text-muted-foreground">Current Version</span>
+                <span className="text-muted-foreground">{t('currentVersion')}</span>
                 <span className="text-foreground font-mono">v{currentVersion}</span>
               </div>
               <div className="flex justify-between text-sm">
-                <span className="text-muted-foreground">Latest Version</span>
+                <span className="text-muted-foreground">{t('latestVersion')}</span>
                 <span className="text-emerald-400 font-mono">v{updateInfo.latest_version}</span>
               </div>
             </div>
@@ -795,14 +805,14 @@ function App() {
                 className="w-full bg-emerald-600 hover:bg-emerald-500 text-white"
               >
                 <Download className="h-4 w-4 mr-2" />
-                Download Update
+                {t('downloadUpdate')}
               </Button>
             )}
 
             {downloadStatus.status === 'downloading' && (
               <div className="space-y-2">
                 <div className="flex justify-between text-sm text-muted-foreground">
-                  <span>Downloading...</span>
+                  <span>{t('downloading')}</span>
                   <span>{Math.round(downloadStatus.progress)}%</span>
                 </div>
                 <div className="h-2 bg-muted rounded-full overflow-hidden">
@@ -820,19 +830,27 @@ function App() {
                 className="w-full bg-blue-600 hover:bg-blue-500 text-white"
               >
                 <CheckCircle2 className="h-4 w-4 mr-2" />
-                Install and Restart
+                {t('installAndRestart')}
               </Button>
             )}
 
             {downloadStatus.status.startsWith('error') && (
               <div className="text-red-400 text-sm text-center">
-                Download failed. Please try again later.
+                {t('downloadFailed')}
               </div>
             )}
           </div>
         </div>
       )}
     </div>
+  );
+}
+
+function App() {
+  return (
+    <LanguageProvider>
+      <AppContent />
+    </LanguageProvider>
   );
 }
 
