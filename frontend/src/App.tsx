@@ -22,6 +22,7 @@ import { Logo } from '@/components/Logo';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
+import { ThemeToggle } from '@/components/ThemeToggle';
 
 const formatBytes = (bytes: number): string => {
   if (bytes === 0) return '0 B';
@@ -230,18 +231,18 @@ function App() {
   const isRunning = status.clash || status.multidesk;
 
   return (
-    <div className="min-h-screen w-full bg-zinc-950 text-foreground font-sans flex">
+    <div className="min-h-screen w-full bg-background text-foreground font-sans flex transition-colors duration-300">
       {/* Sidebar - Fixed Width w-64 */}
-      <aside className="hidden md:flex md:w-64 md:flex-col md:fixed md:inset-y-0 md:left-0 border-r border-white/5 bg-zinc-950 z-50">
-        <div className="p-6 flex items-center gap-3 border-b border-white/5">
+      <aside className="hidden md:flex md:w-64 md:flex-col md:fixed md:inset-y-0 md:left-0 border-r border-border bg-sidebar z-50 transition-colors duration-300">
+        <div className="p-6 flex items-center gap-3 border-b border-sidebar-border">
           <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-blue-600 to-cyan-600 flex items-center justify-center shadow-lg shadow-blue-900/20 overflow-hidden">
             <Logo className="h-7 w-7" />
           </div>
           <div>
-            <span className="font-bold text-lg text-white block leading-none mb-1">
+            <span className="font-bold text-lg text-sidebar-foreground block leading-none mb-1">
               NextDesk
             </span>
-            <span className="text-[10px] font-medium text-zinc-500 uppercase tracking-wider block leading-none">
+            <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider block leading-none">
               Accelerator
             </span>
           </div>
@@ -255,10 +256,10 @@ function App() {
               "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
               activeTab === 'dashboard' 
                 ? "bg-blue-500/10 text-blue-400 hover:bg-blue-500/15 hover:text-blue-300" 
-                : "text-zinc-400 hover:text-white hover:bg-white/5"
+                : "text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent"
             )}
           >
-            <LayoutDashboard className={cn("h-4 w-4", activeTab === 'dashboard' ? "text-blue-500" : "text-zinc-500")} />
+            <LayoutDashboard className={cn("h-4 w-4", activeTab === 'dashboard' ? "text-blue-500" : "text-muted-foreground")} />
             Dashboard
           </Button>
 
@@ -269,10 +270,10 @@ function App() {
               "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
               activeTab === 'servers' 
                 ? "bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/15 hover:text-cyan-300" 
-                : "text-zinc-400 hover:text-white hover:bg-white/5"
+                : "text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent"
             )}
           >
-            <ServerIcon className={cn("h-4 w-4", activeTab === 'servers' ? "text-cyan-500" : "text-zinc-500")} />
+            <ServerIcon className={cn("h-4 w-4", activeTab === 'servers' ? "text-cyan-500" : "text-muted-foreground")} />
             Servers
           </Button>
 
@@ -283,10 +284,10 @@ function App() {
               "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
               activeTab === 'proxy' 
                 ? "bg-violet-500/10 text-violet-400 hover:bg-violet-500/15 hover:text-violet-300" 
-                : "text-zinc-400 hover:text-white hover:bg-white/5"
+                : "text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent"
             )}
           >
-            <Globe className={cn("h-4 w-4", activeTab === 'proxy' ? "text-violet-500" : "text-zinc-500")} />
+            <Globe className={cn("h-4 w-4", activeTab === 'proxy' ? "text-violet-500" : "text-muted-foreground")} />
             Proxy
           </Button>
 
@@ -297,10 +298,10 @@ function App() {
               "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
               activeTab === 'logs' 
                 ? "bg-amber-500/10 text-amber-400 hover:bg-amber-500/15 hover:text-amber-300" 
-                : "text-zinc-400 hover:text-white hover:bg-white/5"
+                : "text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent"
             )}
           >
-            <FileText className={cn("h-4 w-4", activeTab === 'logs' ? "text-amber-500" : "text-zinc-500")} />
+            <FileText className={cn("h-4 w-4", activeTab === 'logs' ? "text-amber-500" : "text-muted-foreground")} />
             Logs
           </Button>
 
@@ -311,23 +312,28 @@ function App() {
               "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
               activeTab === 'settings' 
                 ? "bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/15 hover:text-emerald-300" 
-                : "text-zinc-400 hover:text-white hover:bg-white/5"
+                : "text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent"
             )}
           >
-            <Settings className={cn("h-4 w-4", activeTab === 'settings' ? "text-emerald-500" : "text-zinc-500")} />
+            <Settings className={cn("h-4 w-4", activeTab === 'settings' ? "text-emerald-500" : "text-muted-foreground")} />
             Settings
           </Button>
         </nav>
 
-        <div className="p-4 border-t border-white/5">
-          <div className="bg-zinc-900 rounded-lg p-3 border border-zinc-800">
+        <div className="px-6 pb-4 flex items-center justify-between">
+           <span className="text-xs font-medium text-muted-foreground dark:text-muted-foreground">Appearance</span>
+           <ThemeToggle />
+        </div>
+
+        <div className="p-4 border-t border-sidebar-border">
+          <div className="bg-sidebar-accent rounded-lg p-3 border border-sidebar-border">
             <div className="flex items-center justify-between mb-2">
-              <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-wider">Status</span>
-              <div className={cn("h-1.5 w-1.5 rounded-full transition-colors", isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-zinc-700')} />
+              <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">Status</span>
+              <div className={cn("h-1.5 w-1.5 rounded-full transition-colors", isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-muted-foreground/30')} />
             </div>
             <div className="flex items-center gap-2">
-              <Activity className={cn("h-3.5 w-3.5", isRunning ? "text-emerald-500" : "text-zinc-600")} />
-              <div className="text-sm font-medium text-white">
+              <Activity className={cn("h-3.5 w-3.5", isRunning ? "text-emerald-500" : "text-muted-foreground")} />
+              <div className="text-sm font-medium text-sidebar-foreground">
                 {isRunning ? 'System Active' : 'System Idle'}
               </div>
             </div>
@@ -336,20 +342,20 @@ function App() {
       </aside>
 
       {/* Main Content - Offset ml-64 */}
-      <main className="flex-1 md:ml-64 min-h-screen bg-zinc-950">
+      <main className="flex-1 md:ml-64 min-h-screen bg-background transition-colors duration-300">
         <div className="max-w-6xl mx-auto px-6 py-8 md:px-10 md:py-10 space-y-8">
           
           {/* Header */}
           <div className="flex items-center justify-between">
             <div>
-              <h1 className="text-3xl font-bold text-white tracking-tight mb-1">
+              <h1 className="text-3xl font-bold text-foreground tracking-tight mb-1">
                 {activeTab === 'dashboard' && 'Dashboard'}
                 {activeTab === 'servers' && 'Server List'}
                 {activeTab === 'proxy' && 'Proxy'}
                 {activeTab === 'logs' && 'Logs'}
                 {activeTab === 'settings' && 'Settings'}
               </h1>
-              <p className="text-zinc-400">
+              <p className="text-muted-foreground">
                 {activeTab === 'dashboard' && 'Overview of your network status'}
                 {activeTab === 'servers' && 'Manage available connection nodes'}
                 {activeTab === 'proxy' && 'Configure subscription and proxy settings'}
@@ -364,8 +370,8 @@ function App() {
                 onClick={handleTestConnectivity}
                 disabled={testingConnectivity || expandedGroups.size === 0}
                 className={cn(
-                  "rounded-full h-10 w-10 border-zinc-800 bg-zinc-900 hover:bg-zinc-800 hover:border-zinc-700",
-                  testingConnectivity ? "text-yellow-500" : "text-zinc-400 hover:text-yellow-400"
+                  "rounded-full h-10 w-10 border-input bg-card hover:bg-accent hover:border-accent",
+                  testingConnectivity ? "text-yellow-500" : "text-muted-foreground hover:text-yellow-400"
                 )}
                 title={expandedGroups.size === 0 ? "Expand a group first" : "Test node delays"}
               >
@@ -376,7 +382,7 @@ function App() {
                 variant="outline" 
                 size="icon" 
                 onClick={fetchData} 
-                className="rounded-full h-10 w-10 border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white hover:bg-zinc-800 hover:border-zinc-700"
+                className="rounded-full h-10 w-10 border-input bg-card text-muted-foreground hover:text-foreground hover:bg-accent hover:border-accent"
               >
                 <RefreshCw className="h-4 w-4" />
               </Button>
@@ -391,15 +397,15 @@ function App() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 
                 {/* Clash Card */}
-                <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 shadow-sm">
+                <div className="bg-card border border-border rounded-xl p-6 shadow-sm">
                   <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-base font-medium text-white">Core Engine</h3>
+                    <h3 className="text-base font-medium text-foreground">Core Engine</h3>
                     <Globe className="h-4 w-4 text-blue-500" />
                   </div>
-                  <div className="text-2xl font-bold text-white mb-1">
+                  <div className="text-2xl font-bold text-foreground mb-1">
                     {runMode.reuse_mode ? 'Clash Verge' : (status.clash ? 'Running' : 'Stopped')}
                   </div>
-                  <p className="text-xs text-zinc-500 mb-4">
+                  <p className="text-xs text-muted-foreground mb-4">
                     {runMode.reuse_mode ? `Reuse mode (port ${runMode.proxy_port})` : 'Core routing service'}
                   </p>
                   <Badge variant="secondary" className={cn(
@@ -408,27 +414,27 @@ function App() {
                       ? "bg-green-500/10 text-green-400 border-green-500/20"
                       : status.clash 
                         ? "bg-blue-500/10 text-blue-400 border-blue-500/20" 
-                        : "bg-zinc-800 text-zinc-500 border-zinc-700"
+                        : "bg-muted text-muted-foreground border-border"
                   )}>
                     {runMode.reuse_mode ? 'REUSE' : (status.clash ? 'ACTIVE' : 'INACTIVE')}
                   </Badge>
                 </div>
 
                 {/* MultiDesk Card */}
-                <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 shadow-sm">
+                <div className="bg-card border border-border rounded-xl p-6 shadow-sm">
                   <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-base font-medium text-white">NextDesk</h3>
+                    <h3 className="text-base font-medium text-foreground">NextDesk</h3>
                     <ServerIcon className="h-4 w-4 text-cyan-500" />
                   </div>
-                  <div className="text-2xl font-bold text-white mb-1">
+                  <div className="text-2xl font-bold text-foreground mb-1">
                     {status.multidesk ? 'Connected' : 'Disconnected'}
                   </div>
-                  <p className="text-xs text-zinc-500 mb-4">RDP acceleration service</p>
+                  <p className="text-xs text-muted-foreground mb-4">RDP acceleration service</p>
                   <Badge variant="secondary" className={cn(
                     "rounded-sm px-2 py-0.5 text-xs font-normal border",
                     status.multidesk 
                       ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/20" 
-                      : "bg-zinc-800 text-zinc-500 border-zinc-700"
+                      : "bg-muted text-muted-foreground border-border"
                   )}>
                     {status.multidesk ? 'ACTIVE' : 'INACTIVE'}
                   </Badge>
@@ -443,15 +449,15 @@ function App() {
                     className={cn(
                       "group relative w-40 h-40 rounded-full flex flex-col items-center justify-center transition-all duration-300 border-4",
                       isRunning 
-                        ? 'bg-zinc-900 border-blue-500/50 shadow-[0_0_40px_rgba(59,130,246,0.2)]' 
-                        : 'bg-zinc-900 border-zinc-800 hover:border-zinc-700'
+                        ? 'bg-card border-blue-500/50 shadow-[0_0_40px_rgba(59,130,246,0.2)]' 
+                        : 'bg-card border-border hover:border-muted-foreground'
                     )}
                   >
                     <Power className={cn("h-12 w-12 mb-2 transition-colors duration-300", 
-                      isRunning ? 'text-blue-500' : 'text-zinc-600 group-hover:text-zinc-500'
+                      isRunning ? 'text-blue-500' : 'text-muted-foreground group-hover:text-foreground'
                     )} />
                     <span className={cn("text-sm font-bold tracking-widest transition-colors duration-300", 
-                      isRunning ? 'text-blue-400' : 'text-zinc-600 group-hover:text-zinc-500'
+                      isRunning ? 'text-blue-400' : 'text-muted-foreground group-hover:text-foreground'
                     )}>
                       {loading ? '...' : isRunning ? 'ON' : 'OFF'}
                     </span>
@@ -464,8 +470,8 @@ function App() {
           {activeTab === 'servers' && (
             <div className="space-y-4">
               {proxyGroups.length === 0 ? (
-                <Card className="bg-zinc-900 border-zinc-800">
-                  <CardContent className="p-6 text-center text-zinc-500">
+                <Card className="bg-card border-border">
+                  <CardContent className="p-6 text-center text-muted-foreground">
                     No proxy groups available
                   </CardContent>
                 </Card>
@@ -480,38 +486,38 @@ function App() {
                     : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
 
                   return (
-                    <div key={group.name} className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden transition-all">
+                    <div key={group.name} className="bg-card border border-border rounded-xl overflow-hidden transition-all">
                       <div 
                         className={cn(
                           "p-4 flex items-center justify-between transition-colors",
-                          isSelectType && "cursor-pointer hover:bg-zinc-800/50"
+                          isSelectType && "cursor-pointer hover:bg-accent/50"
                         )}
                         onClick={() => isSelectType && toggleGroupExpansion(group.name)}
                       >
                         <div className="flex items-center gap-4">
                            <div className="flex items-center gap-3">
-                             <span className="font-bold text-white text-lg">{group.name}</span>
+                             <span className="font-bold text-foreground text-lg">{group.name}</span>
                              <Badge variant="outline" className={cn("text-[10px] uppercase tracking-wider border", badgeColor)}>
                                {group.type}
                              </Badge>
                            </div>
-                           <div className="hidden sm:flex text-zinc-500 text-sm items-center gap-2">
-                             <span className="text-zinc-600">Active:</span>
+                           <div className="hidden sm:flex text-muted-foreground text-sm items-center gap-2">
+                             <span className="text-muted-foreground">Active:</span>
                              <span className="text-blue-400 font-medium">{selectedProxy}</span>
                            </div>
                         </div>
                         
                         {isSelectType && (
                           isExpanded ? (
-                            <ChevronDown className="h-5 w-5 text-zinc-500" />
+                            <ChevronDown className="h-5 w-5 text-muted-foreground" />
                           ) : (
-                            <ChevronRight className="h-5 w-5 text-zinc-500" />
+                            <ChevronRight className="h-5 w-5 text-muted-foreground" />
                           )
                         )}
                       </div>
 
                       {isExpanded && (
-                        <div className="bg-zinc-950 p-4 border-t border-zinc-800 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3">
+                        <div className="bg-muted/30 p-4 border-t border-border grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3">
                           {group.proxies.map(proxy => {
                              const isSelected = selectedProxy === proxy;
                              const delay = nodeDelays[proxy];
@@ -543,7 +549,7 @@ function App() {
                                    "px-3 py-1.5 rounded-lg text-sm font-medium transition-all text-left truncate flex items-center justify-between gap-2",
                                    isSelected 
                                      ? "bg-blue-500/20 text-blue-400 border border-blue-500/30" 
-                                     : "bg-zinc-800 text-zinc-400 border border-transparent hover:bg-zinc-700"
+                                     : "bg-muted text-muted-foreground border border-transparent hover:bg-accent"
                                  )}
                                >
                                  <span className="truncate">{proxy}</span>
@@ -567,10 +573,10 @@ function App() {
           {/* Proxy View */}
           {activeTab === 'proxy' && (
             <div className="max-w-2xl space-y-6">
-              <Card className="bg-zinc-900 border-zinc-800">
+              <Card className="bg-card border-border">
                 <CardHeader>
-                  <CardTitle className="text-lg text-white">Subscription</CardTitle>
-                  <CardDescription className="text-zinc-500">Manage your server subscription source</CardDescription>
+                  <CardTitle className="text-lg text-foreground">Subscription</CardTitle>
+                  <CardDescription className="text-muted-foreground">Manage your server subscription source</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
                   <div className="flex gap-3">
@@ -578,7 +584,7 @@ function App() {
                       placeholder="Subscription URL..."
                       value={subUrl}
                       onChange={(e) => setSubUrl(e.target.value)}
-                      className="bg-zinc-950 border-zinc-800 text-white placeholder:text-zinc-600 focus-visible:ring-zinc-700"
+                      className="bg-background border-input text-foreground placeholder:text-muted-foreground focus-visible:ring-ring"
                     />
                     <Button 
                       onClick={handleUpdateSubscription} 
@@ -620,8 +626,8 @@ function App() {
           {activeTab === 'logs' && (
             <div className="space-y-4">
               <div className="flex items-center justify-between mb-4">
-                <div className="text-sm text-zinc-400">
-                  Active connections: <span className="text-white font-medium">{connections.length}</span>
+                <div className="text-sm text-muted-foreground">
+                  Active connections: <span className="text-foreground font-medium">{connections.length}</span>
                 </div>
                 <Button
                   variant="outline"
@@ -630,7 +636,7 @@ function App() {
                     const data = await api.getConnections();
                     setConnections(data.connections || []);
                   }}
-                  className="border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-white hover:bg-zinc-800"
+                  className="border-input bg-card text-muted-foreground hover:text-foreground hover:bg-zinc-800"
                 >
                   <RefreshCw className="h-3 w-3 mr-2" />
                   Refresh
@@ -638,8 +644,8 @@ function App() {
               </div>
 
               {connections.length === 0 ? (
-                <Card className="bg-zinc-900 border-zinc-800">
-                  <CardContent className="p-6 text-center text-zinc-500">
+                <Card className="bg-card border-border">
+                  <CardContent className="p-6 text-center text-muted-foreground">
                     No active connections. Start the engine and connect to RDP.
                   </CardContent>
                 </Card>
@@ -648,7 +654,7 @@ function App() {
                   {connections.map((conn) => (
                     <div 
                       key={conn.id} 
-                      className="bg-zinc-900 border border-zinc-800 rounded-lg p-4"
+                      className="bg-card border border-border rounded-lg p-4"
                     >
                       <div className="flex items-start justify-between gap-4">
                         <div className="flex-1 min-w-0">
@@ -660,15 +666,15 @@ function App() {
                               {conn.metadata.type}
                             </Badge>
                             {conn.rule && (
-                              <Badge variant="outline" className="bg-zinc-800 text-zinc-400 border-zinc-700 text-xs">
+                              <Badge variant="outline" className="bg-muted text-muted-foreground border-border text-xs">
                                 {conn.rule}
                               </Badge>
                             )}
                           </div>
-                          <div className="text-sm text-white font-mono truncate">
+                          <div className="text-sm text-foreground font-mono truncate">
                             {conn.metadata.host || conn.metadata.destinationIP}:{conn.metadata.destinationPort}
                           </div>
-                          <div className="text-xs text-zinc-500 mt-1">
+                          <div className="text-xs text-muted-foreground mt-1">
                             {conn.metadata.sourceIP}:{conn.metadata.sourcePort} → {conn.metadata.destinationIP}:{conn.metadata.destinationPort}
                           </div>
                           {conn.chains.length > 0 && (
@@ -696,22 +702,22 @@ function App() {
           {/* Settings View */}
           {activeTab === 'settings' && (
             <div className="max-w-md">
-              <Card className="bg-zinc-900 border-zinc-800">
+              <Card className="bg-card border-border">
                 <CardHeader>
-                  <CardTitle className="text-lg text-white">About</CardTitle>
-                  <CardDescription className="text-zinc-500">Application version and updates</CardDescription>
+                  <CardTitle className="text-lg text-foreground">About</CardTitle>
+                  <CardDescription className="text-muted-foreground">Application version and updates</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4">
                   <div className="bg-zinc-950 rounded-lg p-4">
                     <div className="flex justify-between text-sm mb-2">
-                      <span className="text-zinc-400">Current Version</span>
-                      <span className="text-white font-mono">v{currentVersion || '...'}</span>
+                      <span className="text-muted-foreground">Current Version</span>
+                      <span className="text-foreground font-mono">v{currentVersion || '...'}</span>
                     </div>
                     <div className="flex justify-between text-sm">
-                      <span className="text-zinc-400">Latest Version</span>
+                      <span className="text-muted-foreground">Latest Version</span>
                       <span className={cn(
                         "font-mono",
-                        updateInfo?.has_update ? "text-emerald-400" : "text-zinc-500"
+                        updateInfo?.has_update ? "text-emerald-400" : "text-muted-foreground"
                       )}>
                         {updateInfo?.latest_version ? `v${updateInfo.latest_version}` : '...'}
                       </span>
@@ -738,7 +744,7 @@ function App() {
                   </Button>
 
                   {updateInfo && !updateInfo.has_update && !updateInfo.error && (
-                    <div className="text-center text-xs text-zinc-500">
+                    <div className="text-center text-xs text-muted-foreground">
                       You're on the latest version
                     </div>
                   )}
@@ -753,32 +759,32 @@ function App() {
       {/* Update Modal */}
       {showUpdateModal && updateInfo?.has_update && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-[100]">
-          <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 w-full max-w-md mx-4 shadow-2xl">
+          <div className="bg-card border border-border rounded-xl p-6 w-full max-w-md mx-4 shadow-2xl">
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-3">
                 <div className="h-10 w-10 rounded-lg bg-gradient-to-br from-emerald-600 to-cyan-600 flex items-center justify-center">
                   <Download className="h-5 w-5 text-white" />
                 </div>
                 <div>
-                  <h3 className="text-lg font-semibold text-white">Update Available</h3>
-                  <p className="text-xs text-zinc-500">A new version is ready to install</p>
+                  <h3 className="text-lg font-semibold text-foreground">Update Available</h3>
+                  <p className="text-xs text-muted-foreground">A new version is ready to install</p>
                 </div>
               </div>
               <button 
                 onClick={() => setShowUpdateModal(false)}
-                className="text-zinc-500 hover:text-white transition-colors"
+                className="text-muted-foreground hover:text-foreground transition-colors"
               >
                 <X className="h-5 w-5" />
               </button>
             </div>
 
-            <div className="bg-zinc-950 rounded-lg p-4 mb-4">
+            <div className="bg-muted/50 rounded-lg p-4 mb-4">
               <div className="flex justify-between text-sm mb-2">
-                <span className="text-zinc-400">Current Version</span>
-                <span className="text-white font-mono">v{currentVersion}</span>
+                <span className="text-muted-foreground">Current Version</span>
+                <span className="text-foreground font-mono">v{currentVersion}</span>
               </div>
               <div className="flex justify-between text-sm">
-                <span className="text-zinc-400">Latest Version</span>
+                <span className="text-muted-foreground">Latest Version</span>
                 <span className="text-emerald-400 font-mono">v{updateInfo.latest_version}</span>
               </div>
             </div>
@@ -795,11 +801,11 @@ function App() {
 
             {downloadStatus.status === 'downloading' && (
               <div className="space-y-2">
-                <div className="flex justify-between text-sm text-zinc-400">
+                <div className="flex justify-between text-sm text-muted-foreground">
                   <span>Downloading...</span>
                   <span>{Math.round(downloadStatus.progress)}%</span>
                 </div>
-                <div className="h-2 bg-zinc-800 rounded-full overflow-hidden">
+                <div className="h-2 bg-muted rounded-full overflow-hidden">
                   <div 
                     className="h-full bg-gradient-to-r from-emerald-600 to-cyan-600 transition-all duration-300"
                     style={{ width: `${downloadStatus.progress}%` }}
