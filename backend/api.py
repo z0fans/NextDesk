@@ -1,5 +1,7 @@
 import json
+import locale
 import socket
+import sys
 import threading
 import requests
 from urllib.parse import quote as url_quote
@@ -381,3 +383,19 @@ class Api:
             return resp.status_code == 204
         except Exception:
             return False
+
+    def get_system_language(self) -> str:
+        try:
+            if sys.platform == "win32":
+                import ctypes
+
+                lcid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+                if lcid in (0x0804, 0x0404, 0x0C04, 0x1004, 0x1404):
+                    return "zh-CN"
+            else:
+                lang = locale.getdefaultlocale()[0] or ""
+                if lang.startswith("zh"):
+                    return "zh-CN"
+        except Exception:
+            pass
+        return "en-US"

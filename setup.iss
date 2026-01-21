@@ -2,7 +2,7 @@
 ; Inno Setup 6.x compatible
 
 #define MyAppName "NextDesk"
-#define MyAppVersion "1.0.62"
+#define MyAppVersion "1.0.63"
 #define MyAppPublisher "NextDesk Team"
 #define MyAppExeName "NextDesk.exe"
 

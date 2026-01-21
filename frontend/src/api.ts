@@ -20,6 +20,7 @@ declare global {
         get_connections: () => Promise<ConnectionsData>;
         switch_proxy: (groupName: string, proxyName: string) => Promise<boolean>;
         get_run_mode: () => Promise<RunMode>;
+        get_system_language: () => Promise<string>;
       };
     };
   }
@@ -265,5 +266,12 @@ export const api = {
       return { reuse_mode: false, clash_api: '', proxy_port: 17897 };
     }
     return window.pywebview.api.get_run_mode();
+  },
+
+  getSystemLanguage: async (): Promise<string> => {
+    if (!(await ensurePywebview())) {
+      return 'en-US';
+    }
+    return window.pywebview.api.get_system_language();
   },
 };

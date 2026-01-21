@@ -1,5 +1,6 @@
 import { createContext, useState, useEffect, type ReactNode } from 'react';
 import { translations, type Language, type TranslationKey } from './translations';
+import { api } from '../api';
 
 interface LanguageContextType {
   language: Language;
@@ -17,17 +18,28 @@ export function LanguageProvider({ children }: LanguageProviderProps) {
   const [language, setLanguageState] = useState<Language>('en-US');
 
   useEffect(() => {
-    const savedLang = localStorage.getItem('nextdesk-language') as Language | null;
-    if (savedLang && (savedLang === 'en-US' || savedLang === 'zh-CN')) {
-      setLanguageState(savedLang);
-    } else {
-      const browserLang = navigator.language;
-      if (browserLang.startsWith('zh')) {
-        setLanguageState('zh-CN');
+    const initLanguage = async () => {
+      const savedLang = localStorage.getItem('nextdesk-language') as Language | null;
+      if (savedLang && (savedLang === 'en-US' || savedLang === 'zh-CN')) {
+        setLanguageState(savedLang);
       } else {
-        setLanguageState('en-US');
+        try {
+          const systemLang = await api.getSystemLanguage();
+          if (systemLang === 'zh-CN' || systemLang === 'en-US') {
+            setLanguageState(systemLang as Language);
+            localStorage.setItem('nextdesk-language', systemLang);
+          }
+        } catch {
+          const browserLang = navigator.language;
+          if (browserLang.startsWith('zh')) {
+            setLanguageState('zh-CN');
+          } else {
+            setLanguageState('en-US');
+          }
+        }
       }
-    }
+    };
+    initLanguage();
   }, []);
 
   const setLanguage = (lang: Language) => {
