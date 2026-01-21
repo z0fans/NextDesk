@@ -13,7 +13,9 @@ import {
   X,
   ChevronDown,
   ChevronRight,
-  FileText
+  FileText,
+  PanelLeftClose,
+  PanelLeft
 } from 'lucide-react';
 import { api, type EngineStatus, type Server, type UpdateInfo, type DownloadStatus, type ProxyGroup, type Connection, type RunMode } from './api';
 import { Button } from '@/components/ui/button';
@@ -56,6 +58,7 @@ function AppContent() {
   const [nodeDelays, setNodeDelays] = useState<Record<string, number>>({});
   const [connections, setConnections] = useState<Connection[]>([]);
   const [runMode, setRunMode] = useState<RunMode>({ reuse_mode: false, clash_api: '', proxy_port: 17897 });
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   useEffect(() => {
     if (proxyGroups.length > 0) {
@@ -238,123 +241,140 @@ function AppContent() {
 
   return (
     <div className="min-h-screen w-full bg-background text-foreground font-sans flex transition-colors duration-300">
-      {/* Sidebar - Fixed Width w-64 */}
-      <aside className="hidden md:flex md:w-64 md:flex-col md:fixed md:inset-y-0 md:left-0 border-r border-border bg-sidebar z-50 transition-colors duration-300">
-        <div className="p-6 flex items-center gap-3 border-b border-sidebar-border">
-          <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-blue-600 to-cyan-600 flex items-center justify-center shadow-lg shadow-blue-900/20 overflow-hidden">
+      <aside className={cn(
+        "hidden md:flex md:flex-col md:fixed md:inset-y-0 md:left-0 border-r border-border bg-sidebar z-50 transition-all duration-300",
+        sidebarCollapsed ? "md:w-16" : "md:w-64"
+      )}>
+        <div className={cn("p-4 flex items-center border-b border-sidebar-border", sidebarCollapsed ? "justify-center" : "gap-3")}>
+          <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-blue-600 to-cyan-600 flex items-center justify-center shadow-lg shadow-blue-900/20 overflow-hidden shrink-0">
             <Logo className="h-7 w-7" />
           </div>
-          <div>
-            <span className="font-bold text-lg text-sidebar-foreground block leading-none mb-1">
-              NextDesk
-            </span>
-            <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider block leading-none">
-              {t('accelerator')}
-            </span>
-          </div>
+          {!sidebarCollapsed && (
+            <div className="flex-1 min-w-0">
+              <span className="font-bold text-lg text-sidebar-foreground block leading-none mb-1">
+                NextDesk
+              </span>
+              <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider block leading-none">
+                {t('accelerator')}
+              </span>
+            </div>
+          )}
         </div>
 
-        <nav className="flex-1 px-3 py-6 space-y-1">
+        <nav className={cn("flex-1 py-4 space-y-1", sidebarCollapsed ? "px-2" : "px-3")}>
           <Button
             variant="ghost"
             onClick={() => setActiveTab('dashboard')}
             className={cn(
-              "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
+              "w-full h-11 text-sm font-medium transition-all mb-1",
+              sidebarCollapsed ? "justify-center px-0" : "justify-start gap-3",
               activeTab === 'dashboard' 
                 ? "bg-blue-500/10 text-blue-400 hover:bg-blue-500/15 hover:text-blue-300" 
                 : "text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent"
             )}
+            title={sidebarCollapsed ? t('dashboard') : undefined}
           >
-            <LayoutDashboard className={cn("h-4 w-4", activeTab === 'dashboard' ? "text-blue-500" : "text-muted-foreground")} />
-            {t('dashboard')}
+            <LayoutDashboard className={cn("h-4 w-4 shrink-0", activeTab === 'dashboard' ? "text-blue-500" : "text-muted-foreground")} />
+            {!sidebarCollapsed && t('dashboard')}
           </Button>
 
           <Button
             variant="ghost"
             onClick={() => setActiveTab('servers')}
             className={cn(
-              "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
+              "w-full h-11 text-sm font-medium transition-all mb-1",
+              sidebarCollapsed ? "justify-center px-0" : "justify-start gap-3",
               activeTab === 'servers' 
                 ? "bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/15 hover:text-cyan-300" 
                 : "text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent"
             )}
+            title={sidebarCollapsed ? t('servers') : undefined}
           >
-            <ServerIcon className={cn("h-4 w-4", activeTab === 'servers' ? "text-cyan-500" : "text-muted-foreground")} />
-            {t('servers')}
+            <ServerIcon className={cn("h-4 w-4 shrink-0", activeTab === 'servers' ? "text-cyan-500" : "text-muted-foreground")} />
+            {!sidebarCollapsed && t('servers')}
           </Button>
 
           <Button
             variant="ghost"
             onClick={() => setActiveTab('proxy')}
             className={cn(
-              "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
+              "w-full h-11 text-sm font-medium transition-all mb-1",
+              sidebarCollapsed ? "justify-center px-0" : "justify-start gap-3",
               activeTab === 'proxy' 
                 ? "bg-violet-500/10 text-violet-400 hover:bg-violet-500/15 hover:text-violet-300" 
                 : "text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent"
             )}
+            title={sidebarCollapsed ? t('proxy') : undefined}
           >
-            <Globe className={cn("h-4 w-4", activeTab === 'proxy' ? "text-violet-500" : "text-muted-foreground")} />
-            {t('proxy')}
+            <Globe className={cn("h-4 w-4 shrink-0", activeTab === 'proxy' ? "text-violet-500" : "text-muted-foreground")} />
+            {!sidebarCollapsed && t('proxy')}
           </Button>
 
           <Button
             variant="ghost"
             onClick={() => setActiveTab('logs')}
             className={cn(
-              "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
+              "w-full h-11 text-sm font-medium transition-all mb-1",
+              sidebarCollapsed ? "justify-center px-0" : "justify-start gap-3",
               activeTab === 'logs' 
                 ? "bg-amber-500/10 text-amber-400 hover:bg-amber-500/15 hover:text-amber-300" 
                 : "text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent"
             )}
+            title={sidebarCollapsed ? t('logs') : undefined}
           >
-            <FileText className={cn("h-4 w-4", activeTab === 'logs' ? "text-amber-500" : "text-muted-foreground")} />
-            {t('logs')}
+            <FileText className={cn("h-4 w-4 shrink-0", activeTab === 'logs' ? "text-amber-500" : "text-muted-foreground")} />
+            {!sidebarCollapsed && t('logs')}
           </Button>
 
           <Button
             variant="ghost"
             onClick={() => setActiveTab('settings')}
             className={cn(
-              "w-full justify-start gap-3 h-11 text-sm font-medium transition-all mb-1",
+              "w-full h-11 text-sm font-medium transition-all mb-1",
+              sidebarCollapsed ? "justify-center px-0" : "justify-start gap-3",
               activeTab === 'settings' 
                 ? "bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/15 hover:text-emerald-300" 
                 : "text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent"
             )}
+            title={sidebarCollapsed ? t('settings') : undefined}
           >
-            <Settings className={cn("h-4 w-4", activeTab === 'settings' ? "text-emerald-500" : "text-muted-foreground")} />
-            {t('settings')}
+            <Settings className={cn("h-4 w-4 shrink-0", activeTab === 'settings' ? "text-emerald-500" : "text-muted-foreground")} />
+            {!sidebarCollapsed && t('settings')}
           </Button>
         </nav>
 
-        <div className="px-6 pb-4 space-y-4">
-           <div className="flex items-center justify-between">
-             <span className="text-xs font-medium text-muted-foreground dark:text-muted-foreground">{t('appearance')}</span>
-             <ThemeToggle />
-           </div>
-           <div className="flex items-center justify-between">
-             <span className="text-xs font-medium text-muted-foreground dark:text-muted-foreground">{t('language')}</span>
-             <LanguageToggle />
-           </div>
-        </div>
-
-        <div className="p-4 border-t border-sidebar-border">
-          <div className="bg-sidebar-accent rounded-lg p-3 border border-sidebar-border">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">{t('status')}</span>
-              <div className={cn("h-1.5 w-1.5 rounded-full transition-colors", isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-muted-foreground/30')} />
-            </div>
-            <div className="flex items-center gap-2">
-              <Activity className={cn("h-3.5 w-3.5", isRunning ? "text-emerald-500" : "text-muted-foreground")} />
-              <div className="text-sm font-medium text-sidebar-foreground">
-                {isRunning ? t('systemActive') : t('systemIdle')}
+        <div className={cn("p-3 border-t border-sidebar-border", sidebarCollapsed ? "px-2" : "px-4")}>
+          {!sidebarCollapsed && (
+            <div className="bg-sidebar-accent rounded-lg p-3 border border-sidebar-border mb-3">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">{t('status')}</span>
+                <div className={cn("h-1.5 w-1.5 rounded-full transition-colors", isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-muted-foreground/30')} />
+              </div>
+              <div className="flex items-center gap-2">
+                <Activity className={cn("h-3.5 w-3.5", isRunning ? "text-emerald-500" : "text-muted-foreground")} />
+                <div className="text-sm font-medium text-sidebar-foreground">
+                  {isRunning ? t('systemActive') : t('systemIdle')}
+                </div>
               </div>
             </div>
-          </div>
+          )}
+          {sidebarCollapsed && (
+            <div className="flex justify-center mb-3">
+              <div className={cn("h-2.5 w-2.5 rounded-full transition-colors", isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-muted-foreground/30')} />
+            </div>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+            className={cn("w-full text-muted-foreground hover:text-foreground", sidebarCollapsed ? "justify-center px-0" : "justify-start gap-2")}
+          >
+            {sidebarCollapsed ? <PanelLeft className="h-4 w-4" /> : <><PanelLeftClose className="h-4 w-4" /></>}
+          </Button>
         </div>
       </aside>
 
-      {/* Main Content - Offset ml-64 */}
-      <main className="flex-1 md:ml-64 min-h-screen bg-background transition-colors duration-300">
+      <main className={cn("flex-1 min-h-screen bg-background transition-all duration-300", sidebarCollapsed ? "md:ml-16" : "md:ml-64")}>
         <div className="max-w-6xl mx-auto px-6 py-8 md:px-10 md:py-10 space-y-8">
           
           {/* Header */}
@@ -713,7 +733,42 @@ function AppContent() {
 
           {/* Settings View */}
           {activeTab === 'settings' && (
-            <div className="max-w-md">
+            <div className="max-w-md space-y-6">
+              {/* Appearance & Language Card */}
+              <Card className="bg-card border-border">
+                <CardHeader>
+                  <CardTitle className="text-lg text-foreground">{t('appearance')}</CardTitle>
+                  <CardDescription className="text-muted-foreground">{t('language')}</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="flex items-center justify-between py-2">
+                    <div className="flex items-center gap-3">
+                      <div className="h-9 w-9 rounded-lg bg-amber-500/10 flex items-center justify-center">
+                        <span className="text-amber-500 text-lg">☀</span>
+                      </div>
+                      <div>
+                        <div className="text-sm font-medium text-foreground">{t('appearance')}</div>
+                        <div className="text-xs text-muted-foreground">Light / Dark</div>
+                      </div>
+                    </div>
+                    <ThemeToggle />
+                  </div>
+                  <div className="flex items-center justify-between py-2">
+                    <div className="flex items-center gap-3">
+                      <div className="h-9 w-9 rounded-lg bg-blue-500/10 flex items-center justify-center">
+                        <Globe className="h-4 w-4 text-blue-500" />
+                      </div>
+                      <div>
+                        <div className="text-sm font-medium text-foreground">{t('language')}</div>
+                        <div className="text-xs text-muted-foreground">English / 中文</div>
+                      </div>
+                    </div>
+                    <LanguageToggle />
+                  </div>
+                </CardContent>
+              </Card>
+
+              {/* About Card */}
               <Card className="bg-card border-border">
                 <CardHeader>
                   <CardTitle className="text-lg text-foreground">{t('about')}</CardTitle>
