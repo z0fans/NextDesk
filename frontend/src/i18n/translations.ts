@@ -62,6 +62,7 @@ export const translations = {
     testNodeDelays: 'Test node delays',
     unknown: 'Unknown',
     activeLabel: 'Active',
+    reuseModeDesc: 'Subscription is managed by Clash Verge',
   },
   'zh-CN': {
     dashboard: '仪表盘',
@@ -126,6 +127,7 @@ export const translations = {
     testNodeDelays: '测试节点延迟',
     unknown: '未知',
     activeLabel: '当前使用',
+    reuseModeDesc: '订阅由 Clash Verge 管理',
   },
 };
 

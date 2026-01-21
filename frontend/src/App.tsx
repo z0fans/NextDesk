@@ -121,18 +121,14 @@ function AppContent() {
 
   const fetchData = async () => {
     try {
-      const [newStatus, newServers, savedUrl, newProxyGroups, newRunMode] = await Promise.all([
+      const [newStatus, newServers, newProxyGroups, newRunMode] = await Promise.all([
         api.getStatus(),
         api.getServers(),
-        api.getSubscriptionUrl(),
         api.getProxyGroups(),
         api.getRunMode()
       ]);
       setStatus(newStatus);
       setServers(newServers);
-      if (savedUrl && !subUrl) {
-        setSubUrl(savedUrl);
-      }
       setProxyGroups(newProxyGroups);
       setRunMode(newRunMode);
     } catch (error) {
@@ -604,7 +600,21 @@ function AppContent() {
 
           {/* Proxy View */}
           {activeTab === 'proxy' && (
-            <div className="max-w-2xl space-y-6">
+            <div className="max-w-2xl space-y-6 relative">
+              {/* Reuse Mode Overlay */}
+              {runMode.reuse_mode && (
+                <div className="absolute inset-0 z-10 flex items-center justify-center bg-background/80 backdrop-blur-sm rounded-xl">
+                  <div className="text-center">
+                    <div className="h-16 w-16 rounded-full bg-green-500/10 flex items-center justify-center mx-auto mb-4">
+                      <CheckCircle2 className="h-8 w-8 text-green-500" />
+                    </div>
+                    <h3 className="text-xl font-semibold text-foreground mb-2">{t('reuseMode')}</h3>
+                    <p className="text-sm text-muted-foreground max-w-xs">
+                      {t('reuseModeDesc')}
+                    </p>
+                  </div>
+                </div>
+              )}
               <Card className="bg-card border-border">
                 <CardHeader>
                   <CardTitle className="text-lg text-foreground">{t('subscription')}</CardTitle>
