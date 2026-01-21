@@ -743,9 +743,9 @@ function AppContent() {
 
           {/* Settings View */}
           {activeTab === 'settings' && (
-            <div className="max-w-md space-y-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               {/* Appearance & Language Card */}
-              <Card className="bg-card border-border">
+              <Card className="bg-card border-border h-fit">
                 <CardHeader>
                   <CardTitle className="text-lg text-foreground">{t('appearance')}</CardTitle>
                   <CardDescription className="text-muted-foreground">{t('language')}</CardDescription>
@@ -779,7 +779,7 @@ function AppContent() {
               </Card>
 
               {/* About Card */}
-              <Card className="bg-card border-border">
+              <Card className="bg-card border-border h-fit">
                 <CardHeader>
                   <CardTitle className="text-lg text-foreground">{t('about')}</CardTitle>
                   <CardDescription className="text-muted-foreground">{t('settingsDesc')}</CardDescription>

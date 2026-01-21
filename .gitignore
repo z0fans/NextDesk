@@ -38,3 +38,4 @@ Thumbs.db
 # Local tools
 .playwright-mcp/
 .serena/
+RELEASE.md
