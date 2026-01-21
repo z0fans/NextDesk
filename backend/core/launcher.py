@@ -130,8 +130,8 @@ class Launcher:
             print(f"MultiDesk not found: {core_path}")
             return
 
-        chs_dll = self._bin_dir / "core_chs.dll"
-        chs_dll_disabled = self._bin_dir / "core_chs.dll.disabled"
+        chs_dll = self._bin_dir / "MultiDesk_chs.x64.dll"
+        chs_dll_disabled = self._bin_dir / "MultiDesk_chs.x64.dll.disabled"
 
         if self._is_chinese_locale():
             if chs_dll_disabled.exists() and not chs_dll.exists():
