@@ -131,6 +131,7 @@ class Api:
             pass
 
     def start_engine(self) -> bool:
+        self._detect_and_configure_clash()
         return self._launcher.start()
 
     def stop_engine(self) -> bool:
