@@ -3,6 +3,7 @@ import sys
 import os
 import threading
 import time
+import locale
 from pathlib import Path
 
 from core.config_gen import get_user_config_dir, get_log_dir
@@ -110,11 +111,34 @@ class Launcher:
         )
         self._clash_log_file = log_file
 
+    def _is_chinese_locale(self) -> bool:
+        try:
+            if sys.platform == "win32":
+                import ctypes
+
+                lcid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+                return lcid in (0x0804, 0x0404, 0x0C04, 0x1004, 0x1404)
+            else:
+                lang = locale.getdefaultlocale()[0] or ""
+                return lang.startswith("zh")
+        except Exception:
+            return False
+
     def _start_multidesk(self):
         core_path = self._bin_dir / "core.dat"
         if not core_path.exists():
             print(f"MultiDesk not found: {core_path}")
             return
+
+        chs_dll = self._bin_dir / "chs.dll"
+        chs_dll_disabled = self._bin_dir / "chs.dll.disabled"
+
+        if self._is_chinese_locale():
+            if chs_dll_disabled.exists() and not chs_dll.exists():
+                chs_dll_disabled.rename(chs_dll)
+        else:
+            if chs_dll.exists():
+                chs_dll.rename(chs_dll_disabled)
 
         config_path = self._config_dir / "MultiDesk.multidesk"
         args = [str(core_path)]
