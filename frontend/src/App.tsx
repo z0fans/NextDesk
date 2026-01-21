@@ -86,12 +86,14 @@ function AppContent() {
   };
 
   const handleProxySelect = async (groupName: string, proxyName: string) => {
+    setSelectedProxies(prev => ({
+      ...prev,
+      [groupName]: proxyName
+    }));
     const success = await api.switchProxy(groupName, proxyName);
     if (success) {
-      setSelectedProxies(prev => ({
-        ...prev,
-        [groupName]: proxyName
-      }));
+      const newProxyGroups = await api.getProxyGroups();
+      setProxyGroups(newProxyGroups);
     }
   };
 
