@@ -1,0 +1,13 @@
+{
+  "Id": "00000000-0000-0000-0000-000000000000",
+  "Hostname": "localhost",
+  "TlsCertificateFile": "/etc/gateway/cert.pem",
+  "TlsPrivateKeyFile": "/etc/gateway/key.pem",
+  "ProvisionerPublicKeyFile": "/etc/gateway/provisioner.pub.pem",
+  "Listeners": [
+    {
+      "InternalUrl": "http://*:8080",
+      "ExternalUrl": "http://localhost:8080"
+    }
+  ]
+}
