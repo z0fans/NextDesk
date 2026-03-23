@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
-const CURRENT_VERSION: &str = "1.0.75";
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GITHUB_REPO: &str = "z0fans/NextDesk";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
