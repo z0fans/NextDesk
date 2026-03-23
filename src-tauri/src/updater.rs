@@ -229,8 +229,18 @@ pub fn install_update(app_state: State<'_, AppState>) -> Result<bool, String> {
 
     #[cfg(target_os = "windows")]
     {
-        // Directly launch the NSIS installer exe
-        let _ = std::process::Command::new(&path)
+        // Get current exe path so we can relaunch after install
+        let current_exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // PowerShell: silent NSIS install (/S) → wait → relaunch
+        let script = format!(
+            "Start-Process -FilePath '{}' -ArgumentList '/S' -Wait; Start-Process -FilePath '{}'",
+            path, current_exe
+        );
+        let _ = std::process::Command::new("powershell")
+            .args(&["-WindowStyle", "Hidden", "-Command", &script])
             .spawn()
             .map_err(|e| e.to_string())?;
         std::process::exit(0);
