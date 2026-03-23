@@ -114,14 +114,14 @@ export const api = {
   checkForUpdate: () =>
     invoke<UpdateInfo>('check_for_update'),
 
-  getDownloadStatus: async (): Promise<DownloadStatus> =>
-    ({ status: 'idle', progress: 0 }),
+  getDownloadStatus: () =>
+    invoke<DownloadStatus>('get_download_status'),
 
-  startDownloadUpdate: async (): Promise<boolean> =>
-    false,
+  startDownloadUpdate: () =>
+    invoke<boolean>('start_download_update'),
 
-  installUpdate: async (): Promise<boolean> =>
-    false,
+  installUpdate: () =>
+    invoke<boolean>('install_update'),
 
   getCurrentVersion: () =>
     invoke<string>('get_current_version'),

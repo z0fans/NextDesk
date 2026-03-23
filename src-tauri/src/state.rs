@@ -4,6 +4,25 @@ use std::sync::{Arc, Mutex};
 use tokio::process::Child;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdaterState {
+    pub download_url: Option<String>,
+    pub status: String,
+    pub progress: f32,
+    pub downloaded_path: Option<String>,
+}
+
+impl Default for UpdaterState {
+    fn default() -> Self {
+        Self {
+            download_url: None,
+            status: "idle".to_string(),
+            progress: 0.0,
+            downloaded_path: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Server {
     pub id: String,
     pub name: String,
@@ -50,6 +69,7 @@ pub struct AppState {
     pub rdp_proxy_port: Arc<Mutex<u16>>,
     pub clipboard_sessions: Arc<Mutex<HashMap<String, ClipboardSessionState>>>,
     pub mac_clipboard_strategy: Arc<Mutex<String>>,
+    pub updater_state: Arc<Mutex<UpdaterState>>,
 }
 
 impl Default for AppState {
@@ -71,6 +91,7 @@ impl Default for AppState {
             rdp_proxy_port: Arc::new(Mutex::new(18765)),
             clipboard_sessions: Arc::new(Mutex::new(HashMap::new())),
             mac_clipboard_strategy: Arc::new(Mutex::new("session-file-url".to_string())),
+            updater_state: Arc::new(Mutex::new(UpdaterState::default())),
         }
     }
 }
