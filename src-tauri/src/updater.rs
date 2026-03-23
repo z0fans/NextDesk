@@ -238,8 +238,24 @@ pub fn install_update(app_state: State<'_, AppState>) -> Result<bool, String> {
 
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open")
-            .arg(&path)
+        // Shell script: mount DMG → copy .app → detach → relaunch
+        let script = format!(
+            r#"
+sleep 1
+MOUNT_DIR=$(hdiutil attach "{dmg}" -nobrowse -noverify | grep '/Volumes/' | awk -F'\t' '{{print $NF}}')
+if [ -z "$MOUNT_DIR" ]; then exit 1; fi
+APP_PATH=$(find "$MOUNT_DIR" -maxdepth 1 -name '*.app' | head -1)
+if [ -z "$APP_PATH" ]; then hdiutil detach "$MOUNT_DIR" -quiet; exit 1; fi
+APP_NAME=$(basename "$APP_PATH")
+rm -rf "/Applications/$APP_NAME"
+cp -R "$APP_PATH" /Applications/
+hdiutil detach "$MOUNT_DIR" -quiet
+open "/Applications/$APP_NAME"
+"#,
+            dmg = path
+        );
+        let _ = std::process::Command::new("sh")
+            .args(&["-c", &script])
             .spawn()
             .map_err(|e| e.to_string())?;
         std::process::exit(0);
