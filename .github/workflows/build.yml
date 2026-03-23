@@ -69,11 +69,16 @@ jobs:
         shell: bash
         run: bash scripts/download-deps.sh x86_64-pc-windows-msvc
 
+      - name: Trim signing key
+        shell: pwsh
+        run: |
+          $key = "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}".Trim()
+          echo "TAURI_SIGNING_PRIVATE_KEY=$key" >> $env:GITHUB_ENV
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
           includeUpdaterJson: true
 
