@@ -1,0 +1,2 @@
+# Track everything - WASM files are required for build
+# ironrdp_web_bg.wasm (~4MB) is needed at runtime
