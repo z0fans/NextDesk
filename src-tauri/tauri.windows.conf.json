@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "resources": {
+      "../.backend/bin/mihomo.exe": "bin/mihomo.exe"
+    }
+  }
+}
