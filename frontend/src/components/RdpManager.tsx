@@ -372,7 +372,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
   resModeRef.current = resMode;
   const [showNewConn, setShowNewConn] = useState(false);
   const [editServerId, setEditServerId] = useState<string | null>(null);
-  const [proxyPort, setProxyPort] = useState(8765);
+  const [proxyPort, setProxyPort] = useState(18765);
 
 
 

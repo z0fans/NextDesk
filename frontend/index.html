@@ -5,6 +5,16 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>NextDesk</title>
+    <script>
+      // Sync theme before React renders to prevent flash
+      (function() {
+        var saved = localStorage.getItem('nextdesk-theme');
+        if (saved === 'light') {
+          document.documentElement.classList.remove('dark');
+        }
+        // If saved === 'dark' or no saved theme, keep the HTML default class="dark"
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

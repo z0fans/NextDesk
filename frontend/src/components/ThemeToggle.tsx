@@ -7,15 +7,9 @@ export function ThemeToggle() {
   const [theme, setTheme] = useState<"light" | "dark">("dark");
 
   useEffect(() => {
-    const savedTheme = localStorage.getItem("nextdesk-theme") as "light" | "dark" | null;
-    if (savedTheme) {
-      setTheme(savedTheme);
-      document.documentElement.classList.toggle("dark", savedTheme === "dark");
-    } else {
-      const systemTheme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-      setTheme(systemTheme);
-      document.documentElement.classList.toggle("dark", systemTheme === "dark");
-    }
+    // Read current theme from DOM (already set by index.html inline script)
+    const isDark = document.documentElement.classList.contains("dark");
+    setTheme(isDark ? "dark" : "light");
   }, []);
 
   const toggleTheme = () => {
