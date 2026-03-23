@@ -53,7 +53,7 @@ function AppContent() {
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [downloadStatus, setDownloadStatus] = useState<DownloadStatus>({ status: 'idle', progress: 0 });
   const [showUpdateModal, setShowUpdateModal] = useState(false);
-  const [currentVersion, setCurrentVersion] = useState('');
+  const [, setCurrentVersion] = useState('');
   const [subMessage, setSubMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [proxyGroups, setProxyGroups] = useState<ProxyGroup[]>([]);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
