@@ -1,7 +1,7 @@
 {
   "productName": "NextDesk",
-  "version": "1.0.76",
-  "identifier": "com.nextdesk.app",
+  "version": "1.0.77",
+  "identifier": "cc.yougotme.nextdesk",
   "build": {
     "frontendDist": "../frontend/dist",
     "devUrl": "http://localhost:5173",
