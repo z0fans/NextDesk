@@ -1,20 +1,14 @@
+# All dot directories (except .github/)
+.*
+!.github/
+!.gitignore
+
 # Dependencies
 node_modules/
-venv/
-__pycache__/
-*.pyc
 
 # Build outputs
 dist/
 build/
-installer/
-*.egg-info/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
 
 # OS
 .DS_Store
@@ -24,21 +18,12 @@ Thumbs.db
 *.log
 /tmp/
 
-# Cache
-.ruff_cache/
-.cache/
-
 # Environment
 .env
 .env.local
 
-# PyInstaller
-*.spec.bak
-
-# Local tools
-.playwright-mcp/
-.serena/
-RELEASE.md
+# Rust build
+src-tauri/target/
 
 # Large binaries (downloaded by CI/scripts)
 .backend/bin/mihomo
@@ -46,6 +31,3 @@ RELEASE.md
 .backend/bin/Country.mmdb
 .backend/bin/geoip.metadb
 .backend/bin/geosite.dat
-
-# Rust build
-src-tauri/target/
