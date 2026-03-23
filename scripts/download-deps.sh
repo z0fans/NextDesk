@@ -10,8 +10,10 @@
 set -euo pipefail
 
 MIHOMO_VERSION="v1.19.21"
-BIN_DIR="$(cd "$(dirname "$0")/../.backend/bin" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BIN_DIR="$SCRIPT_DIR/../.backend/bin"
 mkdir -p "$BIN_DIR"
+BIN_DIR="$(cd "$BIN_DIR" && pwd)"
 
 download_mihomo() {
   local arch="$1"
