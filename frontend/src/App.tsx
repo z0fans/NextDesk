@@ -20,7 +20,9 @@ import {
   Play,
   Square
 } from 'lucide-react';
-import { api, type EngineStatus, type Server, type UpdateInfo, type DownloadStatus, type ProxyGroup, type Connection, type RunMode } from './api';
+import { api, type EngineStatus, type Server, type UpdateInfo, type ProxyGroup, type Connection, type RunMode } from './api';
+import { check } from '@tauri-apps/plugin-updater';
+import { relaunch } from '@tauri-apps/plugin-process';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Logo } from '@/components/Logo';
@@ -51,7 +53,8 @@ function AppContent() {
   const [updatingSub, setUpdatingSub] = useState(false);
   
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
-  const [downloadStatus, setDownloadStatus] = useState<DownloadStatus>({ status: 'idle', progress: 0 });
+  const [downloadProgress, setDownloadProgress] = useState(0);
+  const [updateStatus, setUpdateStatus] = useState<'idle' | 'downloading' | 'installing' | 'error'>('idle');
   const [showUpdateModal, setShowUpdateModal] = useState(false);
   const [, setCurrentVersion] = useState('');
   const [subMessage, setSubMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -157,30 +160,37 @@ function AppContent() {
     }
   };
 
-  const pollDownloadStatus = async () => {
+  const handleDownloadAndInstall = async () => {
     try {
-      const status = await api.getDownloadStatus();
-      setDownloadStatus(status);
-      return status;
+      setUpdateStatus('downloading');
+      setDownloadProgress(0);
+      const update = await check();
+      if (!update) return;
+
+      let downloaded = 0;
+      let totalSize = 0;
+      await update.downloadAndInstall((event) => {
+        switch (event.event) {
+          case 'Started':
+            totalSize = event.data.contentLength ?? 0;
+            downloaded = 0;
+            break;
+          case 'Progress':
+            downloaded += event.data.chunkLength;
+            if (totalSize > 0) {
+              setDownloadProgress(Math.round((downloaded / totalSize) * 100));
+            }
+            break;
+          case 'Finished':
+            setUpdateStatus('installing');
+            break;
+        }
+      });
+      await relaunch();
     } catch (error) {
-      console.error('Failed to get download status', error);
-      return { status: 'idle', progress: 0 };
+      console.error('Update failed', error);
+      setUpdateStatus('error');
     }
-  };
-
-  const handleStartDownload = async () => {
-    await api.startDownloadUpdate();
-    const interval = setInterval(async () => {
-      const status = await pollDownloadStatus();
-      if (status.status === 'ready' || status.status.startsWith('error')) {
-        clearInterval(interval);
-      }
-    }, 500);
-  };
-
-  const handleInstallUpdate = async () => {
-    await api.installUpdate();
-    window.close();
   };
 
   useEffect(() => {
@@ -1025,44 +1035,49 @@ function AppContent() {
               </div>
             </div>
 
-            {downloadStatus.status === 'idle' && (
+            {updateStatus === 'idle' && (
               <Button 
-                onClick={handleStartDownload}
+                onClick={handleDownloadAndInstall}
                 className="w-full bg-emerald-600 hover:bg-emerald-500 text-white"
               >
                 <Download className="h-4 w-4 mr-2" />
-                {t('downloadUpdate')}
+                {t('installAndRestart')}
               </Button>
             )}
 
-            {downloadStatus.status === 'downloading' && (
+            {updateStatus === 'downloading' && (
               <div className="space-y-2">
                 <div className="flex justify-between text-sm text-muted-foreground">
                   <span>{t('downloading')}</span>
-                  <span>{Math.round(downloadStatus.progress)}%</span>
+                  <span>{downloadProgress}%</span>
                 </div>
                 <div className="h-2 bg-muted rounded-full overflow-hidden">
                   <div 
                     className="h-full bg-gradient-to-r from-emerald-600 to-cyan-600 transition-all duration-300"
-                    style={{ width: `${downloadStatus.progress}%` }}
+                    style={{ width: `${downloadProgress}%` }}
                   />
                 </div>
               </div>
             )}
 
-            {downloadStatus.status === 'ready' && (
-              <Button 
-                onClick={handleInstallUpdate}
-                className="w-full bg-blue-600 hover:bg-blue-500 text-white"
-              >
-                <CheckCircle2 className="h-4 w-4 mr-2" />
-                {t('installAndRestart')}
-              </Button>
+            {updateStatus === 'installing' && (
+              <div className="text-emerald-400 text-sm text-center">
+                {t('installAndRestart')}...
+              </div>
             )}
 
-            {downloadStatus.status.startsWith('error') && (
-              <div className="text-red-400 text-sm text-center">
-                {t('downloadFailed')}
+            {updateStatus === 'error' && (
+              <div className="space-y-2">
+                <div className="text-red-400 text-sm text-center">
+                  {t('downloadFailed')}
+                </div>
+                <Button 
+                  onClick={() => { setUpdateStatus('idle'); handleDownloadAndInstall(); }}
+                  className="w-full bg-emerald-600 hover:bg-emerald-500 text-white"
+                >
+                  <RefreshCw className="h-4 w-4 mr-2" />
+                  {t('downloadUpdate')}
+                </Button>
               </div>
             )}
           </div>

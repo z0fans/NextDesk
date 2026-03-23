@@ -479,31 +479,8 @@ fn get_clash_log() -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn check_for_update(
-    app_state: tauri::State<'_, AppState>,
-) -> Result<updater::UpdateInfo, String> {
-    Ok(updater::check_for_update(app_state).await)
-}
-
-#[tauri::command]
-async fn start_download_update(
-    app_state: tauri::State<'_, AppState>,
-) -> Result<bool, String> {
-    updater::start_download_update(app_state).await
-}
-
-#[tauri::command]
-fn get_download_status(
-    app_state: tauri::State<'_, AppState>,
-) -> Result<updater::DownloadStatus, String> {
-    Ok(updater::get_download_status(app_state))
-}
-
-#[tauri::command]
-fn install_update(
-    app_state: tauri::State<'_, AppState>,
-) -> Result<bool, String> {
-    updater::install_update(app_state)
+async fn check_for_update() -> Result<updater::UpdateInfo, String> {
+    Ok(updater::check_for_update().await)
 }
 
 #[tauri::command]
@@ -720,6 +697,8 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(app_state)
         .setup(|app| {
             let state = app.state::<AppState>();
@@ -745,9 +724,6 @@ pub fn run() {
             get_connections,
             get_clash_log,
             check_for_update,
-            start_download_update,
-            get_download_status,
-            install_update,
             get_current_version,
             get_system_language,
             get_run_mode,

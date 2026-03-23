@@ -1,6 +1,6 @@
 {
   "productName": "NextDesk",
-  "version": "1.0.84",
+  "version": "1.0.85",
   "identifier": "cc.yougotme.nextdesk",
   "build": {
     "frontendDist": "../frontend/dist",
@@ -24,6 +24,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["dmg", "nsis"],
     "icon": [
       "icons/32x32.png",
@@ -46,6 +47,17 @@
         "displayLanguageSelector": true,
         "installerIcon": "icons/icon.ico",
         "installMode": "both"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI2NUIxRTBBNjBGMTEyNDAKUldSQUV2RmdDaDVidHI1MUkvR3lJN1JSU3NHaFhPRktFNE5LbnZsU0h6QUxxMWtoRlNFQUp3QnEK",
+      "endpoints": [
+        "https://github.com/z0fans/NextDesk/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

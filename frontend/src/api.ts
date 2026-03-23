@@ -43,10 +43,7 @@ export interface UpdateInfo {
   error?: string;
 }
 
-export interface DownloadStatus {
-  status: 'idle' | 'downloading' | 'ready' | string;
-  progress: number;
-}
+
 
 export interface Connection {
   id: string;
@@ -113,15 +110,6 @@ export const api = {
 
   checkForUpdate: () =>
     invoke<UpdateInfo>('check_for_update'),
-
-  getDownloadStatus: () =>
-    invoke<DownloadStatus>('get_download_status'),
-
-  startDownloadUpdate: () =>
-    invoke<boolean>('start_download_update'),
-
-  installUpdate: () =>
-    invoke<boolean>('install_update'),
 
   getCurrentVersion: () =>
     invoke<string>('get_current_version'),

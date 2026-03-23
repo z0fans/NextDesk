@@ -1,6 +1,6 @@
 [package]
 name = "nextdesk"
-version = "1.0.84"
+version = "1.0.85"
 edition = "2021"
 
 [dependencies]
@@ -27,7 +27,10 @@ tokio-socks = "0.5"
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-dialog = "2.6.0"
 tauri-plugin-fs = "2.4.5"
+tauri-plugin-process = "2"
 
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+tauri-plugin-updater = "2"
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
 objc2 = "0.6.4"
