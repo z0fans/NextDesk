@@ -229,13 +229,8 @@ pub fn install_update(app_state: State<'_, AppState>) -> Result<bool, String> {
 
     #[cfg(target_os = "windows")]
     {
-        // Launch installer after a short delay so current process can exit
-        let script = format!(
-            "ping -n 2 127.0.0.1 >nul & start \"\" \"{}\"",
-            path.replace('/', "\\")
-        );
-        let _ = std::process::Command::new("cmd")
-            .args(&["/c", &script])
+        // Directly launch the NSIS installer exe
+        let _ = std::process::Command::new(&path)
             .spawn()
             .map_err(|e| e.to_string())?;
         std::process::exit(0);
