@@ -1,6 +1,6 @@
 {
   "productName": "NextDesk",
-  "version": "1.0.85",
+  "version": "1.0.86",
   "identifier": "cc.yougotme.nextdesk",
   "build": {
     "frontendDist": "../frontend/dist",
