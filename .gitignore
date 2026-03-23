@@ -39,3 +39,13 @@ Thumbs.db
 .playwright-mcp/
 .serena/
 RELEASE.md
+
+# Large binaries (downloaded by CI/scripts)
+.backend/bin/mihomo
+.backend/bin/mihomo.exe
+.backend/bin/Country.mmdb
+.backend/bin/geoip.metadb
+.backend/bin/geosite.dat
+
+# Rust build
+src-tauri/target/

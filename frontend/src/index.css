@@ -51,17 +51,24 @@
   }
 }
 
+html {
+  height: 100vh;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
 body {
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
   background-color: hsl(var(--background));
   color: hsl(var(--foreground));
-  min-height: 100vh;
-  overflow-x: hidden;
+  height: 100vh;
+  overflow: hidden;
+  overscroll-behavior: none;
 }
 
 #root {
-  min-height: 100vh;
-  overflow-x: hidden;
+  height: 100vh;
+  overflow: hidden;
 }
 
 @theme inline {
@@ -145,6 +152,18 @@ body {
     background-image: linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
                       linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
   }
+
+  .animate-shake {
+    animation: shake 0.4s ease-in-out;
+  }
+}
+
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-4px); }
+  40% { transform: translateX(4px); }
+  60% { transform: translateX(-3px); }
+  80% { transform: translateX(2px); }
 }
 
 @layer base {

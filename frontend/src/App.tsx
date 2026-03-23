@@ -3,7 +3,7 @@ import {
   LayoutDashboard, 
   Server as ServerIcon, 
   Settings, 
-  Power, 
+  
   Activity, 
   Zap, 
   RefreshCw,
@@ -15,7 +15,10 @@ import {
   ChevronRight,
   FileText,
   PanelLeftClose,
-  PanelLeft
+  PanelLeft,
+  Monitor,
+  Play,
+  Square
 } from 'lucide-react';
 import { api, type EngineStatus, type Server, type UpdateInfo, type DownloadStatus, type ProxyGroup, type Connection, type RunMode } from './api';
 import { Button } from '@/components/ui/button';
@@ -28,6 +31,7 @@ import { ThemeToggle } from '@/components/ThemeToggle';
 import { LanguageProvider } from '@/i18n/LanguageProvider';
 import { useTranslation } from '@/i18n/useTranslation';
 import { LanguageToggle } from '@/components/LanguageToggle';
+import { RdpManager } from '@/components/RdpManager';
 
 const formatBytes = (bytes: number): string => {
   if (bytes === 0) return '0 B';
@@ -39,8 +43,8 @@ const formatBytes = (bytes: number): string => {
 
 function AppContent() {
   const { t } = useTranslation();
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'servers' | 'proxy' | 'logs' | 'settings'>('dashboard');
-  const [status, setStatus] = useState<EngineStatus>({ clash: false, multidesk: false });
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'servers' | 'proxy' | 'logs' | 'settings' | 'rdp'>('dashboard');
+  const [status, setStatus] = useState<EngineStatus>({ clash: false, rdp_proxy_port: 8765 });
   const [, setServers] = useState<Server[]>([]);
   const [loading, setLoading] = useState(false);
   const [subUrl, setSubUrl] = useState('');
@@ -59,6 +63,7 @@ function AppContent() {
   const [connections, setConnections] = useState<Connection[]>([]);
   const [runMode, setRunMode] = useState<RunMode>({ reuse_mode: false, clash_api: '', proxy_port: 17897 });
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [folderSharingLocal, setFolderSharingLocal] = useState(() => { try { return JSON.parse(localStorage.getItem('nextdesk_folder_sharing') || 'false'); } catch { return false; } });
 
   useEffect(() => {
     if (proxyGroups.length > 0) {
@@ -200,14 +205,16 @@ function AppContent() {
   const handleToggleEngine = async () => {
     setLoading(true);
     try {
-      if (status.clash || status.multidesk) {
+      if (status.clash) {
         await api.stopEngine();
       } else {
         await api.startEngine();
       }
       setTimeout(fetchData, 1000);
-    } catch (error) {
-      console.error('Failed to toggle engine', error);
+    } catch (error: unknown) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error('Failed to toggle engine:', msg);
+      alert(`Engine error: ${msg}`);
     } finally {
       setLoading(false);
     }
@@ -233,13 +240,13 @@ function AppContent() {
     }
   };
 
-  const isRunning = status.clash || status.multidesk;
+  const isRunning = status.clash;
 
   return (
-    <div className="min-h-screen w-full bg-background text-foreground font-sans flex transition-colors duration-300">
+    <div className="h-screen w-full bg-background text-foreground font-sans flex transition-colors duration-300 overflow-hidden">
       <aside className={cn(
         "hidden md:flex md:flex-col md:fixed md:inset-y-0 md:left-0 border-r border-border bg-sidebar z-50 transition-all duration-300",
-        sidebarCollapsed ? "md:w-16" : "md:w-64"
+        sidebarCollapsed ? "md:w-16" : "md:w-48"
       )}>
         <div className={cn("p-4 flex items-center border-b border-sidebar-border", sidebarCollapsed ? "justify-center" : "gap-3")}>
           <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-blue-600 to-cyan-600 flex items-center justify-center shadow-lg shadow-blue-900/20 overflow-hidden shrink-0">
@@ -288,6 +295,22 @@ function AppContent() {
           >
             <ServerIcon className={cn("h-4 w-4 shrink-0", activeTab === 'servers' ? "text-cyan-500" : "text-muted-foreground")} />
             {!sidebarCollapsed && t('servers')}
+          </Button>
+
+          <Button
+            variant="ghost"
+            onClick={() => setActiveTab('rdp')}
+            className={cn(
+              "w-full h-11 text-sm font-medium transition-all mb-1",
+              sidebarCollapsed ? "justify-center px-0" : "justify-start gap-3",
+              activeTab === 'rdp' 
+                ? "bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/15 hover:text-cyan-300" 
+                : "text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent"
+            )}
+            title={sidebarCollapsed ? t('rdp') : undefined}
+          >
+            <Monitor className={cn("h-4 w-4 shrink-0", activeTab === 'rdp' ? "text-cyan-500" : "text-muted-foreground")} />
+            {!sidebarCollapsed && t('rdp')}
           </Button>
 
           <Button
@@ -370,10 +393,15 @@ function AppContent() {
         </div>
       </aside>
 
-      <main className={cn("flex-1 min-h-screen bg-background transition-all duration-300", sidebarCollapsed ? "md:ml-16" : "md:ml-64")}>
-        <div className="max-w-6xl mx-auto px-6 py-8 md:px-10 md:py-10 space-y-8">
+      <main className={cn("flex-1 h-screen bg-background transition-all duration-300 overflow-hidden", sidebarCollapsed ? "md:ml-16" : "md:ml-48")}>
+        <div className={cn(
+          activeTab === 'rdp'
+            ? "h-full flex flex-col"
+            : "h-full overflow-y-auto max-w-6xl mx-auto px-6 py-8 md:px-10 md:py-10 space-y-8"
+        )}>
           
-          {/* Header */}
+          {/* Header — hidden for RDP (has its own chrome) */}
+          {activeTab !== 'rdp' && (
           <div className="flex items-center justify-between">
             <div>
               <h1 className="text-3xl font-bold text-foreground tracking-tight mb-1">
@@ -409,88 +437,170 @@ function AppContent() {
               <Button 
                 variant="outline" 
                 size="icon" 
-                onClick={fetchData} 
+                disabled={activeTab === 'dashboard' && loading}
+                onClick={activeTab === 'dashboard' ? async () => {
+                  if (runMode.reuse_mode) {
+                    // Already in reuse mode, just refresh
+                    fetchData();
+                    return;
+                  }
+                  // Not in reuse mode: detect and start engine
+                  setLoading(true);
+                  try {
+                    await api.startEngine();
+                    setTimeout(fetchData, 1000);
+                  } catch (error: unknown) {
+                    const msg = error instanceof Error ? error.message : String(error);
+                    alert(`Engine error: ${msg}`);
+                  } finally {
+                    setLoading(false);
+                  }
+                } : fetchData} 
                 className="rounded-full h-10 w-10 border-input bg-card text-muted-foreground hover:text-foreground hover:bg-accent hover:border-accent"
+                title={activeTab === 'dashboard' 
+                  ? (runMode.reuse_mode ? t('refresh') : t('switchToInternal'))
+                  : t('refresh')
+                }
               >
-                <RefreshCw className="h-4 w-4" />
+                <RefreshCw className={cn("h-4 w-4", loading && activeTab === 'dashboard' && "animate-spin")} />
               </Button>
             )}
           </div>
+          )}
 
           {/* Dashboard View */}
           {activeTab === 'dashboard' && (
-            <div className="space-y-10">
+            <div className="space-y-6">
               
-              {/* Status Cards - Grid Layout */}
+              {/* Hero Engine Status Card */}
+              <div className={cn(
+                "relative overflow-hidden rounded-2xl border p-6 backdrop-blur-md transition-all duration-500",
+                isRunning
+                  ? "bg-gradient-to-br from-blue-500/5 via-card/80 to-cyan-500/5 border-blue-500/20 shadow-[0_0_30px_-5px_rgba(59,130,246,0.15)]"
+                  : "bg-card/60 border-border"
+              )}>
+                {/* Subtle glow effect when running */}
+                {isRunning && (
+                  <div className="absolute inset-0 bg-gradient-to-r from-blue-500/5 via-transparent to-cyan-500/5 pointer-events-none" />
+                )}
+                <div className="relative flex items-center justify-between">
+                  <div className="flex items-center gap-4">
+                    {/* Status indicator */}
+                    <div className={cn(
+                      "h-12 w-12 rounded-xl flex items-center justify-center transition-all duration-300",
+                      isRunning
+                        ? "bg-blue-500/10 shadow-[0_0_15px_rgba(59,130,246,0.2)]"
+                        : "bg-muted/50"
+                    )}>
+                      <div className="relative">
+                        <Activity className={cn(
+                          "h-6 w-6 transition-colors duration-300",
+                          isRunning ? "text-blue-500" : "text-muted-foreground"
+                        )} />
+                        {isRunning && (
+                          <div className="absolute -top-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse ring-2 ring-card" />
+                        )}
+                      </div>
+                    </div>
+                    <div>
+                      <h3 className="text-lg font-semibold text-foreground">
+                        {t('coreEngine')}
+                      </h3>
+                      <p className="text-sm text-muted-foreground">
+                        {runMode.reuse_mode 
+                          ? `Clash · ${t('reuseMode')}`
+                          : isRunning ? t('running') : t('stopped')
+                        }
+                      </p>
+                    </div>
+                  </div>
+                  {/* Start / Stop Button */}
+                  {!runMode.reuse_mode && (
+                    <Button
+                      onClick={handleToggleEngine}
+                      disabled={loading}
+                      className={cn(
+                        "h-10 px-6 rounded-full font-medium transition-all duration-300 gap-2",
+                        isRunning
+                          ? "bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20"
+                          : "bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 text-white shadow-lg shadow-blue-500/20"
+                      )}
+                    >
+                      {loading ? (
+                        <RefreshCw className="h-4 w-4 animate-spin" />
+                      ) : isRunning ? (
+                        <><Square className="h-3.5 w-3.5" /> {t('stopEngine')}</>
+                      ) : (
+                        <><Play className="h-4 w-4" /> {t('startEngine')}</>
+                      )}
+                    </Button>
+                  )}
+                  {runMode.reuse_mode && (
+                    <Badge variant="secondary" className="rounded-full px-3 py-1 text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                      {t('reuse')}
+                    </Badge>
+                  )}
+                </div>
+              </div>
+
+              {/* Info Cards - 2 Column Grid */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 
-                {/* Clash Card */}
-                <div className="bg-card border border-border rounded-xl p-6 shadow-sm">
-                  <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-base font-medium text-foreground">{t('coreEngine')}</h3>
-                    <Globe className="h-4 w-4 text-blue-500" />
+                {/* RDP Card */}
+                <div 
+                  className={cn(
+                    "group relative overflow-hidden rounded-xl border p-5 cursor-pointer transition-all duration-300 backdrop-blur-sm",
+                    "bg-card/60 border-border hover:border-cyan-500/30 hover:shadow-[0_0_20px_-5px_rgba(6,182,212,0.15)]"
+                  )}
+                  onClick={() => setActiveTab('rdp')}
+                >
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-3">
+                      <div className="h-9 w-9 rounded-lg bg-cyan-500/10 flex items-center justify-center">
+                        <Monitor className="h-4 w-4 text-cyan-500" />
+                      </div>
+                      <h3 className="text-sm font-semibold text-foreground">{t('rdp')}</h3>
+                    </div>
+                    <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-cyan-400 transition-colors" />
                   </div>
-                  <div className="text-2xl font-bold text-foreground mb-1">
-                    {runMode.reuse_mode ? t('clashVerge') : (status.clash ? t('running') : t('stopped'))}
-                  </div>
-                  <p className="text-xs text-muted-foreground mb-4">
-                    {runMode.reuse_mode ? `${t('reuseMode')} (port ${runMode.proxy_port})` : t('coreRoutingService')}
-                  </p>
-                  <Badge variant="secondary" className={cn(
-                    "rounded-sm px-2 py-0.5 text-xs font-normal border",
-                    runMode.reuse_mode
-                      ? "bg-green-500/10 text-green-400 border-green-500/20"
-                      : status.clash 
-                        ? "bg-blue-500/10 text-blue-400 border-blue-500/20" 
-                        : "bg-muted text-muted-foreground border-border"
-                  )}>
-                    {runMode.reuse_mode ? t('reuse') : (status.clash ? t('active') : t('inactive'))}
+                  <div className="text-xl font-bold text-foreground mb-1">{t('rdpAcceleration')}</div>
+                  <p className="text-xs text-muted-foreground mb-3">{t('rdpDesc')}</p>
+                  <Badge variant="secondary" className="rounded-full px-2.5 py-0.5 text-xs font-mono font-normal border bg-cyan-500/10 text-cyan-400 border-cyan-500/20">
+                    v{__APP_VERSION__}
                   </Badge>
                 </div>
 
-                {/* MultiDesk Card */}
-                <div className="bg-card border border-border rounded-xl p-6 shadow-sm">
-                  <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-base font-medium text-foreground">{t('nextDesk')}</h3>
-                    <ServerIcon className="h-4 w-4 text-cyan-500" />
+                {/* Network Status Card */}
+                <div className="relative overflow-hidden rounded-xl border border-border p-5 backdrop-blur-sm bg-card/60">
+                  <div className="flex items-center gap-3 mb-3">
+                    <div className="h-9 w-9 rounded-lg bg-violet-500/10 flex items-center justify-center">
+                      <Globe className="h-4 w-4 text-violet-500" />
+                    </div>
+                    <h3 className="text-sm font-semibold text-foreground">{t('networkStatus')}</h3>
                   </div>
-                  <div className="text-2xl font-bold text-foreground mb-1">
-                    {status.multidesk ? t('connected') : t('disconnected')}
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs text-muted-foreground">{t('runningMode')}</span>
+                      <span className="text-sm font-medium text-foreground">
+                        {runMode.reuse_mode ? t('external') : t('builtIn')}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs text-muted-foreground">{t('proxyPort')}</span>
+                      <span className="text-sm font-mono text-foreground">
+                        {runMode.proxy_port}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs text-muted-foreground">RDP Proxy</span>
+                      <span className="text-sm font-mono text-foreground">
+                        :{status.rdp_proxy_port}
+                      </span>
+                    </div>
                   </div>
-                  <p className="text-xs text-muted-foreground mb-4">{t('rdpAcceleration')}</p>
-                  <Badge variant="secondary" className={cn(
-                    "rounded-sm px-2 py-0.5 text-xs font-normal border",
-                    status.multidesk 
-                      ? "bg-cyan-500/10 text-cyan-400 border-cyan-500/20" 
-                      : "bg-muted text-muted-foreground border-border"
-                  )}>
-                    {status.multidesk ? t('active') : t('inactive')}
-                  </Badge>
                 </div>
               </div>
 
-              {/* Power Button - Centered */}
-              <div className="flex justify-center py-4">
-                 <button
-                    onClick={handleToggleEngine}
-                    disabled={loading}
-                    className={cn(
-                      "group relative w-40 h-40 rounded-full flex flex-col items-center justify-center transition-all duration-300 border-4",
-                      isRunning 
-                        ? 'bg-card border-blue-500/50 shadow-[0_0_40px_rgba(59,130,246,0.2)]' 
-                        : 'bg-card border-border hover:border-muted-foreground'
-                    )}
-                  >
-                    <Power className={cn("h-12 w-12 mb-2 transition-colors duration-300", 
-                      isRunning ? 'text-blue-500' : 'text-muted-foreground group-hover:text-foreground'
-                    )} />
-                    <span className={cn("text-sm font-bold tracking-widest transition-colors duration-300", 
-                      isRunning ? 'text-blue-400' : 'text-muted-foreground group-hover:text-foreground'
-                    )}>
-                      {loading ? '...' : isRunning ? t('on') : t('off')}
-                    </span>
-                  </button>
-              </div>
             </div>
           )}
 
@@ -600,10 +710,9 @@ function AppContent() {
 
           {/* Proxy View */}
           {activeTab === 'proxy' && (
-            <div className="max-w-2xl space-y-6 relative">
-              {/* Reuse Mode Overlay */}
-              {runMode.reuse_mode && (
-                <div className="absolute inset-0 z-10 flex items-center justify-center bg-background/80 backdrop-blur-sm rounded-xl">
+            <div className="max-w-2xl space-y-6">
+              {runMode.reuse_mode ? (
+                <div className="bg-card/50 backdrop-blur-md border border-border/50 rounded-xl p-12 flex items-center justify-center">
                   <div className="text-center">
                     <div className="h-16 w-16 rounded-full bg-green-500/10 flex items-center justify-center mx-auto mb-4">
                       <CheckCircle2 className="h-8 w-8 text-green-500" />
@@ -614,7 +723,7 @@ function AppContent() {
                     </p>
                   </div>
                 </div>
-              )}
+              ) : (
               <Card className="bg-card border-border">
                 <CardHeader>
                   <CardTitle className="text-lg text-foreground">{t('subscription')}</CardTitle>
@@ -661,6 +770,7 @@ function AppContent() {
                   </div>
                 </CardContent>
               </Card>
+              )}
             </div>
           )}
 
@@ -741,16 +851,21 @@ function AppContent() {
             </div>
           )}
 
+          {/* RDP View — always mounted, hidden via CSS to preserve sessions */}
+          <div className={cn("flex-1 overflow-hidden", activeTab !== 'rdp' && "hidden")}>
+            <RdpManager onMainSidebarCollapse={() => setSidebarCollapsed(true)} />
+          </div>
+
           {/* Settings View */}
           {activeTab === 'settings' && (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-stretch">
               {/* Appearance & Language Card */}
-              <Card className="bg-card border-border h-fit">
+              <Card className="bg-card border-border flex flex-col">
                 <CardHeader>
                   <CardTitle className="text-lg text-foreground">{t('appearance')}</CardTitle>
                   <CardDescription className="text-muted-foreground">{t('language')}</CardDescription>
                 </CardHeader>
-                <CardContent className="space-y-4">
+                <CardContent className="space-y-4 flex-1">
                   <div className="flex items-center justify-between py-2">
                     <div className="flex items-center gap-3">
                       <div className="h-9 w-9 rounded-lg bg-amber-500/10 flex items-center justify-center">
@@ -779,16 +894,16 @@ function AppContent() {
               </Card>
 
               {/* About Card */}
-              <Card className="bg-card border-border h-fit">
+              <Card className="bg-card border-border flex flex-col">
                 <CardHeader>
                   <CardTitle className="text-lg text-foreground">{t('about')}</CardTitle>
                   <CardDescription className="text-muted-foreground">{t('settingsDesc')}</CardDescription>
                 </CardHeader>
-                <CardContent className="space-y-4">
-                  <div className="bg-muted dark:bg-zinc-950 rounded-lg p-4">
+                <CardContent className="space-y-4 flex-1">
+                  <div className="bg-muted dark:bg-zinc-800/50 rounded-lg p-4">
                     <div className="flex justify-between text-sm mb-2">
                       <span className="text-muted-foreground">{t('currentVersion')}</span>
-                      <span className="text-foreground font-mono">v{currentVersion || '...'}</span>
+                      <span className="text-foreground font-mono">v{__APP_VERSION__}</span>
                     </div>
                     <div className="flex justify-between text-sm">
                       <span className="text-muted-foreground">{t('latestVersion')}</span>
@@ -827,6 +942,50 @@ function AppContent() {
                   )}
                 </CardContent>
               </Card>
+
+              {/* RDP Settings Card */}
+              <Card className="bg-card border-border flex flex-col md:col-span-2">
+                <CardHeader>
+                  <CardTitle className="text-lg text-foreground">{t('rdpSettings')}</CardTitle>
+                  <CardDescription className="text-muted-foreground">{t('rdpSettingsDesc')}</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4 flex-1">
+                  <div className="flex items-center justify-between py-2">
+                    <div className="flex items-center gap-3">
+                      <div className="h-9 w-9 rounded-lg bg-emerald-500/10 flex items-center justify-center">
+                        <Monitor className="h-4 w-4 text-emerald-500" />
+                      </div>
+                      <div>
+                        <div className="text-sm font-medium text-foreground">{t('folderSharing')}</div>
+                        <div className="text-xs text-muted-foreground">{t('folderSharingDesc')}</div>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => {
+                        const key = 'nextdesk_folder_sharing';
+                        const current = (() => { try { return JSON.parse(localStorage.getItem(key) || 'false'); } catch { return false; } })();
+                        const next = !current;
+                        localStorage.setItem(key, JSON.stringify(next));
+                        // Force re-render by dispatching storage event
+                        window.dispatchEvent(new StorageEvent('storage', { key }));
+                        // Also trigger re-render locally
+                        setFolderSharingLocal(next);
+                      }}
+                      className={cn(
+                        "relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                        folderSharingLocal ? "bg-emerald-500" : "bg-zinc-600"
+                      )}
+                    >
+                      <span
+                        className={cn(
+                          "inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform",
+                          folderSharingLocal ? "translate-x-6" : "translate-x-1"
+                        )}
+                      />
+                    </button>
+                  </div>
+                </CardContent>
+              </Card>
             </div>
           )}
 
@@ -858,7 +1017,7 @@ function AppContent() {
             <div className="bg-muted/50 rounded-lg p-4 mb-4">
               <div className="flex justify-between text-sm mb-2">
                 <span className="text-muted-foreground">{t('currentVersion')}</span>
-                <span className="text-foreground font-mono">v{currentVersion}</span>
+                <span className="text-foreground font-mono">v{__APP_VERSION__}</span>
               </div>
               <div className="flex justify-between text-sm">
                 <span className="text-muted-foreground">{t('latestVersion')}</span>
