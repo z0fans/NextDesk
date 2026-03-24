@@ -1,6 +1,6 @@
 {
   "productName": "NextDesk",
-  "version": "1.0.87",
+  "version": "1.0.88",
   "identifier": "cc.yougotme.nextdesk",
   "build": {
     "frontendDist": "../frontend/dist",
@@ -25,7 +25,7 @@
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": true,
-    "targets": ["dmg", "nsis"],
+    "targets": ["app", "dmg", "nsis"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

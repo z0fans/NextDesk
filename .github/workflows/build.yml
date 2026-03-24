@@ -33,11 +33,15 @@ jobs:
       - name: Download mihomo & geodata
         run: bash scripts/download-deps.sh universal-apple-darwin
 
+      - name: Sanitize signing key
+        run: |
+          KEY=$(echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" | tr -d '\n\r')
+          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY" >> "$GITHUB_ENV"
+
       - name: Build & Release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
           args: --target universal-apple-darwin
           tagName: ${{ github.ref_name }}
@@ -70,11 +74,16 @@ jobs:
         shell: bash
         run: bash scripts/download-deps.sh x86_64-pc-windows-msvc
 
+      - name: Sanitize signing key
+        shell: bash
+        run: |
+          KEY=$(echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" | tr -d '\n\r')
+          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY" >> "$GITHUB_ENV"
+
       - name: Build & Release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "NextDesk ${{ github.ref_name }}"
