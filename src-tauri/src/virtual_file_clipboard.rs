@@ -238,6 +238,7 @@ fn write_file_paths_to_windows_clipboard(
             "-Command",
             &script,
         ])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .output()
         .map_err(|e| format!("powershell error: {}", e))?;
 

@@ -545,6 +545,7 @@ fn clipboard_read_file_paths_windows() -> Result<Vec<String>, String> {
 
     let output = Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", ps_script])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .output()
         .map_err(|e| format!("PowerShell error: {}", e))?;
 
