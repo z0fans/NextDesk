@@ -570,27 +570,26 @@ fn get_proxy_port_sync(api_port: u16) -> u16 {
             if let Ok(n) = stream.read(&mut buf) {
                 let body =
                     String::from_utf8_lossy(&buf[..n]);
-                // Find mixed-port in JSON body
-                if let Some(pos) =
-                    body.find("\"mixed-port\"")
-                {
-                    let after = &body[pos..];
-                    // Extract number after ":"
-                    if let Some(colon) =
-                        after.find(':')
-                    {
-                        let num_str: String = after
-                            [colon + 1..]
-                            .chars()
-                            .take_while(|c| {
-                                c.is_ascii_digit()
-                                    || *c == ' '
-                            })
-                            .collect();
-                        if let Ok(p) =
-                            num_str.trim().parse::<u16>()
-                        {
-                            return p;
+                // Try mixed-port first, then socks-port; skip if 0
+                for key in &["\"mixed-port\"", "\"socks-port\""] {
+                    if let Some(pos) = body.find(key) {
+                        let after = &body[pos..];
+                        if let Some(colon) = after.find(':') {
+                            let num_str: String = after
+                                [colon + 1..]
+                                .chars()
+                                .take_while(|c| {
+                                    c.is_ascii_digit()
+                                        || *c == ' '
+                                })
+                                .collect();
+                            if let Ok(p) =
+                                num_str.trim().parse::<u16>()
+                            {
+                                if p > 0 {
+                                    return p;
+                                }
+                            }
                         }
                     }
                 }

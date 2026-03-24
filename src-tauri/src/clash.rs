@@ -58,10 +58,16 @@ pub async fn get_clash_proxy_port(
     let url = format!("http://{host}:{port}/configs");
     if let Ok(resp) = client.get(&url).send().await {
         if let Ok(data) = resp.json::<Value>().await {
+            // mixed-port=0 means disabled; prefer non-zero mixed-port, else socks-port
             if let Some(p) = data
                 .get("mixed-port")
-                .or(data.get("socks-port"))
                 .and_then(|v| v.as_u64())
+                .filter(|&p| p > 0)
+                .or_else(|| {
+                    data.get("socks-port")
+                        .and_then(|v| v.as_u64())
+                        .filter(|&p| p > 0)
+                })
             {
                 return p as u16;
             }
