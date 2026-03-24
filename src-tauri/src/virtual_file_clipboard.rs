@@ -2,6 +2,8 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::time::SystemTime;
 
 #[cfg(target_os = "macos")]

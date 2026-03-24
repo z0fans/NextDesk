@@ -4,6 +4,8 @@ use std::fs;
 use std::fs::File;
 use std::path::Path;
 use std::process::Command;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 use tauri::{AppHandle, State};
