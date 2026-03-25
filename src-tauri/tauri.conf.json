@@ -34,8 +34,6 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../.backend/bin/mihomo": "bin/mihomo",
-      "../.backend/bin/mihomo.exe": "bin/mihomo.exe",
       "../.backend/bin/Country.mmdb": "bin/Country.mmdb",
       "../.backend/bin/geoip.metadb": "bin/geoip.metadb",
       "../.backend/bin/geosite.dat": "bin/geosite.dat"
