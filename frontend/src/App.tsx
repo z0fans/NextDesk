@@ -169,7 +169,11 @@ function AppContent() {
       setUpdateStatus('downloading');
       setDownloadProgress(0);
       const update = await check();
-      if (!update) return;
+      if (!update) {
+        console.warn('Updater check() returned null — version in latest.json may not be newer than current');
+        setUpdateStatus('error');
+        return;
+      }
 
       let downloaded = 0;
       let totalSize = 0;
