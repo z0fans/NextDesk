@@ -405,7 +405,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
   const rdpdrEnabledRef = useRef<Set<string>>(new Set());
   const pasteShortcutInFlightRef = useRef<Set<string>>(new Set());
   const keepCursorVisibleUntilRef = useRef<Map<string, number>>(new Map());
-  const pasteProgressTabsRef = useRef<Set<string>>(new Set());
+
   const fileTransferInProgressRef = useRef<Set<string>>(new Set());
   const clipboardPollInFlightRef = useRef<Set<string>>(new Set());
   // Track file keys received from remote to prevent feedback loop:
@@ -1304,7 +1304,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
   connectSessionRef.current = connectSession;
 
   // ── Auto-reconnect with exponential backoff ──
-  const scheduleReconnect = useCallback((tabId: string, reason: string) => {
+  const scheduleReconnect = useCallback((tabId: string, _reason: string) => {
     const count = (reconnectCountRef.current.get(tabId) || 0) + 1;
     if (count > MAX_RECONNECT_ATTEMPTS) {
       console.log(`[rdp] reconnect: gave up after ${MAX_RECONNECT_ATTEMPTS} attempts for`, tabId);
