@@ -4,6 +4,7 @@ import { RdpConnectDialog, type RdpConfig } from './RdpConnectDialog';
 import { Monitor, X, Maximize2, Minimize2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
+import { useTranslation } from '@/i18n/useTranslation';
 
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'error';
 
@@ -63,6 +64,7 @@ async function loadWasm(): Promise<IronRdpWasm> {
 }
 
 export function RdpViewer() {
+  const { t } = useTranslation();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const sessionRef = useRef<Session | null>(null);
@@ -240,7 +242,7 @@ export function RdpViewer() {
         <div className="flex items-center justify-between px-3 py-1.5 bg-card border-b border-border z-10">
           <div className="flex items-center gap-2">
             <Monitor className="h-4 w-4 text-cyan-500" />
-            <span className="text-xs font-medium">RDP Session</span>
+            <span className="text-xs font-medium">{t('rdpSession')}</span>
             <span className={cn("h-1.5 w-1.5 rounded-full", "bg-emerald-500 animate-pulse")} />
           </div>
           <div className="flex items-center gap-1">
@@ -270,7 +272,7 @@ export function RdpViewer() {
       {connState === 'connecting' && (
         <div className="flex-1 flex flex-col items-center justify-center gap-4">
           <div className="h-12 w-12 rounded-full border-4 border-cyan-500/30 border-t-cyan-500 animate-spin" />
-          <p className="text-sm text-muted-foreground">Connecting to remote desktop...</p>
+          <p className="text-sm text-muted-foreground">{t('rdpConnectRemoteDesktop')}</p>
         </div>
       )}
 

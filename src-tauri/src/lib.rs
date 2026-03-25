@@ -1,5 +1,6 @@
 mod clash;
 mod config;
+mod macos_cursor_fix;
 mod macos_item_provider;
 mod macos_pasteboard_promise;
 mod macos_file_promise;
@@ -700,6 +701,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(app_state)
         .setup(|app| {
+            // macOS: swizzle [NSCursor setHiddenUntilMouseMoves:] to no-op
+            // to prevent cursor from hiding on keyDown in RDP sessions
+            macos_cursor_fix::install_cursor_unhide();
+
             let state = app.state::<AppState>();
             let rdp_port = *state.rdp_proxy_port.lock().unwrap();
             let socks_port = state.proxy_port.clone();
@@ -740,6 +745,9 @@ pub fn run() {
             rdpdr_backend::stage_downloaded_files_for_paste,
             rdpdr_backend::get_session_clipboard_state,
             rdpdr_backend::open_session_clipboard_folder,
+            rdpdr_backend::clipboard_stage_begin,
+            rdpdr_backend::clipboard_stage_chunk,
+            rdpdr_backend::clipboard_stage_commit,
             frontend_log,
         ])
         .run(tauri::generate_context!())

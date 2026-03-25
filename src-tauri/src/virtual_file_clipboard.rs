@@ -137,7 +137,7 @@ fn stage_files(
     Ok(staged_paths)
 }
 
-fn session_stage_root(
+pub fn session_stage_root(
     session_id: Option<&str>,
 ) -> PathBuf {
     let base = dirs::cache_dir()
@@ -159,7 +159,7 @@ fn session_stage_root(
     ))
 }
 
-fn unique_path_in_dir(
+pub fn unique_path_in_dir(
     dir: &Path,
     file_name: &str,
 ) -> PathBuf {
@@ -190,18 +190,29 @@ fn unique_path_in_dir(
 fn write_file_urls_to_macos_pasteboard(
     paths: &[String],
 ) -> Result<(), String> {
+    // IMPORTANT: Do NOT mix writeObjects (modern) with addTypes (legacy).
+    // Mixing them on macOS 26 causes pasteboard state corruption where Finder
+    // reads the PREVIOUS file URL instead of the current one.
+    //
+    // Use ONLY declareTypes + setPropertyList (legacy API) which is atomic,
+    // sets NSFilenamesPboardType, and is recognized by both Finder paste and
+    // AppleScript `the clipboard as list`.
     let script = r#"
         use framework "Foundation"
         use framework "AppKit"
         on run argv
             set pb to current application's NSPasteboard's generalPasteboard()
-            pb's clearContents()
-            set fileURLs to current application's NSMutableArray's alloc()'s init()
+
+            -- Build path array
+            set pathArray to current application's NSMutableArray's alloc()'s init()
             repeat with p in argv
-                set fileURL to current application's NSURL's fileURLWithPath:p
-                (fileURLs's addObject:fileURL)
+                (pathArray's addObject:(current application's NSString's stringWithString:p))
             end repeat
-            pb's writeObjects:fileURLs
+
+            -- Atomic: declareTypes clears and declares in one call
+            pb's declareTypes:{current application's NSFilenamesPboardType} owner:(missing value)
+            pb's setPropertyList:pathArray forType:(current application's NSFilenamesPboardType)
+
             return ""
         end run
     "#;
@@ -216,6 +227,12 @@ fn write_file_urls_to_macos_pasteboard(
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
+
+    log::info!(
+        "[clipboard] Pasteboard updated with {} file path(s): {}",
+        paths.len(),
+        paths.join(", ")
+    );
 
     Ok(())
 }
@@ -249,4 +266,28 @@ fn write_file_paths_to_windows_clipboard(
     }
 
     Ok(())
+}
+
+/// Cross-platform helper: write already-staged file paths to the system clipboard.
+/// Used by the chunked file transfer commit command.
+pub fn write_staged_paths_to_clipboard(
+    paths: &[String],
+) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        write_file_urls_to_macos_pasteboard(paths)?;
+        return Ok("macos-session-file-url".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        write_file_paths_to_windows_clipboard(paths)?;
+        return Ok("windows-set-clipboard-path".to_string());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = paths;
+        Ok("staging-only".to_string())
+    }
 }

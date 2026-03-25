@@ -6,9 +6,11 @@ import { RdpTabBar } from './RdpTabBar';
 import { RdpGridView } from './RdpGridView';
 import { NewConnectionDialog } from './NewConnectionDialog';
 import { useSessionStore } from '@/lib/useSessionStore';
-import { Monitor, X, ChevronDown, FolderOpen } from 'lucide-react';
+import { Monitor } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
+import { useTranslation } from '@/i18n/useTranslation';
+import type { TranslationKey } from '@/i18n/translations';
 import { codeToScancode, macRemapCode } from '@/lib/scancodeMap';
 import { RdpAudioPlayer } from '@/lib/rdp-audio';
 import { H264Decoder } from '@/lib/h264-decoder';
@@ -280,6 +282,7 @@ interface SessionBuilder {
   forceClipboardUpdateCallback(cb: Function): SessionBuilder;
   fileContentsRequestCallback(cb: Function): SessionBuilder;
   fileContentsResponseCallback(cb: Function): SessionBuilder;
+  fileChunkCallback(cb: Function): SessionBuilder;
   connect(): Promise<WasmSession>;
 }
 interface WasmSession {
@@ -295,42 +298,42 @@ interface WasmSession {
 }
 
 /** Map raw RDP/WASM errors to user-friendly messages */
-function friendlyRdpError(raw: string): string {
+function friendlyRdpError(raw: string, t: (key: TranslationKey) => string): string {
   const r = raw.toLowerCase();
   if (r.includes('status_logon_failure') || r.includes('0xc000006d'))
-    return 'Login failed — incorrect username or password.';
+    return t('rdpErrLoginFailed');
   if (r.includes('status_account_disabled') || r.includes('0xc0000072'))
-    return 'Login failed — this account is disabled.';
+    return t('rdpErrAccountDisabled');
   if (r.includes('status_account_locked') || r.includes('0xc0000234'))
-    return 'Login failed — account locked due to too many attempts.';
+    return t('rdpErrAccountLocked');
   if (r.includes('status_password_expired') || r.includes('0xc0000071'))
-    return 'Login failed — password has expired.';
+    return t('rdpErrPasswordExpired');
   if (r.includes('status_account_expired') || r.includes('0xc0000193'))
-    return 'Login failed — account has expired.';
+    return t('rdpErrAccountExpired');
   if (r.includes('status_password_must_change') || r.includes('0xc0000224'))
-    return 'Login failed — password must be changed before first login.';
+    return t('rdpErrPasswordMustChange');
   if (r.includes('credssp'))
-    return 'Authentication failed — check your username and password.';
+    return t('rdpErrCredSsp');
   if (r.includes('tls') || r.includes('ssl') || r.includes('certificate'))
-    return 'TLS/SSL error — could not establish a secure connection.';
+    return t('rdpErrTls');
   if (r.includes('dns') || r.includes('resolve'))
-    return 'Connection failed — hostname could not be resolved.';
+    return t('rdpErrDns');
   if (r.includes('refused') || r.includes('reset'))
-    return 'Connection refused — RDP service may not be running on the target.';
+    return t('rdpErrRefused');
   if (r.includes('timeout') || r.includes('timed out'))
-    return 'Connection timed out — host is unreachable or too slow.';
+    return t('rdpErrTimeout');
   if (r.includes('rdcleanpath'))
-    return 'Connection interrupted — WebSocket channel closed.';
+    return t('rdpErrWsClosed');
   if (r.includes('websocket') || r.includes('ws://'))
-    return 'Connection interrupted — WebSocket channel closed.';
+    return t('rdpErrWsClosed');
   if (r.includes('canvas'))
-    return 'Display error — canvas element not ready. Try again.';
+    return t('rdpErrCanvas');
   if (r.includes('another user connected') || r.includes('forcing the disconnection'))
-    return 'Disconnected — another user logged in to the remote computer.';
+    return t('rdpErrAnotherUser');
   if (r.includes('administratively'))
-    return 'Disconnected — the session was ended by an administrator.';
+    return t('rdpErrAdmin');
   if (r.includes('idle timeout'))
-    return 'Disconnected — session timed out due to inactivity.';
+    return t('rdpErrIdleTimeout');
   // fallback: return the original but truncated
   return raw.length > 200 ? raw.slice(0, 200) + '…' : raw;
 }
@@ -351,6 +354,7 @@ async function loadWasm(): Promise<IronRdpWasm> {
 }
 
 export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: () => void } = {}) {
+  const { t } = useTranslation();
   const store = useSessionStore();
   const [rdpStats, setRdpStats] = useState({ resolution: '', fps: 0, status: 'idle' as string });
   const [hasClipboardFolder, setHasClipboardFolder] = useState(false);
@@ -367,7 +371,6 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
     { label: '1280×720', value: '1280x720' },
   ] as const;
   const [resMode, setResMode] = useState('adaptive');
-  const [showResMenu, setShowResMenu] = useState(false);
   const resModeRef = useRef('adaptive');
   resModeRef.current = resMode;
   const [showNewConn, setShowNewConn] = useState(false);
@@ -405,6 +408,9 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
   const pasteProgressTabsRef = useRef<Set<string>>(new Set());
   const fileTransferInProgressRef = useRef<Set<string>>(new Set());
   const clipboardPollInFlightRef = useRef<Set<string>>(new Set());
+  // Track file keys received from remote to prevent feedback loop:
+  // remote download → write to clipboard → Poll/Focus detects → sends FormatList back
+  const remoteClipboardFileKeyRef = useRef<Map<string, string>>(new Map());
   const prevSidebarOpenRef = useRef(store.sidebarOpen);
   activeTabIdRef.current = store.activeTabId;
 
@@ -542,7 +548,10 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
     if (!server) return;
 
     connectingTabsRef.current.add(tabId);
-    store.updateTabStatus(tabId, 'connecting');
+    // Keep 'reconnecting' UI during auto-reconnect instead of flashing back to 'Connecting to...'
+    if (tab.status !== 'reconnecting') {
+      store.updateTabStatus(tabId, 'connecting');
+    }
     try {
       const wasm = await loadWasm();
 
@@ -585,23 +594,12 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         .renderCanvas(canvas)
         .setCursorStyleCallback(
           (kind: string, data?: string, hx?: number, hy?: number) => {
-            // During paste, block ALL server cursor events to prevent flicker.
-            // Root cause: server sends PointerBitmap with transparent images
-            // that make cursor appear to disappear.
-            if (pasteProgressTabsRef.current.has(tabId)) {
-              canvas.style.cursor = 'progress';
-              return;
-            }
             if (kind === 'url' && data) {
               canvas.style.cursor = `url(${data}) ${hx ?? 0} ${hy ?? 0}, auto`;
             } else if (kind === 'hidden') {
-              const keepVisibleUntil =
-                keepCursorVisibleUntilRef.current.get(tabId) ?? 0;
-              if (Date.now() < keepVisibleUntil) {
-                canvas.style.cursor = 'default';
-              } else {
-                canvas.style.cursor = 'none';
-              }
+              // Intentionally ignore — Windows sends PointerHidden before
+              // switching to a new cursor bitmap. Keeping the old cursor
+              // until the next PointerBitmap arrives prevents flickering.
             } else {
               canvas.style.cursor = 'default';
             }
@@ -632,8 +630,12 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
               cblog('[clipboard] Remote item MIME:', mime);
               if (mime.startsWith('text/') && !textHandled) {
                 const text = item.value() as string;
+                // Remote sent text, not files — clear file key ref
+                remoteClipboardFileKeyRef.current.delete(tabId);
                 tauriWriteClipboard(text).then(() => {
                   cblog('[clipboard] Remote → Local text:', text.slice(0, 50));
+                  // Mark as already-advertised so paste-shortcut won't re-send
+                  advertisedClipboardRef.current.set(tabId, { kind: 'text', text });
                 }).catch(e => cblog('[clipboard] Write text failed:', e));
                 textHandled = true;
               } else if (mime === RDP_FILE_MIME) {
@@ -678,7 +680,23 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
           const sess = sessionRefs.current.get(tabId);
           if (!sess || !wasm) { cblog('[clipboard] forceUpdate: no session/wasm!'); return; }
           if (rdpdrEnabledRef.current.has(tabId)) {
-            cblog('[clipboard] forceUpdate: RDPDR active, skip file clipboard sync and only consider text');
+            cblog('[clipboard] forceUpdate: RDPDR active');
+            // Check cached snapshot first — paste-shortcut may have already prepared file data
+            const rdpdrCachedSnapshot = advertisedClipboardRef.current.get(tabId);
+            if (rdpdrCachedSnapshot) {
+              cblog(
+                '[clipboard] forceUpdate: replay cached snapshot (RDPDR mode)',
+                rdpdrCachedSnapshot.kind === 'files'
+                  ? `${rdpdrCachedSnapshot.files.length} file(s)`
+                  : `"${rdpdrCachedSnapshot.text.slice(0, 60)}"`,
+              );
+              const clipboardData = buildClipboardDataFromSnapshot(wasm, rdpdrCachedSnapshot);
+              void sess.onClipboardPaste(clipboardData)
+                .then(() => cblog('[clipboard] ✅ forceUpdate replayed cached snapshot (RDPDR)'))
+                .catch(e => cblog('[clipboard] forceUpdate replay error (RDPDR):', e));
+              return;
+            }
+            // No cache — fall back to text-only sync (skip file detection when RDPDR handles files)
             void invoke<string[]>('clipboard_read_file_paths')
               .catch(() => [] as string[])
               .then(filePaths => {
@@ -788,36 +806,170 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
           fileTransferInProgressRef.current.add(tabId);
         })
         .fileContentsResponseCallback((filesData: any) => {
-          cblog('[file-transfer] ▶ FileContentsResponse raw:', debugPayload(filesData));
-          const files = normalizeTransferredFiles(filesData);
-          if (files.length === 0) {
-            cblog('[file-transfer] ▶ FileContentsResponse: no data or invalid format');
-            return;
-          }
-          cblog('[file-transfer] ▶ FileContentsResponse received:', files.length, 'file(s)');
-          const payloads = files.map(file => ({
-            name: file.name,
-            data: Array.from(file.data),
-          }));
-          invoke<{ strategy: string; staged_paths: string[] }>('stage_downloaded_files_for_paste', {
-            sessionId: tabId,
-            files: payloads,
-          })
-            .then(result => {
-              cblog('[file-transfer] ✅ Local clipboard strategy:', result.strategy);
-              cblog('[file-transfer] ✅ Prepared local paste paths:', result.staged_paths);
-              setHasClipboardFolder(Boolean(result.staged_paths.length));
-            })
-            .catch((e: any) => {
-              cblog('[file-transfer] ❌ Stage for local paste failed:', e);
-            })
-            .finally(() => {
-              // Unlock after a delay to let CLIPRDR state machine settle
+          try {
+            cblog('[file-transfer] ▶ FileContentsResponse raw:', debugPayload(filesData));
+            const files = normalizeTransferredFiles(filesData);
+            if (files.length === 0) {
+              cblog('[file-transfer] ▶ FileContentsResponse: no data or invalid format');
+              return;
+            }
+            cblog('[file-transfer] ▶ FileContentsResponse received:', files.length, 'file(s)');
+            // Pre-set remote file basename marker BEFORE invoke to close the timing window.
+            const remoteBasenames = files.map(f => f.name.toLowerCase()).sort().join('|');
+            remoteClipboardFileKeyRef.current.set(tabId, remoteBasenames);
+
+            const CHUNK_THRESHOLD = 10 * 1024 * 1024; // 10MB
+            const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB per invoke
+            const totalSize = files.reduce((acc: number, f: any) => acc + (f.data?.length ?? 0), 0);
+
+            const releaseLock = () => {
               setTimeout(() => {
                 fileTransferInProgressRef.current.delete(tabId);
                 cblog('[file-transfer] Transfer lock released for', tabId);
               }, 2000);
+            };
+
+            if (totalSize > CHUNK_THRESHOLD) {
+              // ── Chunked transfer for large files ──
+              cblog(`[file-transfer] Large file detected (${(totalSize / 1024 / 1024).toFixed(1)}MB), using chunked transfer`);
+              (async () => {
+                try {
+                  const stagedPaths: string[] = [];
+                  for (const file of files) {
+                    const path = await invoke<string>('clipboard_stage_begin', {
+                      sessionId: tabId, fileName: file.name,
+                    });
+                    const totalChunks = Math.ceil(file.data.length / CHUNK_SIZE);
+                    for (let i = 0; i < file.data.length; i += CHUNK_SIZE) {
+                      const end = Math.min(i + CHUNK_SIZE, file.data.length);
+                      const chunk = file.data.subarray(i, end);
+                      await invoke('clipboard_stage_chunk', {
+                        path, data: Array.from(chunk),
+                      });
+                      const chunkNum = Math.floor(i / CHUNK_SIZE) + 1;
+                      if (chunkNum % 10 === 0 || chunkNum === totalChunks) {
+                        cblog(`[file-transfer] Chunk ${chunkNum}/${totalChunks} for ${file.name}`);
+                      }
+                    }
+                    stagedPaths.push(path);
+                  }
+                  const result = await invoke<{ strategy: string; staged_paths: string[] }>(
+                    'clipboard_stage_commit', { sessionId: tabId, stagedPaths }
+                  );
+                  cblog('[file-transfer] ✅ Large file staged:', result.strategy, result.staged_paths);
+                  setHasClipboardFolder(true);
+                } catch (e: any) {
+                  cblog('[file-transfer] ❌ Chunked staging failed:', e);
+                } finally {
+                  releaseLock();
+                }
+              })();
+            } else {
+              // ── Small file: existing path ──
+              const payloads = files.map((file: any) => ({
+                name: file.name,
+                data: Array.from(file.data),
+              }));
+              invoke<{ strategy: string; staged_paths: string[] }>('stage_downloaded_files_for_paste', {
+                sessionId: tabId, files: payloads,
+              })
+                .then(result => {
+                  cblog('[file-transfer] ✅ Local clipboard strategy:', result.strategy);
+                  cblog('[file-transfer] ✅ Prepared local paste paths:', result.staged_paths);
+                  setHasClipboardFolder(Boolean(result.staged_paths.length));
+                })
+                .catch((e: any) => {
+                  cblog('[file-transfer] ❌ Stage for local paste failed:', e);
+                })
+                .finally(releaseLock);
+            }
+          } catch (outerErr: any) {
+            cblog('[file-transfer] ❌ FileContentsResponse callback crashed:', outerErr);
+            // Release lock even on crash to avoid permanent clipboard lockout
+            setTimeout(() => {
+              fileTransferInProgressRef.current.delete(tabId);
+            }, 500);
+          }
+        })
+        .fileChunkCallback((chunkInfo: any) => {
+          try {
+            const { file_index, file_name, total_size, offset, data, is_last, is_last_file } = chunkInfo;
+            const chunkData = data instanceof Uint8Array ? data : new Uint8Array(data);
+            // Use a Promise chain per file to guarantee sequential writes
+            // (clipboard_stage_begin is async, but WASM chunks arrive synchronously)
+            const chainKey = `__chain_${tabId}_${file_index}`;
+            const pathKey = `__staged_${tabId}_${file_index}`;
+
+            const prevChain: Promise<void> = (globalThis as any)[chainKey] || Promise.resolve();
+
+            const nextChain = prevChain.then(async () => {
+              if (offset === 0) {
+                // First chunk → begin staging + write first chunk
+                cblog(`[file-transfer] ▶ Chunked download started: ${file_name} (${(total_size / 1024 / 1024).toFixed(1)}MB)`);
+                fileTransferInProgressRef.current.add(tabId);
+                const path = await invoke<string>('clipboard_stage_begin', {
+                  sessionId: tabId, fileName: file_name,
+                });
+                (globalThis as any)[pathKey] = path;
+                await invoke('clipboard_stage_chunk', { path, data: Array.from(chunkData) });
+              } else {
+                // Subsequent chunks → append
+                const path = (globalThis as any)[pathKey];
+                if (path) {
+                  await invoke('clipboard_stage_chunk', { path, data: Array.from(chunkData) });
+                } else {
+                  cblog(`[file-transfer] ⚠ No path for chunk at offset=${offset}, skipping`);
+                }
+              }
+
+              // Log progress
+              const chunkNum = Math.floor(offset / (2 * 1024 * 1024)) + 1;
+              const totalChunks = Math.ceil(total_size / (2 * 1024 * 1024));
+              if (chunkNum % 10 === 0 || is_last) {
+                cblog(`[file-transfer] Chunk ${chunkNum}/${totalChunks} for ${file_name}`);
+              }
+
+              // All files done → commit
+              if (is_last_file && is_last) {
+                cblog('[file-transfer] All chunked downloads complete, committing to clipboard');
+                const stagedPaths: string[] = [];
+                for (let i = 0; i <= file_index; i++) {
+                  const k = `__staged_${tabId}_${i}`;
+                  const ck = `__chain_${tabId}_${i}`;
+                  const p = (globalThis as any)[k];
+                  if (p) {
+                    stagedPaths.push(p);
+                    delete (globalThis as any)[k];
+                  }
+                  delete (globalThis as any)[ck];
+                }
+                if (stagedPaths.length > 0) {
+                  const remoteBasenames = stagedPaths.map(p => {
+                    const parts = p.split('/');
+                    return (parts[parts.length - 1] || '').toLowerCase();
+                  }).sort().join('|');
+                  remoteClipboardFileKeyRef.current.set(tabId, remoteBasenames);
+
+                  const result = await invoke<{ strategy: string; staged_paths: string[] }>(
+                    'clipboard_stage_commit', { sessionId: tabId, stagedPaths }
+                  );
+                  cblog('[file-transfer] ✅ Chunked transfer committed:', result.strategy, result.staged_paths);
+                  setHasClipboardFolder(true);
+                }
+                setTimeout(() => {
+                  fileTransferInProgressRef.current.delete(tabId);
+                  cblog('[file-transfer] Transfer lock released');
+                }, 2000);
+              }
+            }).catch((e: any) => {
+              cblog('[file-transfer] ❌ chunk pipeline error:', e);
             });
+
+            (globalThis as any)[chainKey] = nextChain;
+          } catch (err: any) {
+            cblog('[file-transfer] ❌ fileChunkCallback crashed:', err);
+            fileTransferInProgressRef.current.delete(tabId);
+          }
         });
 
       // Use global counter injected in WASM bindings (__wbg_putImageData)
@@ -1112,7 +1264,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         const lowerReason = reason.toLowerCase();
         if (nonRecoverableReasons.some(kw => lowerReason.includes(kw))) {
           console.log('[rdp] non-recoverable disconnect:', reason);
-          store.updateTabStatus(tabId, 'error', friendlyRdpError(reason));
+          store.updateTabStatus(tabId, 'error', friendlyRdpError(reason, t));
         } else {
           scheduleReconnect(tabId, reason);
         }
@@ -1140,12 +1292,12 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       ];
       const lower = raw.toLowerCase();
       if (nonRecoverable.some(kw => lower.includes(kw))) {
-        store.updateTabStatus(tabId, 'error', friendlyRdpError(raw));
+        store.updateTabStatus(tabId, 'error', friendlyRdpError(raw, t));
       } else if (!userDisconnectedRef.current.has(tabId)) {
         scheduleReconnect(tabId, raw);
       } else {
         userDisconnectedRef.current.delete(tabId);
-        store.updateTabStatus(tabId, 'error', friendlyRdpError(raw));
+        store.updateTabStatus(tabId, 'error', friendlyRdpError(raw, t));
       }
     }
   }, [store, proxyPort, getCanvasSize]);
@@ -1157,14 +1309,14 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
     if (count > MAX_RECONNECT_ATTEMPTS) {
       console.log(`[rdp] reconnect: gave up after ${MAX_RECONNECT_ATTEMPTS} attempts for`, tabId);
       reconnectCountRef.current.delete(tabId);
-      store.updateTabStatus(tabId, 'error', `${friendlyRdpError(reason)}\n(Auto-reconnect failed after ${MAX_RECONNECT_ATTEMPTS} attempts)`);
+      store.updateTabStatus(tabId, 'error', t('rdpReconnectFailed', { max: String(MAX_RECONNECT_ATTEMPTS) }));
       return;
     }
     reconnectCountRef.current.set(tabId, count);
     // Exponential backoff: 1s, 2s, 4s, 8s, 16s
     const delay = Math.min(1000 * Math.pow(2, count - 1), 16000);
     console.log(`[rdp] reconnect #${count}/${MAX_RECONNECT_ATTEMPTS} for ${tabId} in ${delay}ms`);
-    store.updateTabStatus(tabId, 'reconnecting', `Reconnecting (${count}/${MAX_RECONNECT_ATTEMPTS})...\n${friendlyRdpError(reason)}`);
+    store.updateTabStatus(tabId, 'reconnecting', t('rdpReconnectingCount', { count: String(count), max: String(MAX_RECONNECT_ATTEMPTS) }));
 
     const timer = setTimeout(() => {
       reconnectTimerRef.current.delete(tabId);
@@ -1271,7 +1423,6 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
   const applyResolution = useCallback((mode: string) => {
     console.log('[rdp] applyResolution called:', mode);
     setResMode(mode);
-    setShowResMenu(false);
     const tabId = store.activeTabId;
     if (!tabId) return;
 
@@ -1342,30 +1493,42 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         const wm = wasmModule;
         if (!sess || !wm) return;
         pasteShortcutInFlightRef.current.add(tabId);
-        // Show progress cursor (arrow + spinning) during paste preparation,
-        // like Jump Desktop does. Keep it visible for up to 10s (large files).
-        pasteProgressTabsRef.current.add(tabId);
-        keepCursorVisibleUntilRef.current.set(tabId, Date.now() + 10000);
-        const canvas = canvasRefs.current.get(tabId);
-        if (canvas) canvas.style.cursor = 'progress';
 
         try {
           // Always fetch fresh clipboard data to ensure correctness.
           // Pre-cache is used to update advertisedClipboard on focus, but
           // paste must always read the CURRENT clipboard state.
+          // However, per MS-RDPECLIP, FormatList must only be sent on
+          // clipboard CHANGE — sending it redundantly makes the server
+          // discard its own clipboard and breaks RDP-internal copy/paste.
+          const cached = advertisedClipboardRef.current.get(tabId);
           const files = await invoke<{name: string, path: string, size: number, data: number[]}[]>('clipboard_read_files_data')
             .catch(() => [] as {name: string, path: string, size: number, data: number[]}[]);
           cblog('[clipboard] paste-shortcut: read', files.length, 'file(s) from current clipboard');
           if (files.length > 0) {
+            // Check if clipboard was recently populated by a remote download.
+            // Don't compare filenames — there's a race condition where clipboard
+            // may still hold the PREVIOUS file if staging hasn't completed yet.
+            const remoteKey = remoteClipboardFileKeyRef.current.get(tabId);
+            if (remoteKey) {
+              cblog('[clipboard] paste-shortcut: skipping remote-originated file (feedback loop prevention)');
+              return;
+            }
             const payloads: ClipboardFilePayload[] = files.map(f => ({
               name: f.name,
               size: f.size,
               data: new Uint8Array(f.data),
               path: f.path,
             }));
+            const newFileKey = payloads.map(f => f.path || f.name).join('|');
+            // Skip FormatList if clipboard hasn't changed (avoids breaking RDP-internal paste)
+            if (cached && cached.kind === 'files' && cached.fileKey === newFileKey) {
+              cblog('[clipboard] paste-shortcut: files unchanged, skip FormatList');
+              return;
+            }
             const snapshot: AdvertisedClipboardSnapshot = {
               kind: 'files',
-              fileKey: payloads.map(f => f.path || f.name).join('|'),
+              fileKey: newFileKey,
               files: cloneClipboardFilePayloads(payloads),
             };
             const clipboardData = buildClipboardDataFromSnapshot(wm, snapshot);
@@ -1380,7 +1543,13 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
 
           const text = await tauriReadClipboard().catch(() => null);
           if (!text) return;
-
+          // Clipboard now has text, not files — clear remote file ref
+          remoteClipboardFileKeyRef.current.delete(tabId);
+          // Skip FormatList if text unchanged
+          if (cached && cached.kind === 'text' && cached.text === text) {
+            cblog('[clipboard] paste-shortcut: text unchanged, skip FormatList');
+            return;
+          }
           const snapshot: AdvertisedClipboardSnapshot = {
             kind: 'text',
             text,
@@ -1394,15 +1563,6 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
           cblog('[clipboard] ✅ paste-shortcut local text injected before remote paste');
         } finally {
           pasteShortcutInFlightRef.current.delete(tabId);
-          // Keep progress cursor for a short period after injection,
-          // so it stays visible until Windows shows its copy dialog.
-          setTimeout(() => {
-            pasteProgressTabsRef.current.delete(tabId);
-            const c = canvasRefs.current.get(tabId);
-            if (c && c.style.cursor === 'progress') {
-              c.style.cursor = 'default';
-            }
-          }, 3000);
         }
       };
 
@@ -1436,13 +1596,14 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
             suppressedShortcutKeyups.add('MetaLeft');
             suppressedShortcutKeyups.add('MetaRight');
           }
-          if (rdpdrEnabledRef.current.has(tabId)) {
-            void syncLocalClipboardForPasteShortcut()
-              .catch(err => cblog('[clipboard] paste-shortcut injection error:', err))
-              .finally(() => sendCtrlShortcut(0x2F));
-            return;
-          }
-          sendCtrlShortcut(0x2F);
+          // Always sync clipboard before sending Ctrl+V scancode.
+          // This eliminates the race condition where Focus sync hasn't
+          // finished reading the new clipboard yet when user presses paste.
+          // syncLocalClipboardForPasteShortcut has change detection to
+          // avoid redundant FormatList (which would break RDP-internal paste).
+          void syncLocalClipboardForPasteShortcut()
+            .catch(err => cblog('[clipboard] paste-shortcut injection error:', err))
+            .finally(() => sendCtrlShortcut(0x2F));
           return;
         }
 
@@ -1594,6 +1755,22 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
           if (filePaths.length > 0) {
             const fileKey = filePaths.join('|');
             if (fileKey !== lastSyncedFileKey) {
+              // Check if this file key came from a remote download (feedback loop prevention)
+              // remoteClipboardFileKeyRef stores sorted basenames (set before async staging)
+              const remoteKey = remoteClipboardFileKeyRef.current.get(tabId);
+              if (remoteKey) {
+                const detectedBasenames = filePaths.map(p => p.split('/').pop()?.toLowerCase() || '').sort().join('|');
+                if (detectedBasenames === remoteKey) {
+                  cblog('[clipboard] ' + (reason === 'Focus' ? 'Focus' : 'Poll') + ': skipping remote-originated file (feedback loop prevention)');
+                  lastSyncedFileKey = fileKey;
+                  lastSyncedText = null;
+                  return;
+                }
+                // File names don't match remote download — user copied a local file.
+                // Clear the remote ref so paste-shortcut won't block local→RDP injection.
+                remoteClipboardFileKeyRef.current.delete(tabId);
+                cblog('[clipboard] ' + (reason === 'Focus' ? 'Focus' : 'Poll') + ': new local file detected, clearing remote file ref');
+              }
               const files = await invoke<{name: string, path: string, size: number, data: number[]}[]>('clipboard_read_files_data').catch(() => [] as any[]);
               if (!files || files.length === 0) {
                 if (reason === 'Focus') {
@@ -1795,10 +1972,25 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
             tabs={store.tabs}
             activeTabId={store.activeTabId}
             viewMode={store.viewMode}
+            sidebarOpen={store.sidebarOpen}
+            onToggleSidebar={() => store.setSidebarOpen(!store.sidebarOpen)}
             onSelectTab={store.setActiveTabId}
             onCloseTab={handleCloseTab}
             onViewModeChange={store.setViewMode}
             onReorderTabs={store.reorderTabs}
+            onReconnectTab={(tabId) => reconnectWithSize(tabId)}
+            sessionControls={activeTab?.status === 'connected' ? {
+              resMode,
+              resolution: rdpStats.resolution,
+              fps: rdpStats.fps,
+              presets: RESOLUTION_PRESETS,
+              macClipboardStrategy,
+              hasClipboardFolder,
+              onApplyResolution: applyResolution,
+              onToggleClipboardStrategy: toggleMacClipboardStrategy,
+              onOpenClipboardFolder: openClipboardFolder,
+              onDisconnect: () => handleCloseTab(activeTab.id),
+            } : null}
           />
         </div>
 
@@ -1844,45 +2036,49 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
               {activeTab?.status === 'connecting' && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
                   <div className="h-12 w-12 rounded-full border-4 border-cyan-500/30 border-t-cyan-500 animate-spin" />
-                  <p className="text-sm text-muted-foreground">Connecting to {activeTab.name}...</p>
+                  <div className="min-h-[90px] flex flex-col items-center justify-start gap-3">
+                    <p className="text-sm text-muted-foreground">{t('rdpConnectingTo', { name: activeTab.name })}</p>
+                  </div>
                 </div>
               )}
 
               {activeTab?.status === 'error' && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 p-8">
-                  <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/20 text-sm text-destructive max-w-md whitespace-pre-wrap">
+                  <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/20 text-sm text-destructive max-w-md whitespace-pre-wrap text-center">
                     {activeTab.errorMsg}
                   </div>
-                  <Button variant="outline" size="sm" onClick={() => connectSession(activeTab.id)}>Retry</Button>
+                  <Button variant="outline" size="sm" onClick={() => connectSession(activeTab.id)}>{t('rdpRetry')}</Button>
                 </div>
               )}
 
               {activeTab?.status === 'reconnecting' && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
                   <div className="h-12 w-12 rounded-full border-4 border-cyan-500/30 border-t-cyan-500 animate-spin" />
-                  <p className="text-sm text-muted-foreground whitespace-pre-line text-center">{activeTab.errorMsg || 'Reconnecting...'}</p>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={() => {
-                      userDisconnectedRef.current.add(activeTab.id);
-                      const timer = reconnectTimerRef.current.get(activeTab.id);
-                      if (timer) { clearTimeout(timer); reconnectTimerRef.current.delete(activeTab.id); }
-                      reconnectCountRef.current.delete(activeTab.id);
-                      store.updateTabStatus(activeTab.id, 'disconnected');
-                    }}
-                  >Cancel Reconnect</Button>
+                  <div className="min-h-[90px] flex flex-col items-center justify-start gap-3">
+                    <p className="text-sm text-muted-foreground whitespace-pre-line text-center">{activeTab.errorMsg || t('rdpReconnectingMsg')}</p>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        userDisconnectedRef.current.add(activeTab.id);
+                        const timer = reconnectTimerRef.current.get(activeTab.id);
+                        if (timer) { clearTimeout(timer); reconnectTimerRef.current.delete(activeTab.id); }
+                        reconnectCountRef.current.delete(activeTab.id);
+                        store.updateTabStatus(activeTab.id, 'disconnected');
+                      }}
+                    >{t('rdpCancelReconnect')}</Button>
+                  </div>
                 </div>
               )}
 
               {activeTab?.status === 'idle' && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
                   <Monitor className="h-16 w-16 text-slate-700" />
-                  <p className="text-sm text-muted-foreground">Click to connect to {activeTab.name}</p>
+                  <p className="text-sm text-muted-foreground">{t('rdpClickToConnect', { name: activeTab.name })}</p>
                   <Button
                     className="bg-gradient-to-r from-cyan-600 to-blue-600 text-white"
                     onClick={() => connectSession(activeTab.id)}
-                  >Connect</Button>
+                  >{t('rdpConnect')}</Button>
                 </div>
               )}
             </div>
@@ -1890,62 +2086,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
           </div>
         )}
 
-        {/* Bottom status bar — auto-hide overlay */}
-        {activeTab?.status === 'connected' && (
-          <div
-            className="group/bar absolute bottom-0 left-0 right-0 z-20"
-            style={{ height: '52px' }}
-          >
-            {/* Invisible hover trigger zone */}
-            <div className="absolute inset-0" />
-            {/* Actual bar — hidden by default, slides up on hover */}
-            <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between px-3 h-[36px] bg-card/90 backdrop-blur-sm border-t border-border/40 translate-y-full opacity-0 group-hover/bar:translate-y-0 group-hover/bar:opacity-100 transition-all duration-200 ease-out">
-              <div className="flex items-center gap-3">
-                <div className="relative">
-                  <button
-                    className="flex items-center gap-1 text-[10px] text-cyan-400/80 font-mono hover:text-cyan-300 transition-colors cursor-pointer"
-                    onClick={() => setShowResMenu(v => !v)}
-                  >
-                    {resMode === 'adaptive' ? 'Auto' : (rdpStats.resolution || '—')}
-                    <ChevronDown className={cn("h-2.5 w-2.5 transition-transform", showResMenu && "rotate-180")} />
-                  </button>
-                  {showResMenu && (
-                    <>
-                      <div className="fixed inset-0 z-30" onClick={() => setShowResMenu(false)} />
-                      <div className="absolute bottom-full left-0 mb-1 z-40 bg-card/95 backdrop-blur-md border border-border/60 rounded-md shadow-xl py-1 min-w-[130px]">
-                        {RESOLUTION_PRESETS.map(p => (
-                          <button
-                            key={p.value}
-                            className={cn(
-                              "w-full text-left px-3 py-1 text-[11px] font-mono hover:bg-white/5 transition-colors cursor-pointer",
-                              resMode === p.value ? "text-cyan-400" : "text-muted-foreground"
-                            )}
-                            onClick={() => { applyResolution(p.value); setShowResMenu(false); }}
-                          >
-                            {p.label}
-                            {resMode === p.value && <span className="ml-1 text-[9px]">✓</span>}
-                          </button>
-                        ))}
-                      </div>
-                    </>
-                  )}
-                </div>
-                <span className="text-[10px] text-emerald-400/80 font-mono">{rdpStats.fps} fps</span>
-              </div>
-              <div className="flex items-center gap-0.5">
-                <Button variant="ghost" size="sm" className="h-6 px-2 text-[10px] gap-1" onClick={toggleMacClipboardStrategy}>
-                  {macClipboardStrategy === 'session-file-url' ? 'Std' : 'Exp'}
-                </Button>
-                <Button variant="ghost" size="sm" className={cn("h-6 px-2 text-[10px] gap-1", !hasClipboardFolder && "opacity-50")} onClick={openClipboardFolder} disabled={!hasClipboardFolder}>
-                  <FolderOpen className="h-3 w-3" /> Files
-                </Button>
-                <Button variant="ghost" size="sm" className="h-6 w-6 p-0 text-destructive" onClick={() => handleCloseTab(activeTab.id)}>
-                  <X className="h-3 w-3" />
-                </Button>
-              </div>
-            </div>
-          </div>
-        )}
+
       </div>
 
       <NewConnectionDialog
@@ -1960,19 +2101,20 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
 }
 
 function EmptyState({ onNewServer }: { onNewServer: () => void }) {
+  const { t } = useTranslation();
   return (
     <div className="flex-1 flex flex-col items-center justify-center gap-4 text-center p-8">
       <div className="h-20 w-20 rounded-2xl bg-gradient-to-br from-cyan-500/10 to-blue-600/10 flex items-center justify-center">
         <Monitor className="h-10 w-10 text-cyan-500/50" />
       </div>
       <div>
-        <h3 className="text-lg font-semibold mb-1">No Active Sessions</h3>
-        <p className="text-sm text-muted-foreground">Add a server to get started</p>
+        <h3 className="text-lg font-semibold mb-1">{t('rdpNoActiveSessions')}</h3>
+        <p className="text-sm text-muted-foreground">{t('rdpAddServerToStart')}</p>
       </div>
       <Button
         className="bg-gradient-to-r from-cyan-600 to-blue-600 text-white"
         onClick={onNewServer}
-      >New Connection</Button>
+      >{t('rdpNewConnection')}</Button>
     </div>
   );
 }

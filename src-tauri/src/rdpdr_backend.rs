@@ -13,6 +13,9 @@ use tauri::{AppHandle, State};
 use crate::state::{AppState, ClipboardSessionState};
 use crate::virtual_file_clipboard::{
     write_virtual_files_to_local_clipboard,
+    write_staged_paths_to_clipboard,
+    session_stage_root,
+    unique_path_in_dir,
     VirtualClipboardFile,
     VirtualClipboardWriteResult,
 };
@@ -756,4 +759,98 @@ pub fn open_session_clipboard_folder(
         let _ = folder;
         Ok(false)
     }
+}
+
+// ── Chunked file staging for large remote files ──
+// For files > 10MB, JS sends data in 2MB chunks to avoid OOM from Array.from().
+
+/// Create a staging path for a large file. Returns the full path.
+#[tauri::command]
+pub async fn clipboard_stage_begin(
+    session_id: String,
+    file_name: String,
+) -> Result<String, String> {
+    let stage_root = session_stage_root(Some(&session_id));
+    fs::create_dir_all(&stage_root)
+        .map_err(|e| format!("Failed to create staging dir: {}", e))?;
+    let dest = unique_path_in_dir(&stage_root, &file_name);
+    // Create empty file
+    File::create(&dest)
+        .map_err(|e| format!("Failed to create staged file: {}", e))?;
+    log::info!(
+        "[file-transfer] Stage begin: {} ({})",
+        file_name,
+        dest.display()
+    );
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// Append a data chunk to a staged file.
+#[tauri::command]
+pub async fn clipboard_stage_chunk(
+    path: String,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("Failed to open staged file: {}", e))?;
+    f.write_all(&data)
+        .map_err(|e| format!("Failed to write chunk: {}", e))?;
+    Ok(())
+}
+
+/// Finalize staged files: write paths to system clipboard and update session.
+#[tauri::command]
+pub async fn clipboard_stage_commit(
+    app: AppHandle,
+    app_state: State<'_, AppState>,
+    session_id: String,
+    staged_paths: Vec<String>,
+) -> Result<VirtualClipboardWriteResult, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let paths_clone = staged_paths.clone();
+    app.run_on_main_thread(move || {
+        let result = write_staged_paths_to_clipboard(&paths_clone);
+        let _ = tx.send(result);
+    })
+    .map_err(|e| format!("Failed to dispatch: {}", e))?;
+
+    let strategy = rx
+        .recv()
+        .map_err(|e| format!("Channel error: {}", e))??;
+
+    let result = VirtualClipboardWriteResult {
+        strategy: strategy.clone(),
+        staged_paths: staged_paths.clone(),
+    };
+
+    for path in &staged_paths {
+        let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        log::info!(
+            "[file-transfer] Committed staged file via {}: {} ({} bytes)",
+            strategy,
+            path,
+            size
+        );
+    }
+
+    if !session_id.trim().is_empty() {
+        let mut sessions = app_state
+            .clipboard_sessions
+            .lock()
+            .map_err(|_| "Clipboard session lock poisoned".to_string())?;
+        sessions.insert(session_id.clone(), ClipboardSessionState {
+            session_id,
+            strategy: result.strategy.clone(),
+            staged_paths: result.staged_paths.clone(),
+            updated_at_ms: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        });
+    }
+
+    Ok(result)
 }

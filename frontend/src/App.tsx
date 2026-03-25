@@ -67,6 +67,7 @@ function AppContent() {
   const [runMode, setRunMode] = useState<RunMode>({ reuse_mode: false, clash_api: '', proxy_port: 17897 });
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [folderSharingLocal, setFolderSharingLocal] = useState(() => { try { return JSON.parse(localStorage.getItem('nextdesk_folder_sharing') || 'false'); } catch { return false; } });
+  const [showUpToDateToast, setShowUpToDateToast] = useState(false);
 
   useEffect(() => {
     if (proxyGroups.length > 0) {
@@ -144,7 +145,7 @@ function AppContent() {
     }
   };
 
-  const checkForUpdate = async () => {
+  const checkForUpdate = async (manual = false) => {
     try {
       const [version, info] = await Promise.all([
         api.getCurrentVersion(),
@@ -154,6 +155,9 @@ function AppContent() {
       setUpdateInfo(info);
       if (info.has_update) {
         setShowUpdateModal(true);
+      } else if (manual && !info.error) {
+        setShowUpToDateToast(true);
+        setTimeout(() => setShowUpToDateToast(false), 3000);
       }
     } catch (error) {
       console.error('Failed to check for update', error);
@@ -255,7 +259,7 @@ function AppContent() {
   return (
     <div className="h-screen w-full bg-background text-foreground font-sans flex transition-colors duration-300 overflow-hidden">
       <aside className={cn(
-        "hidden md:flex md:flex-col md:fixed md:inset-y-0 md:left-0 border-r border-border bg-sidebar z-50 transition-all duration-300",
+        "hidden md:flex md:flex-col md:fixed md:inset-y-0 md:left-0 border-r border-border bg-sidebar z-50 transition-all duration-300 relative",
         sidebarCollapsed ? "md:w-16" : "md:w-48"
       )}>
         <div className={cn("p-4 flex items-center border-b border-sidebar-border", sidebarCollapsed ? "justify-center" : "gap-3")}>
@@ -392,14 +396,20 @@ function AppContent() {
               <div className={cn("h-2.5 w-2.5 rounded-full transition-colors", isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-muted-foreground/30')} />
             </div>
           )}
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-            className={cn("w-full text-muted-foreground hover:text-foreground", sidebarCollapsed ? "justify-center px-0" : "justify-start gap-2")}
-          >
-            {sidebarCollapsed ? <PanelLeft className="h-4 w-4" /> : <><PanelLeftClose className="h-4 w-4" /></>}
-          </Button>
+
+        </div>
+
+        {/* Edge hover trigger for collapse/expand */}
+        <div
+          className="absolute top-0 right-0 w-3 h-full flex items-center justify-center group/edge cursor-pointer z-10"
+          onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+        >
+          <div className="opacity-0 group-hover/edge:opacity-100 transition-opacity duration-200 bg-sidebar-accent/90 backdrop-blur-sm rounded-l-md py-2 px-0.5 border border-r-0 border-sidebar-border shadow-md">
+            {sidebarCollapsed
+              ? <PanelLeft className="h-3 w-3 text-muted-foreground" />
+              : <PanelLeftClose className="h-3 w-3 text-muted-foreground" />
+            }
+          </div>
         </div>
       </aside>
 
@@ -443,18 +453,16 @@ function AppContent() {
               >
                 <Zap className={cn("h-4 w-4", testingConnectivity && "animate-pulse")} />
               </Button>
-            ) : (
+            ) : activeTab === 'dashboard' ? (
               <Button 
                 variant="outline" 
                 size="icon" 
-                disabled={activeTab === 'dashboard' && loading}
-                onClick={activeTab === 'dashboard' ? async () => {
+                disabled={loading}
+                onClick={async () => {
                   if (runMode.reuse_mode) {
-                    // Already in reuse mode, just refresh
                     fetchData();
                     return;
                   }
-                  // Not in reuse mode: detect and start engine
                   setLoading(true);
                   try {
                     await api.startEngine();
@@ -465,16 +473,13 @@ function AppContent() {
                   } finally {
                     setLoading(false);
                   }
-                } : fetchData} 
+                }}
                 className="rounded-full h-10 w-10 border-input bg-card text-muted-foreground hover:text-foreground hover:bg-accent hover:border-accent"
-                title={activeTab === 'dashboard' 
-                  ? (runMode.reuse_mode ? t('refresh') : t('switchToInternal'))
-                  : t('refresh')
-                }
+                title={runMode.reuse_mode ? t('refresh') : t('switchToInternal')}
               >
-                <RefreshCw className={cn("h-4 w-4", loading && activeTab === 'dashboard' && "animate-spin")} />
+                <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
               </Button>
-            )}
+            ) : null}
           </div>
           )}
 
@@ -720,15 +725,15 @@ function AppContent() {
 
           {/* Proxy View */}
           {activeTab === 'proxy' && (
-            <div className="max-w-2xl space-y-6">
+            <div className="space-y-6">
               {runMode.reuse_mode ? (
-                <div className="bg-card/50 backdrop-blur-md border border-border/50 rounded-xl p-12 flex items-center justify-center">
+                <div className="bg-card/50 backdrop-blur-md border border-border/50 rounded-xl p-16 flex items-center justify-center min-h-[40vh]">
                   <div className="text-center">
-                    <div className="h-16 w-16 rounded-full bg-green-500/10 flex items-center justify-center mx-auto mb-4">
+                    <div className="h-16 w-16 rounded-full bg-green-500/10 flex items-center justify-center mx-auto mb-5">
                       <CheckCircle2 className="h-8 w-8 text-green-500" />
                     </div>
                     <h3 className="text-xl font-semibold text-foreground mb-2">{t('reuseMode')}</h3>
-                    <p className="text-sm text-muted-foreground max-w-xs">
+                    <p className="text-sm text-muted-foreground max-w-sm mx-auto">
                       {t('reuseModeDesc')}
                     </p>
                   </div>
@@ -931,7 +936,7 @@ function AppContent() {
                       if (updateInfo?.has_update) {
                         setShowUpdateModal(true);
                       } else {
-                        checkForUpdate();
+                        checkForUpdate(true);
                       }
                     }}
                     className={cn(
@@ -945,11 +950,7 @@ function AppContent() {
                     {updateInfo?.has_update ? t('downloadUpdate') : t('checkForUpdates')}
                   </Button>
 
-                  {updateInfo && !updateInfo.has_update && !updateInfo.error && (
-                    <div className="text-center text-xs text-muted-foreground">
-                      {t('latestVersionMsg')}
-                    </div>
-                  )}
+
                 </CardContent>
               </Card>
 
@@ -1080,6 +1081,16 @@ function AppContent() {
                 </Button>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Up-to-date toast notification */}
+      {showUpToDateToast && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[100] animate-in slide-in-from-bottom-4 fade-in duration-300">
+          <div className="flex items-center gap-2 px-5 py-3 rounded-xl bg-emerald-500/15 border border-emerald-500/25 backdrop-blur-md shadow-lg shadow-emerald-900/10">
+            <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+            <span className="text-sm font-medium text-emerald-300">{t('latestVersionMsg')}</span>
           </div>
         </div>
       )}

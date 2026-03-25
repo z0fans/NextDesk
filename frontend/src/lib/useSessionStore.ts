@@ -94,6 +94,34 @@ export function useSessionStore() {
     ));
   }, []);
 
+  const moveGroup = useCallback((id: string, direction: 'up' | 'down') => {
+    if (id === 'fav' || id === 'default') return;
+    setGroups(prev => {
+      const idx = prev.findIndex(g => g.id === id);
+      if (idx < 0) return prev;
+      const minIdx = prev.findIndex(g => g.id !== 'fav' && g.id !== 'default');
+      const targetIdx = direction === 'up' ? idx - 1 : idx + 1;
+      if (targetIdx < minIdx || targetIdx >= prev.length) return prev;
+      const next = [...prev];
+      [next[idx], next[targetIdx]] = [next[targetIdx], next[idx]];
+      return next;
+    });
+  }, []);
+
+  const reorderGroup = useCallback((groupId: string, toIndex: number) => {
+    if (groupId === 'fav' || groupId === 'default') return;
+    setGroups(prev => {
+      const fromIndex = prev.findIndex(g => g.id === groupId);
+      if (fromIndex < 0 || fromIndex === toIndex) return prev;
+      const minIdx = prev.findIndex(g => g.id !== 'fav' && g.id !== 'default');
+      if (toIndex < minIdx || toIndex >= prev.length) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      return next;
+    });
+  }, []);
+
   // ── Session Tabs ──
   const openSession = useCallback((server: ServerEntry): string => {
     const existing = tabs.find(t => t.serverId === server.id && t.status !== 'disconnected');
@@ -155,7 +183,7 @@ export function useSessionStore() {
     groups, servers, tabs, activeTabId, activeTab, viewMode, sidebarOpen, folderSharingEnabled,
     setActiveTabId, setViewMode, setSidebarOpen, setFolderSharingEnabled,
     addServer, updateServer, removeServer, toggleFavorite,
-    addGroup, removeGroup, toggleGroupExpand, renameGroup,
+    addGroup, removeGroup, toggleGroupExpand, renameGroup, moveGroup, reorderGroup,
     openSession, closeTab, updateTabStatus, updateTabThumbnail, reorderTabs, getServerById,
   };
 }

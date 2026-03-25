@@ -1,13 +1,14 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import {
   Search, Star, ChevronRight, ChevronDown, Monitor,
-  Plus, FolderPlus, PanelLeftClose, PanelLeftOpen,
-  Pencil, Trash2, MoveRight, X,
+  Plus, FolderPlus, PanelLeftClose,
+  Pencil, Trash2, MoveRight, X, GripVertical, FolderOpen,
 } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import type { SessionStore } from '@/lib/useSessionStore';
+import { useTranslation } from '@/i18n/useTranslation';
 
 interface Props {
   store: SessionStore;
@@ -28,8 +29,9 @@ const STATUS_DOT: Record<string, string> = {
 
 /* ── drag state shared via ref ── */
 interface DragState {
-  serverId: string;
-  serverName: string;
+  type: 'server' | 'group';
+  id: string;
+  name: string;
   startY: number;
   active: boolean;
 }
@@ -38,6 +40,7 @@ export function RdpSidebar({
   store, onConnectServer, onSelectServer, onNewServer,
   onEditServer, onDeleteServer,
 }: Props) {
+  const { t } = useTranslation();
   const [search, setSearch] = useState('');
   const [newGroupName, setNewGroupName] = useState('');
   const [showNewGroup, setShowNewGroup] = useState(false);
@@ -49,6 +52,7 @@ export function RdpSidebar({
   const [groupCtx, setGroupCtx] = useState<{ id: string; x: number; y: number } | null>(null);
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [editingGroupName, setEditingGroupName] = useState('');
+  const [groupDragInsertIdx, setGroupDragInsertIdx] = useState<number | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const groupRefs = useRef<Map<string, HTMLElement>>(new Map());
 
@@ -89,40 +93,66 @@ export function RdpSidebar({
 
   // ── Custom drag handlers ──
   const startDrag = useCallback((serverId: string, serverName: string, y: number) => {
-    dragRef.current = { serverId, serverName, startY: y, active: false };
+    dragRef.current = { type: 'server', id: serverId, name: serverName, startY: y, active: false };
+  }, []);
+
+  const startGroupDrag = useCallback((groupId: string, groupName: string, y: number) => {
+    dragRef.current = { type: 'group', id: groupId, name: groupName, startY: y, active: false };
   }, []);
 
   useEffect(() => {
     const onMouseMove = (e: MouseEvent) => {
       const d = dragRef.current;
       if (!d) return;
-      // Activate after 5px movement
       if (!d.active && Math.abs(e.clientY - d.startY) < 5) return;
       d.active = true;
       setDragging(true);
-      setGhostName(d.serverName);
+      setGhostName(d.name);
       setGhostPos({ x: e.clientX + 12, y: e.clientY - 8 });
 
-      // Hit-test which group we're over
-      let foundGroup: string | null = null;
-      groupRefs.current.forEach((el, gid) => {
-        const rect = el.getBoundingClientRect();
-        if (e.clientY >= rect.top && e.clientY <= rect.bottom &&
-            e.clientX >= rect.left && e.clientX <= rect.right) {
-          foundGroup = gid;
-        }
-      });
-      setHoverGroupId(foundGroup);
+      if (d.type === 'server') {
+        let foundGroup: string | null = null;
+        groupRefs.current.forEach((el, gid) => {
+          const rect = el.getBoundingClientRect();
+          if (e.clientY >= rect.top && e.clientY <= rect.bottom &&
+              e.clientX >= rect.left && e.clientX <= rect.right) {
+            foundGroup = gid;
+          }
+        });
+        setHoverGroupId(foundGroup);
+        setGroupDragInsertIdx(null);
+      } else {
+        // Group drag: find insertion position
+        const movable = groups.filter(g => g.id !== 'fav');
+        let bestIdx = -1;
+        let bestDist = Infinity;
+        movable.forEach((g, i) => {
+          const el = groupRefs.current.get(g.id);
+          if (!el) return;
+          const rect = el.getBoundingClientRect();
+          const mid = rect.top + rect.height / 2;
+          const dist = Math.abs(e.clientY - mid);
+          if (dist < bestDist) { bestDist = dist; bestIdx = e.clientY < mid ? i : i + 1; }
+        });
+        setGroupDragInsertIdx(bestIdx >= 1 ? bestIdx : null);
+        setHoverGroupId(null);
+      }
     };
 
     const onMouseUp = () => {
       const d = dragRef.current;
-      if (d?.active && hoverGroupId) {
-        store.updateServer(d.serverId, { groupId: hoverGroupId });
+      if (d?.active) {
+        if (d.type === 'server' && hoverGroupId) {
+          store.updateServer(d.id, { groupId: hoverGroupId });
+        } else if (d.type === 'group' && groupDragInsertIdx !== null) {
+          const favOffset = groups[0]?.id === 'fav' ? 1 : 0;
+          store.reorderGroup(d.id, groupDragInsertIdx + favOffset);
+        }
       }
       dragRef.current = null;
       setDragging(false);
       setHoverGroupId(null);
+      setGroupDragInsertIdx(null);
     };
 
     window.addEventListener('mousemove', onMouseMove);
@@ -131,7 +161,7 @@ export function RdpSidebar({
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
     };
-  }, [hoverGroupId, store]);
+  }, [hoverGroupId, groupDragInsertIdx, groups, store]);
 
   const setGroupRef = useCallback((id: string, el: HTMLElement | null) => {
     if (el) groupRefs.current.set(id, el);
@@ -139,22 +169,13 @@ export function RdpSidebar({
   }, []);
 
   if (!sidebarOpen) {
-    return (
-      <div className="w-12 flex flex-col items-center py-3 gap-3 bg-card/50 border-r border-border shrink-0">
-        <Button variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={() => setSidebarOpen(true)}>
-          <PanelLeftOpen className="h-4 w-4" />
-        </Button>
-        <Button variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={onNewServer}>
-          <Plus className="h-4 w-4" />
-        </Button>
-      </div>
-    );
+    return null;
   }
 
   return (
     <div className="w-52 flex flex-col bg-card/50 border-r border-border shrink-0 overflow-hidden select-none">
-      <div className="flex items-center justify-between px-3 py-2 border-b border-border">
-        <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Servers</span>
+      <div className="flex items-center justify-between px-3 py-1 border-b border-border">
+        <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">{t('rdpServers')}</span>
         <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setSidebarOpen(false)}>
           <PanelLeftClose className="h-3.5 w-3.5" />
         </Button>
@@ -162,7 +183,7 @@ export function RdpSidebar({
       <div className="px-3 py-2">
         <div className="relative">
           <Search className="absolute left-2.5 top-2 h-3.5 w-3.5 text-muted-foreground" />
-          <Input placeholder="Search servers..." value={search} onChange={e => setSearch(e.target.value)} className="h-8 pl-8 text-xs bg-background/50" />
+          <Input placeholder={t('rdpSearchServers')} value={search} onChange={e => setSearch(e.target.value)} className="h-8 pl-8 text-xs bg-background/50" />
         </div>
       </div>
 
@@ -170,7 +191,7 @@ export function RdpSidebar({
         {favorites.length > 0 && (
           <div className="mb-1">
             <div className="flex items-center gap-1.5 px-2 py-1.5 text-xs text-amber-500/80 font-medium">
-              <Star className="h-3 w-3 fill-amber-500/60" /> Favorites
+              <Star className="h-3 w-3 fill-amber-500/60" /> {t('rdpFavorites')}
             </div>
             {favorites.map(s => (
               <ServerItem key={s.id} server={s} status={getSessionStatus(s.id)} store={store}
@@ -182,16 +203,26 @@ export function RdpSidebar({
           </div>
         )}
 
-        {groups.filter(g => g.id !== 'fav').map(group => {
+        {/* No top insertion indicator — Servers group is always fixed at position 0 */}
+
+        {groups.filter(g => {
+          if (g.id === 'fav') return false;
+          if (g.id === 'default') return true;
+          // Hide custom groups when default is collapsed
+          const def = groups.find(d => d.id === 'default');
+          return def?.isExpanded ?? true;
+        }).map((group, gi) => {
           const groupServers = filteredServers.filter(s => s.groupId === group.id);
           const isOver = hoverGroupId === group.id && dragging;
+          const isDraggedGroup = dragging && dragRef.current?.type === 'group' && dragRef.current?.id === group.id;
           return (
+            <div key={group.id}>
             <div
-              key={group.id}
               ref={el => setGroupRef(group.id, el)}
               className={cn(
                 "mb-1 rounded-md transition-all duration-150",
-                isOver && "bg-cyan-500/15 ring-1 ring-cyan-500/40 scale-[1.02]"
+                isOver && "bg-cyan-500/15 ring-1 ring-cyan-500/40 scale-[1.02]",
+                isDraggedGroup && "opacity-40"
               )}
             >
               {editingGroupId === group.id ? (
@@ -216,27 +247,47 @@ export function RdpSidebar({
                   />
                 </div>
               ) : (
-                <button
-                  className={cn(
-                    "flex items-center gap-1.5 px-2 py-1.5 text-xs font-medium w-full text-left cursor-pointer rounded-md transition-colors",
-                    isOver ? "text-cyan-400" : "text-muted-foreground hover:text-foreground"
+                <div className={cn(
+                  "flex items-center gap-0.5 px-1 py-1.5 text-xs font-medium rounded-md transition-colors group/grp",
+                  isOver ? "text-cyan-400" : "text-muted-foreground hover:text-foreground"
+                )}>
+                  {group.id !== 'fav' && group.id !== 'default' && (
+                    <span
+                      className="cursor-grab active:cursor-grabbing opacity-0 group-hover/grp:opacity-60 hover:!opacity-100 transition-opacity px-0.5"
+                      onMouseDown={e => {
+                        e.stopPropagation();
+                        if (e.button === 0) startGroupDrag(group.id, group.name, e.clientY);
+                      }}
+                    >
+                      <GripVertical className="h-3 w-3" />
+                    </span>
                   )}
-                  onClick={() => store.toggleGroupExpand(group.id)}
-                  onContextMenu={e => {
-                    e.preventDefault();
-                    if (group.id !== 'fav' && group.id !== 'default') {
-                      setGroupCtx({ id: group.id, x: e.clientX, y: e.clientY });
-                    }
-                  }}
-                >
-                  {group.isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-                  {group.name}
-                  <span className="text-[10px] text-muted-foreground/60 ml-auto">({groupServers.length})</span>
-                </button>
+                  <button
+                    className="flex items-center gap-1.5 flex-1 text-left cursor-pointer"
+                    onClick={() => {
+                      if (group.id === 'default' && group.isExpanded) {
+                        // Collapsing default → collapse all groups
+                        groups.filter(g => g.id !== 'fav' && g.isExpanded).forEach(g => store.toggleGroupExpand(g.id));
+                      } else {
+                        store.toggleGroupExpand(group.id);
+                      }
+                    }}
+                    onContextMenu={e => {
+                      e.preventDefault();
+                      if (group.id !== 'fav' && group.id !== 'default') {
+                        setGroupCtx({ id: group.id, x: e.clientX, y: e.clientY });
+                      }
+                    }}
+                  >
+                    {group.isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                    {group.name}
+                    <span className="text-[10px] text-muted-foreground/60 ml-auto">({groupServers.length})</span>
+                  </button>
+                </div>
               )}
               {isOver && groupServers.length === 0 && (
                 <div className="mx-2 mb-1 py-1.5 border border-dashed border-cyan-500/40 rounded text-center text-[10px] text-cyan-500/60">
-                  Drop here
+                  {t('rdpDropHere')}
                 </div>
               )}
               {group.isExpanded && groupServers.map(s => (
@@ -246,6 +297,11 @@ export function RdpSidebar({
                   onDragStart={startDrag} isDragging={dragging}
                 />
               ))}
+            </div>
+            {/* Group drag insertion indicator */}
+            {groupDragInsertIdx === gi + 1 && dragging && dragRef.current?.type === 'group' && (
+              <div className="mx-2 my-0.5 h-0.5 rounded-full bg-cyan-500 shadow-[0_0_6px_rgba(6,182,212,0.5)] transition-all" />
+            )}
             </div>
           );
         })}
@@ -264,24 +320,24 @@ export function RdpSidebar({
                   setEditingGroupName(g?.name ?? '');
                   setGroupCtx(null);
                 }}>
-                <Pencil className="h-3 w-3" /> Rename
+                <Pencil className="h-3 w-3" /> {t('rdpRename')}
               </button>
               <div className="h-px bg-border/50 my-0.5" />
               <button className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer"
                 onClick={() => { store.removeGroup(groupCtx.id); setGroupCtx(null); }}>
-                <Trash2 className="h-3 w-3" /> Delete
+                <Trash2 className="h-3 w-3" /> {t('rdpDelete')}
               </button>
             </div>
           </>
         )}
       </div>
 
-      <div className="px-3 py-2 border-t border-border space-y-1.5">
+      <div className="px-3 py-2 border-t border-border space-y-1.5 mt-auto">
         {showNewGroup ? (
           <div className="space-y-1">
             <div className={cn("flex gap-1", groupNameError && "animate-shake")}>
               <Input
-                placeholder="Group name" value={newGroupName}
+                placeholder={t('rdpGroupName')} value={newGroupName}
                 onChange={e => { setNewGroupName(e.target.value); setGroupNameError(false); }}
                 onKeyDown={e => { if (e.key === 'Enter') handleAddGroup(); else if (e.key === 'Escape') handleCloseNewGroup(); }}
                 className={cn("h-7 text-xs transition-colors", groupNameError && "border-red-500 focus-visible:ring-red-500/30")}
@@ -293,16 +349,16 @@ export function RdpSidebar({
               </Button>
             </div>
             {groupNameError && (
-              <p className="text-[10px] text-red-400 px-1">该名称已存在</p>
+              <p className="text-[10px] text-red-400 px-1">{t('rdpDuplicateName')}</p>
             )}
           </div>
         ) : (
           <div className="flex gap-1.5">
             <Button variant="outline" size="sm" className="h-7 flex-1 text-xs gap-1" onClick={onNewServer}>
-              <Plus className="h-3 w-3" /> Server
+              <Plus className="h-3 w-3" /> {t('rdpServer')}
             </Button>
             <Button variant="outline" size="sm" className="h-7 flex-1 text-xs gap-1" onClick={() => setShowNewGroup(true)}>
-              <FolderPlus className="h-3 w-3" /> Group
+              <FolderPlus className="h-3 w-3" /> {t('rdpGroup')}
             </Button>
           </div>
         )}
@@ -314,7 +370,7 @@ export function RdpSidebar({
           className="fixed z-[100] pointer-events-none bg-card/90 backdrop-blur border border-cyan-500/40 rounded-md px-2.5 py-1 text-xs text-cyan-300 shadow-lg shadow-cyan-500/10 flex items-center gap-1.5"
           style={{ left: ghostPos.x, top: ghostPos.y }}
         >
-          <Monitor className="h-3 w-3" /> {ghostName}
+          {dragRef.current?.type === 'group' ? <FolderOpen className="h-3 w-3" /> : <Monitor className="h-3 w-3" />} {ghostName}
         </div>
       )}
     </div>
@@ -338,6 +394,7 @@ function ServerItem({
   onDragStart: (serverId: string, name: string, y: number) => void;
   isDragging: boolean;
 }) {
+  const { t } = useTranslation();
   const [ctx, setCtx] = useState<{ x: number; y: number } | null>(null);
   const [showMoveMenu, setShowMoveMenu] = useState(false);
   const otherGroups = groups.filter(g => g.id !== 'fav' && g.id !== server.groupId);
@@ -397,13 +454,13 @@ function ServerItem({
             style={{ left: ctx.x, top: ctx.y }}>
             <button className="flex items-center gap-2 w-full px-3 py-1.5 text-xs hover:bg-accent/50 transition-colors cursor-pointer"
               onClick={() => { setCtx(null); onEdit(server.id); }}>
-              <Pencil className="h-3 w-3" /> Edit
+              <Pencil className="h-3 w-3" /> {t('rdpEdit')}
             </button>
             {otherGroups.length > 0 && (
               <div className="relative">
                 <button className="flex items-center gap-2 w-full px-3 py-1.5 text-xs hover:bg-accent/50 transition-colors cursor-pointer"
                   onClick={() => setShowMoveMenu(!showMoveMenu)}>
-                  <MoveRight className="h-3 w-3" /> Move to…
+                  <MoveRight className="h-3 w-3" /> {t('rdpMoveTo')}
                   <ChevronRight className="h-3 w-3 ml-auto" />
                 </button>
                 {showMoveMenu && (
@@ -421,7 +478,7 @@ function ServerItem({
             <div className="h-px bg-border/50 my-0.5" />
             <button className="flex items-center gap-2 w-full px-3 py-1.5 text-xs text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer"
               onClick={() => { setCtx(null); onDelete(server.id); }}>
-              <Trash2 className="h-3 w-3" /> Delete
+              <Trash2 className="h-3 w-3" /> {t('rdpDelete')}
             </button>
           </div>
         </>

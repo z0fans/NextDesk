@@ -757,6 +757,14 @@ export class SessionBuilder {
      * @param {Function} callback
      * @returns {SessionBuilder}
      */
+    fileChunkCallback(callback) {
+        const ret = wasm.sessionbuilder_fileChunkCallback(this.__wbg_ptr, callback);
+        return SessionBuilder.__wrap(ret);
+    }
+    /**
+     * @param {Function} callback
+     * @returns {SessionBuilder}
+     */
     fileContentsRequestCallback(callback) {
         const ret = wasm.sessionbuilder_fileContentsRequestCallback(this.__wbg_ptr, callback);
         return SessionBuilder.__wrap(ret);

@@ -1,6 +1,7 @@
 import { Monitor } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { SessionTab } from '@/lib/rdp-types';
+import { useTranslation } from '@/i18n/useTranslation';
 
 interface Props {
   tabs: SessionTab[];
@@ -8,19 +9,21 @@ interface Props {
   onSelectTab: (id: string) => void;
 }
 
-const STATUS_LABEL: Record<string, { text: string; color: string }> = {
-  connected: { text: 'Connected', color: 'text-emerald-500' },
-  connecting: { text: 'Connecting...', color: 'text-amber-500' },
-  error: { text: 'Error', color: 'text-red-500' },
-  idle: { text: 'Ready', color: 'text-slate-400' },
-  disconnected: { text: 'Disconnected', color: 'text-slate-500' },
-};
-
 export function RdpGridView({ tabs, activeTabId, onSelectTab }: Props) {
+  const { t } = useTranslation();
+
+  const STATUS_LABEL: Record<string, { text: string; color: string }> = {
+    connected: { text: t('rdpStatusConnected'), color: 'text-emerald-500' },
+    connecting: { text: t('rdpStatusConnecting'), color: 'text-amber-500' },
+    error: { text: t('rdpStatusError'), color: 'text-red-500' },
+    idle: { text: t('rdpStatusReady'), color: 'text-slate-400' },
+    disconnected: { text: t('rdpStatusDisconnected'), color: 'text-slate-500' },
+  };
+
   if (tabs.length === 0) {
     return (
       <div className="flex-1 flex items-center justify-center text-muted-foreground text-sm">
-        No active sessions
+        {t('rdpNoActiveSessions2')}
       </div>
     );
   }

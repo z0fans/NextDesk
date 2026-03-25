@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Monitor, Loader2 } from 'lucide-react';
+import { useTranslation } from '@/i18n/useTranslation';
 
 interface RdpConnectDialogProps {
   onConnect: (config: RdpConfig) => void;
@@ -17,6 +18,7 @@ export interface RdpConfig {
 }
 
 export function RdpConnectDialog({ onConnect, connecting }: RdpConnectDialogProps) {
+  const { t } = useTranslation();
   const [host, setHost] = useState('');
   const [port, setPort] = useState('3389');
   const [username, setUsername] = useState('');
@@ -42,14 +44,14 @@ export function RdpConnectDialog({ onConnect, connecting }: RdpConnectDialogProp
           <Monitor className="h-5 w-5 text-white" />
         </div>
         <div>
-          <h3 className="text-lg font-semibold">RDP Connection</h3>
-          <p className="text-xs text-muted-foreground">Connect to remote desktop</p>
+          <h3 className="text-lg font-semibold">{t('rdpConnectionTitle')}</h3>
+          <p className="text-xs text-muted-foreground">{t('rdpConnectToRemote')}</p>
         </div>
       </div>
 
       <div className="grid grid-cols-3 gap-3">
         <div className="col-span-2">
-          <label className="text-xs font-medium text-muted-foreground mb-1 block">Host</label>
+          <label className="text-xs font-medium text-muted-foreground mb-1 block">{t('rdpHost')}</label>
           <Input
             placeholder="192.168.1.100"
             value={host}
@@ -58,7 +60,7 @@ export function RdpConnectDialog({ onConnect, connecting }: RdpConnectDialogProp
           />
         </div>
         <div>
-          <label className="text-xs font-medium text-muted-foreground mb-1 block">Port</label>
+          <label className="text-xs font-medium text-muted-foreground mb-1 block">{t('rdpPort')}</label>
           <Input
             placeholder="3389"
             value={port}
@@ -69,7 +71,7 @@ export function RdpConnectDialog({ onConnect, connecting }: RdpConnectDialogProp
       </div>
 
       <div>
-        <label className="text-xs font-medium text-muted-foreground mb-1 block">Username</label>
+        <label className="text-xs font-medium text-muted-foreground mb-1 block">{t('rdpUsername')}</label>
         <Input
           placeholder="Administrator"
           value={username}
@@ -79,7 +81,7 @@ export function RdpConnectDialog({ onConnect, connecting }: RdpConnectDialogProp
       </div>
 
       <div>
-        <label className="text-xs font-medium text-muted-foreground mb-1 block">Password</label>
+        <label className="text-xs font-medium text-muted-foreground mb-1 block">{t('rdpPassword')}</label>
         <Input
           placeholder="••••••••"
           type="password"
@@ -89,7 +91,7 @@ export function RdpConnectDialog({ onConnect, connecting }: RdpConnectDialogProp
       </div>
 
       <div>
-        <label className="text-xs font-medium text-muted-foreground mb-1 block">Domain (optional)</label>
+        <label className="text-xs font-medium text-muted-foreground mb-1 block">{t('rdpDomainOptional')}</label>
         <Input
           placeholder="WORKGROUP"
           value={domain}
@@ -103,9 +105,9 @@ export function RdpConnectDialog({ onConnect, connecting }: RdpConnectDialogProp
         className="w-full bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white"
       >
         {connecting ? (
-          <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> Connecting...</>
+          <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> {t('rdpConnecting')}</>
         ) : (
-          <><Monitor className="h-4 w-4 mr-2" /> Connect</>
+          <><Monitor className="h-4 w-4 mr-2" /> {t('rdpConnect')}</>
         )}
       </Button>
     </form>
