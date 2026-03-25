@@ -516,7 +516,7 @@ fn frontend_log(msg: String) -> Result<(), String> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .create(true).append(true)
-        .open("/tmp/nextdesk_clipboard.log")
+        .open(std::env::temp_dir().join("nextdesk_clipboard.log"))
         .map_err(|e| e.to_string())?;
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

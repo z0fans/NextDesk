@@ -1,6 +1,6 @@
 {
   "productName": "NextDesk",
-  "version": "1.0.92",
+  "version": "1.0.93",
   "identifier": "cc.yougotme.nextdesk",
   "build": {
     "frontendDist": "../frontend/dist",
@@ -34,6 +34,8 @@
       "icons/icon.ico"
     ],
     "resources": {
+      "../.backend/bin/mihomo": "bin/mihomo",
+      "../.backend/bin/mihomo.exe": "bin/mihomo.exe",
       "../.backend/bin/Country.mmdb": "bin/Country.mmdb",
       "../.backend/bin/geoip.metadb": "bin/geoip.metadb",
       "../.backend/bin/geosite.dat": "bin/geosite.dat"
