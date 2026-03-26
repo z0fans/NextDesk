@@ -1684,6 +1684,22 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         sendInput(wasmModule.DeviceEvent.wheelRotations(vertical, amount, unit));
       };
 
+      // ── Release all keys/buttons when focus is lost ──
+      // Without this, modifier keys (Ctrl, Shift) get "stuck" in pressed
+      // state on the RDP server when the user switches away (Cmd+Tab,
+      // clicks outside canvas, etc.), because the browser never fires
+      // keyUp events for keys held when focus leaves.
+      const releaseAllKeys = () => {
+        const session = sessionRefs.current.get(tabId);
+        if (session) {
+          try { session.releaseAllInputs(); } catch { /* ignore */ }
+        }
+        pressedButtons.clear();
+        suppressedShortcutKeyups.clear();
+      };
+      const onCanvasBlur = () => releaseAllKeys();
+      const onWindowBlur = () => releaseAllKeys();
+
       canvas.addEventListener('keydown', onKeyDown);
       canvas.addEventListener('keyup', onKeyUp);
       canvas.addEventListener('mousemove', onMouseMove);
@@ -1691,6 +1707,8 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       window.addEventListener('mouseup', onMouseUp);
       canvas.addEventListener('contextmenu', onCtxMenu);
       canvas.addEventListener('wheel', onWheel, { passive: false });
+      canvas.addEventListener('blur', onCanvasBlur);
+      window.addEventListener('blur', onWindowBlur);
       canvas.focus();
 
       // ── Clipboard sync (MS-RDPECLIP compliant) ──
@@ -1844,6 +1862,8 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         window.removeEventListener('mouseup', onMouseUp);
         canvas.removeEventListener('contextmenu', onCtxMenu);
         canvas.removeEventListener('wheel', onWheel);
+        canvas.removeEventListener('blur', onCanvasBlur);
+        window.removeEventListener('blur', onWindowBlur);
         canvas.removeEventListener('focus', onFocusSync);
         window.removeEventListener('focus', onFocusSync);
         if (clipboardPollTimer) clearInterval(clipboardPollTimer);
