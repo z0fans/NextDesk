@@ -77,24 +77,24 @@ fi
 
 case "$TARGET" in
   aarch64-apple-darwin)
-    download_mihomo "darwin-arm64" "$BIN_DIR/mihomo"
+    download_mihomo "darwin-arm64" "$BIN_DIR/nextdesk-core"
     ;;
   x86_64-apple-darwin)
-    download_mihomo "darwin-amd64" "$BIN_DIR/mihomo"
+    download_mihomo "darwin-amd64" "$BIN_DIR/nextdesk-core"
     ;;
   universal-apple-darwin)
     # Download both and create universal binary via lipo
-    download_mihomo "darwin-arm64" "$BIN_DIR/mihomo-arm64"
-    download_mihomo "darwin-amd64" "$BIN_DIR/mihomo-amd64"
+    download_mihomo "darwin-arm64" "$BIN_DIR/nextdesk-core-arm64"
+    download_mihomo "darwin-amd64" "$BIN_DIR/nextdesk-core-amd64"
     echo "Creating Universal Binary with lipo..."
-    lipo -create "$BIN_DIR/mihomo-arm64" "$BIN_DIR/mihomo-amd64" \
-         -output "$BIN_DIR/mihomo"
-    chmod +x "$BIN_DIR/mihomo"
-    rm -f "$BIN_DIR/mihomo-arm64" "$BIN_DIR/mihomo-amd64"
-    echo "  -> Universal Binary saved to $BIN_DIR/mihomo"
+    lipo -create "$BIN_DIR/nextdesk-core-arm64" "$BIN_DIR/nextdesk-core-amd64" \
+         -output "$BIN_DIR/nextdesk-core"
+    chmod +x "$BIN_DIR/nextdesk-core"
+    rm -f "$BIN_DIR/nextdesk-core-arm64" "$BIN_DIR/nextdesk-core-amd64"
+    echo "  -> Universal Binary saved to $BIN_DIR/nextdesk-core"
     ;;
   x86_64-pc-windows-msvc)
-    download_mihomo "windows-amd64" "$BIN_DIR/mihomo.exe"
+    download_mihomo "windows-amd64" "$BIN_DIR/nextdesk-core.exe"
     ;;
   *)
     echo "ERROR: Unsupported target: $TARGET" >&2

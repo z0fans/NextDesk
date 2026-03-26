@@ -1,6 +1,6 @@
 {
   "productName": "NextDesk",
-  "version": "1.0.93",
+  "version": "1.0.94",
   "identifier": "cc.yougotme.nextdesk",
   "build": {
     "frontendDist": "../frontend/dist",
@@ -34,6 +34,8 @@
       "icons/icon.ico"
     ],
     "resources": {
+      "../.backend/bin/nextdesk-core": "bin/nextdesk-core",
+      "../.backend/bin/nextdesk-core.exe": "bin/nextdesk-core.exe",
       "../.backend/bin/Country.mmdb": "bin/Country.mmdb",
       "../.backend/bin/geoip.metadb": "bin/geoip.metadb",
       "../.backend/bin/geosite.dat": "bin/geosite.dat"
@@ -46,7 +48,8 @@
         "languages": ["SimpChinese", "English"],
         "displayLanguageSelector": true,
         "installerIcon": "icons/icon.ico",
-        "installMode": "both"
+        "installMode": "both",
+        "installerHooks": "nsis/hooks.nsi"
       }
     }
   },

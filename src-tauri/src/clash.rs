@@ -94,14 +94,14 @@ pub async fn start_clash_process()
     let bin_dir = get_bin_dir();
     eprintln!("[clash] bin_dir: {}", bin_dir.display());
     let binary_name = if cfg!(target_os = "windows") {
-        "mihomo.exe"
+        "nextdesk-core.exe"
     } else {
-        "mihomo"
+        "nextdesk-core"
     };
     let mihomo_path = bin_dir.join(binary_name);
     if !mihomo_path.exists() {
         return Err(format!(
-            "mihomo binary not found: {}",
+            "Engine binary not found: {}",
             mihomo_path.display()
         ));
     }
@@ -140,13 +140,23 @@ pub async fn start_clash_process()
         .try_clone()
         .map_err(|e| format!("Clone failed: {e}"))?;
 
-    let child = Command::new(&mihomo_path)
-        .arg("-f")
+    let mut cmd = Command::new(&mihomo_path);
+    cmd.arg("-f")
         .arg(&config_path)
         .current_dir(&config_dir)
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+
+    // Hide the console window on Windows
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let child = cmd
         .spawn()
         .map_err(|e| format!("Spawn failed: {e}"))?;
 
