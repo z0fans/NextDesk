@@ -53,7 +53,7 @@ pub async fn load_subscription(
 
     let resp = client
         .get(url.trim())
-        .header("User-Agent", "clash-verge/v1.7.7")
+        .header("User-Agent", concat!("NextDesk/", env!("CARGO_PKG_VERSION"), " (rdp-accelerator)"))
         .send()
         .await
         .map_err(|e| {
