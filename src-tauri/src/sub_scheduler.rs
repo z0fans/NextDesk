@@ -78,6 +78,27 @@ async fn run_sync(app: &AppHandle, state: &AppState, allow_retry: bool) {
                 .collect();
             *state.proxy_groups.lock().unwrap() = groups;
 
+            // If no proxy groups from subscription (URI list format),
+            // generate default Server-RDP and Auto-RDP groups
+            if state.proxy_groups.lock().unwrap().is_empty() && !servers.is_empty() {
+                let server_names: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+                let default_groups = vec![
+                    ProxyGroup {
+                        name: "Server-RDP".to_string(),
+                        group_type: "select".to_string(),
+                        proxies: server_names.clone(),
+                        now: None,
+                    },
+                    ProxyGroup {
+                        name: "Auto-RDP".to_string(),
+                        group_type: "fallback".to_string(),
+                        proxies: server_names,
+                        now: None,
+                    },
+                ];
+                *state.proxy_groups.lock().unwrap() = default_groups;
+            }
+
             if let Some(raw) = &parsed.raw_config {
                 config::generate_clash_config_from_subscription(raw);
             } else {

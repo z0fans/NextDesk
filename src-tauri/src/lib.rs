@@ -302,6 +302,34 @@ async fn load_subscription(
                 })
                 .collect();
 
+            // If no proxy groups from subscription (URI list format),
+            // generate default Server-RDP and Auto-RDP groups
+            let groups: Vec<ProxyGroup> = if groups.is_empty() && server_count > 0 {
+                let server_names: Vec<String> = app_state
+                    .servers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect();
+                vec![
+                    ProxyGroup {
+                        name: "Server-RDP".to_string(),
+                        group_type: "select".to_string(),
+                        proxies: server_names.clone(),
+                        now: None,
+                    },
+                    ProxyGroup {
+                        name: "Auto-RDP".to_string(),
+                        group_type: "fallback".to_string(),
+                        proxies: server_names,
+                        now: None,
+                    },
+                ]
+            } else {
+                groups
+            };
+
             *app_state
                 .proxy_groups
                 .lock()
