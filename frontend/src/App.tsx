@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { 
   LayoutDashboard, 
   Server as ServerIcon, 
@@ -18,17 +19,21 @@ import {
   PanelLeft,
   Monitor,
   Play,
-  Square
+  Square,
+  Cloud,
+  AlertTriangle
 } from 'lucide-react';
-import { api, type EngineStatus, type Server, type UpdateInfo, type ProxyGroup, type Connection, type RunMode } from './api';
+import { api, type EngineStatus, type Server, type UpdateInfo, type ProxyGroup, type Connection, type RunMode, type RelayEndpoint, type AutoUpdateStatus } from './api';
 import { check } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Logo } from '@/components/Logo';
 import { Input } from '@/components/ui/input';
+import { Switch } from '@/components/ui/switch';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
+import { getTimeAgo } from './lib/timeAgo';
 import { ThemeToggle } from '@/components/ThemeToggle';
 import { LanguageProvider } from '@/i18n/LanguageProvider';
 import { useTranslation } from '@/i18n/useTranslation';
@@ -64,10 +69,20 @@ function AppContent() {
   const [testingConnectivity, setTestingConnectivity] = useState(false);
   const [nodeDelays, setNodeDelays] = useState<Record<string, number>>({});
   const [connections, setConnections] = useState<Connection[]>([]);
-  const [runMode, setRunMode] = useState<RunMode>({ reuse_mode: false, clash_api: '', proxy_port: 17897 });
+  const [runMode, setRunMode] = useState<RunMode>({ reuse_mode: false, clash_api: '', proxy_port: 17897, cloud_mode: false, dashboard_url: '' });
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [folderSharingLocal, setFolderSharingLocal] = useState(() => { try { return JSON.parse(localStorage.getItem('nextdesk_folder_sharing') || 'false'); } catch { return false; } });
   const [showUpToDateToast, setShowUpToDateToast] = useState(false);
+  const [cloudEnabled, setCloudEnabled] = useState(false);
+  const [dashboardUrl, setDashboardUrl] = useState('');
+  const [relayApiKey, setRelayApiKey] = useState('');
+  const [relayEndpoints, setRelayEndpoints] = useState<RelayEndpoint[]>([]);
+  const [cloudSaving, setCloudSaving] = useState(false);
+  const [autoUpdateStatus, setAutoUpdateStatus] = useState<AutoUpdateStatus>({
+    enabled: true,
+    last_sync_ts: 0,
+    sync_state: { type: 'Idle' },
+  });
 
   useEffect(() => {
     if (proxyGroups.length > 0) {
@@ -84,6 +99,17 @@ function AppContent() {
       });
     }
   }, [proxyGroups]);
+
+  // Fetch auto-update status on mount + listen for changes
+  useEffect(() => {
+    api.getAutoUpdateStatus().then(setAutoUpdateStatus).catch(console.error);
+
+    const unlisten = listen<AutoUpdateStatus>('subscription_sync_state', (event) => {
+      setAutoUpdateStatus(event.payload);
+    });
+
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
 
   const toggleGroupExpansion = (groupName: string) => {
     setExpandedGroups(prev => {
@@ -140,6 +166,18 @@ function AppContent() {
       setServers(newServers);
       setProxyGroups(newProxyGroups);
       setRunMode(newRunMode);
+      // Sync cloud mode state from backend
+      if (newRunMode.cloud_mode !== undefined) {
+        setCloudEnabled(newRunMode.cloud_mode);
+        setDashboardUrl(newRunMode.dashboard_url || '');
+      }
+      // Load relay endpoints if cloud mode is on
+      if (newRunMode.cloud_mode) {
+        try {
+          const eps = await api.getRelayEndpoints();
+          setRelayEndpoints(eps);
+        } catch { /* ignore */ }
+      }
     } catch (error) {
       console.error('Failed to fetch data', error);
     }
@@ -255,6 +293,23 @@ function AppContent() {
     } finally {
       setUpdatingSub(false);
       setTimeout(() => setSubMessage(null), 5000);
+    }
+  };
+
+  const handleAutoUpdateToggle = async (enabled: boolean) => {
+    try {
+      await api.setAutoUpdateEnabled(enabled);
+      setAutoUpdateStatus(prev => ({ ...prev, enabled }));
+    } catch (e) {
+      console.error('Failed to toggle auto-update:', e);
+    }
+  };
+
+  const handleRetrySync = async () => {
+    try {
+      await api.triggerSyncNow();
+    } catch (e) {
+      console.error('Failed to trigger sync:', e);
     }
   };
 
@@ -463,10 +518,6 @@ function AppContent() {
                 size="icon" 
                 disabled={loading}
                 onClick={async () => {
-                  if (runMode.reuse_mode) {
-                    fetchData();
-                    return;
-                  }
                   setLoading(true);
                   try {
                     await api.startEngine();
@@ -479,7 +530,7 @@ function AppContent() {
                   }
                 }}
                 className="rounded-full h-10 w-10 border-input bg-card text-muted-foreground hover:text-foreground hover:bg-accent hover:border-accent"
-                title={runMode.reuse_mode ? t('refresh') : t('switchToInternal')}
+                title={t('refresh')}
               >
                 <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
               </Button>
@@ -526,39 +577,29 @@ function AppContent() {
                         {t('coreEngine')}
                       </h3>
                       <p className="text-sm text-muted-foreground">
-                        {runMode.reuse_mode 
-                          ? `Clash · ${t('reuseMode')}`
-                          : isRunning ? t('running') : t('stopped')
-                        }
+                        {isRunning ? t('running') : t('stopped')}
                       </p>
                     </div>
                   </div>
                   {/* Start / Stop Button */}
-                  {!runMode.reuse_mode && (
-                    <Button
-                      onClick={handleToggleEngine}
-                      disabled={loading}
-                      className={cn(
-                        "h-10 px-6 rounded-full font-medium transition-all duration-300 gap-2",
-                        isRunning
-                          ? "bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20"
-                          : "bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 text-white shadow-lg shadow-blue-500/20"
-                      )}
-                    >
-                      {loading ? (
-                        <RefreshCw className="h-4 w-4 animate-spin" />
-                      ) : isRunning ? (
-                        <><Square className="h-3.5 w-3.5" /> {t('stopEngine')}</>
-                      ) : (
-                        <><Play className="h-4 w-4" /> {t('startEngine')}</>
-                      )}
-                    </Button>
-                  )}
-                  {runMode.reuse_mode && (
-                    <Badge variant="secondary" className="rounded-full px-3 py-1 text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                      {t('reuse')}
-                    </Badge>
-                  )}
+                  <Button
+                    onClick={handleToggleEngine}
+                    disabled={loading}
+                    className={cn(
+                      "h-10 px-6 rounded-full font-medium transition-all duration-300 gap-2",
+                      isRunning
+                        ? "bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/20"
+                        : "bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 text-white shadow-lg shadow-blue-500/20"
+                    )}
+                  >
+                    {loading ? (
+                      <RefreshCw className="h-4 w-4 animate-spin" />
+                    ) : isRunning ? (
+                      <><Square className="h-3.5 w-3.5" /> {t('stopEngine')}</>
+                    ) : (
+                      <><Play className="h-4 w-4" /> {t('startEngine')}</>
+                    )}
+                  </Button>
                 </div>
               </div>
 
@@ -601,31 +642,116 @@ function AppContent() {
                     <div className="flex items-center justify-between">
                       <span className="text-xs text-muted-foreground">{t('runningMode')}</span>
                       <span className="text-sm font-medium text-foreground">
-                        {runMode.reuse_mode ? t('external') : t('builtIn')}
+                        {t('builtIn')}
                       </span>
                     </div>
                     <div className="flex items-center justify-between">
-                      <span className="text-xs text-muted-foreground">{t('proxyPort')}</span>
-                      <span className="text-sm font-mono text-foreground">
-                        {runMode.proxy_port}
+                      <span className="text-xs text-muted-foreground">{t('accelerationChannel')}</span>
+                      <span className="relative group text-sm font-medium text-foreground flex items-center gap-1.5 cursor-default">
+                        <span className={`h-2 w-2 rounded-full ${status.clash ? 'bg-green-500' : 'bg-muted-foreground/40'}`}></span>
+                        {status.clash ? t('ready') : t('notReady')}
+                        <span className="absolute bottom-full right-0 mb-2 px-2.5 py-1 rounded-md bg-popover border border-border text-xs font-mono text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap shadow-lg">
+                          {t('port')} {runMode.proxy_port}
+                        </span>
                       </span>
                     </div>
                     <div className="flex items-center justify-between">
-                      <span className="text-xs text-muted-foreground">RDP Proxy</span>
-                      <span className="text-sm font-mono text-foreground">
-                        :{status.rdp_proxy_port}
+                      <span className="text-xs text-muted-foreground">{t('connectionRelay')}</span>
+                      <span className="relative group text-sm font-medium text-foreground flex items-center gap-1.5 cursor-default">
+                        <span className={`h-2 w-2 rounded-full ${status.clash ? 'bg-blue-500' : 'bg-muted-foreground/40'}`}></span>
+                        {status.clash ? t('normal') : t('closed')}
+                        <span className="absolute bottom-full right-0 mb-2 px-2.5 py-1 rounded-md bg-popover border border-border text-xs font-mono text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none whitespace-nowrap shadow-lg">
+                          {t('port')} {status.rdp_proxy_port}
+                        </span>
                       </span>
                     </div>
                   </div>
                 </div>
               </div>
 
+              {/* Cloud Relay Endpoints */}
+              {cloudEnabled && (
+                <div className="relative overflow-hidden rounded-xl border border-violet-500/20 p-5 backdrop-blur-sm bg-card/60">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-3">
+                      <div className="h-9 w-9 rounded-lg bg-violet-500/10 flex items-center justify-center">
+                        <Cloud className="h-4 w-4 text-violet-500" />
+                      </div>
+                      <div>
+                        <h3 className="text-sm font-semibold text-foreground">{t('cloudRelay')}</h3>
+                        <p className="text-xs text-muted-foreground">{t('cloudRelayDesc')}</p>
+                      </div>
+                    </div>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 w-7 p-0"
+                      onClick={async () => {
+                        try {
+                          const eps = await api.refreshRelayEndpoints();
+                          setRelayEndpoints(eps);
+                        } catch (e) { console.error(e); }
+                      }}
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                  {relayEndpoints.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">{t('noEndpoints')}</p>
+                  ) : (
+                    <div className="space-y-1.5">
+                      {relayEndpoints.map((ep) => (
+                        <div key={ep.id} className="flex items-center justify-between py-1.5 px-2 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
+                          <div className="flex items-center gap-2">
+                            <div className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                            <span className="text-xs font-medium text-foreground">{ep.name}</span>
+                          </div>
+                          <span className="text-xs font-mono text-muted-foreground">
+                            {ep.host}:{ep.port}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <p className="text-[10px] text-muted-foreground mt-2">{t('autoCreateInfo')}</p>
+                </div>
+              )}
+
             </div>
           )}
 
           {/* Servers View */}
-          {activeTab === 'servers' && (
-            <div className="space-y-4">
+          {activeTab === 'servers' && (() => {
+            const getGroupMeta = (name: string) => {
+              const lower = name.toLowerCase();
+              if (lower.includes('americas')) return {
+                icon: '🌎', accentBg: 'border-l-blue-500',
+                dotColor: 'bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)]',
+                nameColor: 'text-blue-400',
+                descKey: 'serverGroupDescAmericas' as const,
+                coverageKey: 'serverGroupCoverageAmericas' as const,
+                iconBg: 'bg-blue-500/12',
+              };
+              if (lower.includes('asia')) return {
+                icon: '🌏', accentBg: 'border-l-amber-500',
+                dotColor: 'bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.5)]',
+                nameColor: 'text-amber-400',
+                descKey: 'serverGroupDescAsia' as const,
+                coverageKey: 'serverGroupCoverageAsia' as const,
+                iconBg: 'bg-amber-500/12',
+              };
+              return {
+                icon: '🌐', accentBg: 'border-l-slate-500',
+                dotColor: 'bg-slate-500 shadow-[0_0_8px_rgba(100,116,139,0.4)]',
+                nameColor: 'text-slate-400',
+                descKey: 'serverGroupDescGlobal' as const,
+                coverageKey: 'serverGroupCoverageGlobal' as const,
+                iconBg: 'bg-slate-500/12',
+              };
+            };
+
+            return (
+            <div className="space-y-6">
               {proxyGroups.length === 0 ? (
                 <Card className="bg-card border-border">
                   <CardContent className="p-6 text-center text-muted-foreground">
@@ -633,116 +759,144 @@ function AppContent() {
                   </CardContent>
                 </Card>
               ) : (
-                proxyGroups.map((group) => {
-                  const isSelectType = group.type.toLowerCase().includes('select');
-                  const isExpanded = isSelectType && expandedGroups.has(group.name);
-                  const selectedProxy = group.now || selectedProxies[group.name] || group.proxies[0];
-                  
-                  const badgeColor = isSelectType
-                    ? 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20'
-                    : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20';
+                <>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+                    {proxyGroups.map((group) => {
+                      const meta = getGroupMeta(group.name);
+                      const isSelectType = group.type.toLowerCase().includes('select');
+                      const isExpanded = isSelectType && expandedGroups.has(group.name);
+                      const selectedProxy = group.now || selectedProxies[group.name] || group.proxies[0];
+                      const displayName = group.name.replace(/^[\p{Emoji}\s🖥️]+/u, '').trim();
 
-                  return (
-                    <div key={group.name} className="bg-card border border-border rounded-xl overflow-hidden transition-all">
-                      <div 
-                        className={cn(
-                          "p-4 flex items-center justify-between transition-colors",
-                          isSelectType && "cursor-pointer hover:bg-accent/50"
-                        )}
-                        onClick={() => isSelectType && toggleGroupExpansion(group.name)}
-                      >
-                        <div className="flex items-center gap-4">
-                           <div className="flex items-center gap-3">
-                             <span className="font-bold text-foreground text-lg">{group.name}</span>
-                             <Badge variant="outline" className={cn("text-[10px] uppercase tracking-wider border", badgeColor)}>
-                               {group.type}
-                             </Badge>
-                           </div>
-                           <div className="hidden sm:flex text-muted-foreground text-sm items-center gap-2">
-                             <span className="text-muted-foreground">{t('activeLabel')}:</span>
-                             <span className="text-blue-400 font-medium">{selectedProxy}</span>
-                           </div>
+                      return (
+                        <div
+                          key={group.name}
+                          className={cn(
+                            "relative bg-card/80 backdrop-blur-sm border border-border rounded-2xl overflow-hidden transition-all duration-300 hover:border-border/80 hover:shadow-[0_8px_32px_rgba(0,0,0,0.25)] hover:-translate-y-0.5",
+                            `border-l-4 ${meta.accentBg}`
+                          )}
+                        >
+                          <div className="p-5">
+                            <div className="flex items-center gap-3 mb-2">
+                              <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center text-xl shrink-0", meta.iconBg)}>
+                                {meta.icon}
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <span className="font-bold text-foreground text-[15px] truncate">{displayName}</span>
+                                  <Badge variant="outline" className="text-[9px] uppercase tracking-wider border bg-cyan-500/10 text-cyan-400 border-cyan-500/20 shrink-0">
+                                    {group.type}
+                                  </Badge>
+                                </div>
+                                <p className="text-xs text-muted-foreground mt-0.5">{t(meta.descKey)}</p>
+                              </div>
+                            </div>
+
+                            {t(meta.coverageKey) && t(meta.coverageKey) !== meta.coverageKey && <p className="text-[11px] text-muted-foreground/70 mb-3 pl-[52px]">{t(meta.coverageKey)}</p>}
+
+                            <div className="flex items-center gap-2 px-3 py-2.5 bg-background/40 rounded-xl border border-border/50">
+                              <div className={cn("w-2 h-2 rounded-full shrink-0", meta.dotColor)} />
+                              <span className="text-[11px] text-muted-foreground">{t('currentNode')}</span>
+                              <span className={cn("text-[13px] font-semibold ml-auto truncate", meta.nameColor)}>{selectedProxy}</span>
+                            </div>
+                          </div>
+
+                          {isSelectType && (
+                            <button
+                              className="w-full flex items-center justify-center gap-1.5 px-4 py-2.5 border-t border-border/50 text-xs text-muted-foreground hover:text-foreground hover:bg-accent/30 transition-colors cursor-pointer"
+                              onClick={() => toggleGroupExpansion(group.name)}
+                            >
+                              {isExpanded ? (
+                                <>{t('collapseNodes')} <ChevronDown className="h-3.5 w-3.5" /></>
+                              ) : (
+                                <>{t('expandNodes')} ({group.proxies.length}) <ChevronRight className="h-3.5 w-3.5" /></>
+                              )}
+                            </button>
+                          )}
                         </div>
-                        
-                        {isSelectType && (
-                          isExpanded ? (
-                            <ChevronDown className="h-5 w-5 text-muted-foreground" />
-                          ) : (
-                            <ChevronRight className="h-5 w-5 text-muted-foreground" />
-                          )
-                        )}
-                      </div>
+                      );
+                    })}
+                  </div>
 
-                      {isExpanded && (
-                        <div className="bg-muted/30 p-4 border-t border-border grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3">
+                  {proxyGroups.map((group) => {
+                    const meta = getGroupMeta(group.name);
+                    const isSelectType = group.type.toLowerCase().includes('select');
+                    const isExpanded = isSelectType && expandedGroups.has(group.name);
+                    const selectedProxy = group.now || selectedProxies[group.name] || group.proxies[0];
+                    const displayName = group.name.replace(/^[\p{Emoji}\s🖥️]+/u, '').trim();
+                    if (!isExpanded) return null;
+
+                    return (
+                      <div key={`${group.name}-nodes`} className={cn("bg-card/80 backdrop-blur-sm border border-border rounded-2xl overflow-hidden border-l-4", meta.accentBg)}>
+                        <div className="p-4 flex items-center justify-between cursor-pointer hover:bg-accent/20 transition-colors" onClick={() => toggleGroupExpansion(group.name)}>
+                          <div className="flex items-center gap-3">
+                            <div className={cn("w-9 h-9 rounded-lg flex items-center justify-center text-lg shrink-0", meta.iconBg)}>{meta.icon}</div>
+                            <div>
+                              <div className="flex items-center gap-2">
+                                <span className="font-bold text-foreground text-sm">{displayName}</span>
+                                <Badge variant="outline" className="text-[9px] uppercase tracking-wider border bg-cyan-500/10 text-cyan-400 border-cyan-500/20">{group.type}</Badge>
+                              </div>
+                              <p className="text-[11px] text-muted-foreground mt-0.5">{t(meta.descKey)}</p>
+                            </div>
+                            <div className="hidden sm:flex items-center gap-2 ml-6">
+                              <span className="text-[11px] text-muted-foreground">{t('currentNode')}:</span>
+                              <span className={cn("text-[13px] font-semibold", meta.nameColor)}>{selectedProxy}</span>
+                            </div>
+                          </div>
+                          <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0" />
+                        </div>
+                        <div className="bg-muted/20 p-4 border-t border-border grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-2.5">
                           {group.proxies.map(proxy => {
-                             const isSelected = selectedProxy === proxy;
-                             const delay = nodeDelays[proxy];
-                             const hasDelay = delay !== undefined;
-                             const isTimeout = delay === -1;
-                             
-                             const getDelayColor = () => {
-                               if (!hasDelay) return '';
-                               if (isTimeout) return 'text-red-400';
-                               if (delay < 100) return 'text-emerald-400';
-                               if (delay < 300) return 'text-yellow-400';
-                               return 'text-orange-400';
-                             };
-                             
-                             const getDelayText = () => {
-                               if (!hasDelay) return null;
-                               if (isTimeout) return '--';
-                               return `${delay}ms`;
-                             };
-                             
-                             return (
-                               <button
-                                 key={proxy}
-                                 onClick={(e) => {
-                                   e.stopPropagation();
-                                   handleProxySelect(group.name, proxy);
-                                 }}
-                                 className={cn(
-                                   "px-3 py-1.5 rounded-lg text-sm font-medium transition-all text-left truncate flex items-center justify-between gap-2",
-                                   isSelected 
-                                     ? "bg-blue-500/20 text-blue-400 border border-blue-500/30" 
-                                     : "bg-muted text-muted-foreground border border-transparent hover:bg-accent"
-                                 )}
-                               >
-                                 <span className="truncate">{proxy}</span>
-                                 {hasDelay && (
-                                   <span className={cn("text-xs font-mono shrink-0", getDelayColor())}>
-                                     {getDelayText()}
-                                   </span>
-                                 )}
-                               </button>
-                             );
+                            const isSelected = selectedProxy === proxy;
+                            const delay = nodeDelays[proxy];
+                            const hasDelay = delay !== undefined;
+                            const isTimeout = delay === -1;
+                            const isSubGroup = proxyGroups.some(g => g.name === proxy);
+                            const getDelayColor = () => {
+                              if (!hasDelay) return '';
+                              if (isTimeout) return 'text-red-400';
+                              if (delay < 100) return 'text-emerald-400';
+                              if (delay < 300) return 'text-yellow-400';
+                              return 'text-orange-400';
+                            };
+                            const getDelayText = () => {
+                              if (!hasDelay) return null;
+                              if (isTimeout) return '--';
+                              return `${delay}ms`;
+                            };
+                            return (
+                              <button
+                                key={proxy}
+                                onClick={(e) => { e.stopPropagation(); handleProxySelect(group.name, proxy); }}
+                                className={cn(
+                                  "px-3 py-2 rounded-lg text-xs font-medium transition-all text-left truncate flex items-center justify-between gap-2",
+                                  isSubGroup ? "bg-cyan-500/8 text-cyan-300 border border-dashed border-cyan-500/30 hover:bg-cyan-500/15"
+                                    : isSelected ? "bg-blue-500/20 text-blue-400 border border-blue-500/30"
+                                    : "bg-muted/60 text-muted-foreground border border-transparent hover:bg-accent"
+                                )}
+                              >
+                                <span className="truncate">{proxy}</span>
+                                {isSubGroup && !hasDelay ? (
+                                  <span className="text-[9px] font-semibold text-cyan-400/70 shrink-0">{t('subGroup')}</span>
+                                ) : hasDelay ? (
+                                  <span className={cn("text-[10px] font-mono shrink-0", getDelayColor())}>{getDelayText()}</span>
+                                ) : null}
+                              </button>
+                            );
                           })}
                         </div>
-                      )}
-                    </div>
-                  );
-                })
+                      </div>
+                    );
+                  })}
+                </>
               )}
             </div>
-          )}
+            );
+          })()}
 
           {/* Proxy View */}
           {activeTab === 'proxy' && (
             <div className="space-y-6">
-              {runMode.reuse_mode ? (
-                <div className="bg-card/50 backdrop-blur-md border border-border/50 rounded-xl p-16 flex items-center justify-center min-h-[40vh]">
-                  <div className="text-center">
-                    <div className="h-16 w-16 rounded-full bg-green-500/10 flex items-center justify-center mx-auto mb-5">
-                      <CheckCircle2 className="h-8 w-8 text-green-500" />
-                    </div>
-                    <h3 className="text-xl font-semibold text-foreground mb-2">{t('reuseMode')}</h3>
-                    <p className="text-sm text-muted-foreground max-w-sm mx-auto">
-                      {t('reuseModeDesc')}
-                    </p>
-                  </div>
-                </div>
-              ) : (
               <Card className="bg-card border-border">
                 <CardHeader>
                   <CardTitle className="text-lg text-foreground">{t('subscription')}</CardTitle>
@@ -776,20 +930,83 @@ function AppContent() {
                     </div>
                   )}
                   
-                  <div className="bg-blue-500/5 border border-blue-500/10 rounded-md p-4">
-                    <div className="flex gap-3">
-                      <CheckCircle2 className="h-5 w-5 text-blue-500 shrink-0" />
-                      <div>
-                        <h4 className="text-sm font-medium text-blue-400 mb-1">{t('autoUpdateEnabled')}</h4>
-                        <p className="text-xs text-blue-400/60 leading-relaxed">
-                          {t('serverListSync')}
-                        </p>
+                  {/* Auto-Update Status Bar */}
+                  {autoUpdateStatus.sync_state.type === 'Failed' ? (
+                    <div className="bg-orange-500/5 border border-orange-500/20 rounded-md p-4">
+                      <div className="flex items-center justify-between">
+                        <div className="flex gap-3 items-center">
+                          <AlertTriangle className="h-5 w-5 text-orange-500 shrink-0" />
+                          <span className="text-sm font-medium text-orange-400">
+                            {t('autoSyncFailed').replace(
+                              '{reason}',
+                              t(
+                                autoUpdateStatus.sync_state.error_category === 'network_error'
+                                  ? 'errorCategoryNetwork'
+                                  : autoUpdateStatus.sync_state.error_category === 'subscription_invalid'
+                                  ? 'errorCategorySubscriptionInvalid'
+                                  : 'errorCategoryUnknown'
+                              )
+                            )}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={handleRetrySync}
+                            className="text-orange-400 hover:text-orange-300 text-xs"
+                          >
+                            {t('syncRetryNow')}
+                          </Button>
+                          <Switch
+                            checked={autoUpdateStatus.enabled}
+                            onCheckedChange={handleAutoUpdateToggle}
+                          />
+                        </div>
                       </div>
                     </div>
-                  </div>
+                  ) : (
+                    <div className={cn(
+                      "rounded-md p-4 border",
+                      autoUpdateStatus.enabled
+                        ? "bg-blue-500/5 border-blue-500/10"
+                        : "bg-muted/30 border-border"
+                    )}>
+                      <div className="flex items-center justify-between">
+                        <div className="flex gap-3 items-center">
+                          <CheckCircle2 className={cn(
+                            "h-5 w-5 shrink-0",
+                            autoUpdateStatus.enabled ? "text-blue-500" : "text-muted-foreground"
+                          )} />
+                          <div>
+                            <h4 className={cn(
+                              "text-sm font-medium mb-0.5",
+                              autoUpdateStatus.enabled ? "text-blue-400" : "text-muted-foreground"
+                            )}>
+                              {autoUpdateStatus.enabled ? t('autoUpdateEnabled') : t('autoUpdateDisabled')}
+                            </h4>
+                            {autoUpdateStatus.enabled && (
+                              <p className="text-xs text-blue-400/60">
+                                {autoUpdateStatus.last_sync_ts > 0
+                                  ? t('lastSyncedAgo').replace('{time}', (() => {
+                                      const { key, n } = getTimeAgo(autoUpdateStatus.last_sync_ts);
+                                      return t(key).replace('{n}', String(n));
+                                    })())
+                                  : t('serverListSync')
+                                }
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                        <Switch
+                          checked={autoUpdateStatus.enabled}
+                          onCheckedChange={handleAutoUpdateToggle}
+                        />
+                      </div>
+                    </div>
+                  )}
                 </CardContent>
               </Card>
-              )}
             </div>
           )}
 
@@ -965,6 +1182,101 @@ function AppContent() {
                   <CardDescription className="text-muted-foreground">{t('rdpSettingsDesc')}</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4 flex-1">
+                  {/* Turbo Mode — coming soon */}
+                  <div className="flex items-center justify-between py-2 opacity-50 cursor-not-allowed">
+                    <div className="flex items-center gap-3">
+                      <div className="h-9 w-9 rounded-lg bg-blue-500/10 flex items-center justify-center">
+                        <Zap className="h-4 w-4 text-blue-500" />
+                      </div>
+                      <div>
+                        <div className="text-sm font-medium text-foreground flex items-center gap-2">
+                          {t('tubeMode')}
+                          <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/25">Soon</span>
+                        </div>
+                        <div className="text-xs text-muted-foreground">{t('tubeModeDesc')}</div>
+                      </div>
+                    </div>
+                    <div className="relative inline-flex h-6 w-11 items-center rounded-full bg-zinc-600 pointer-events-none">
+                      <span className="inline-block h-4 w-4 rounded-full bg-white shadow-sm translate-x-1" />
+                    </div>
+                  </div>
+                  {/* Cloud Mode */}
+                  <div className="flex flex-col gap-3 py-2">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        <div className="h-9 w-9 rounded-lg bg-violet-500/10 flex items-center justify-center">
+                          <Cloud className="h-4 w-4 text-violet-500" />
+                        </div>
+                        <div>
+                          <div className="text-sm font-medium text-foreground">{t('cloudMode')}</div>
+                          <div className="text-xs text-muted-foreground">{t('cloudModeDesc')}</div>
+                        </div>
+                      </div>
+                      <button
+                        onClick={async () => {
+                          const next = !cloudEnabled;
+                          setCloudEnabled(next);
+                          if (!next) {
+                            await api.setCloudMode(false, '', '');
+                            setRelayEndpoints([]);
+                          }
+                        }}
+                        className={cn(
+                          "relative inline-flex h-6 w-11 items-center rounded-full transition-colors",
+                          cloudEnabled ? "bg-violet-500" : "bg-zinc-600"
+                        )}
+                      >
+                        <span className={cn(
+                          "inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform",
+                          cloudEnabled ? "translate-x-6" : "translate-x-1"
+                        )} />
+                      </button>
+                    </div>
+                    {cloudEnabled && (
+                      <div className="ml-12 space-y-2">
+                        <Input
+                          placeholder={t('dashboardUrl')}
+                          value={dashboardUrl}
+                          onChange={(e) => setDashboardUrl(e.target.value)}
+                          className="h-8 text-xs"
+                        />
+                        <Input
+                          type="password"
+                          placeholder={t('relayApiKey')}
+                          value={relayApiKey}
+                          onChange={(e) => setRelayApiKey(e.target.value)}
+                          className="h-8 text-xs"
+                        />
+                        <div className="flex items-center gap-2">
+                          <Button
+                            size="sm"
+                            className="h-7 text-xs bg-violet-600 hover:bg-violet-700"
+                            disabled={cloudSaving || !dashboardUrl || !relayApiKey}
+                            onClick={async () => {
+                              setCloudSaving(true);
+                              try {
+                                await api.setCloudMode(true, dashboardUrl, relayApiKey);
+                                const eps = await api.refreshRelayEndpoints();
+                                setRelayEndpoints(eps);
+                              } catch (e) {
+                                console.error('Cloud mode save failed', e);
+                              } finally {
+                                setCloudSaving(false);
+                              }
+                            }}
+                          >
+                            {cloudSaving ? <RefreshCw className="h-3 w-3 animate-spin" /> : t('saveAndSync')}
+                          </Button>
+                          {relayEndpoints.length > 0 && (
+                            <span className="text-xs text-emerald-500">
+                              {relayEndpoints.length} {t('endpointsSynced')}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  {/* Folder Sharing */}
                   <div className="flex items-center justify-between py-2">
                     <div className="flex items-center gap-3">
                       <div className="h-9 w-9 rounded-lg bg-emerald-500/10 flex items-center justify-center">
@@ -981,9 +1293,7 @@ function AppContent() {
                         const current = (() => { try { return JSON.parse(localStorage.getItem(key) || 'false'); } catch { return false; } })();
                         const next = !current;
                         localStorage.setItem(key, JSON.stringify(next));
-                        // Force re-render by dispatching storage event
                         window.dispatchEvent(new StorageEvent('storage', { key }));
-                        // Also trigger re-render locally
                         setFolderSharingLocal(next);
                       }}
                       className={cn(
