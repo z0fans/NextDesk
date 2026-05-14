@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use crate::state::{ProxyGroup, Server};
 
 const SOCKS_PORT: u16 = 17897;
-const RDP_GROUP_KEYWORDS: &[&str] = &["server-", "auto-"];
+const RDP_GROUP_KEYWORDS: &[&str] = &["server-", "auto-", "proxy"];
 
 pub fn get_user_config_dir() -> PathBuf {
     let base = dirs::config_dir()
@@ -31,6 +31,22 @@ pub struct SavedConfig {
     pub servers: Vec<Server>,
     #[serde(default)]
     pub proxy_groups: Vec<ProxyGroup>,
+    #[serde(default)]
+    pub tube_enabled: bool,
+    #[serde(default)]
+    pub cloud_mode: bool,
+    #[serde(default)]
+    pub dashboard_url: String,
+    #[serde(default)]
+    pub relay_api_key: String,
+    #[serde(default = "default_auto_update_enabled")]
+    pub auto_update_enabled: bool,
+    #[serde(default)]
+    pub last_sync_ts: u64,
+}
+
+fn default_auto_update_enabled() -> bool {
+    true
 }
 
 pub fn load_saved_config() -> SavedConfig {
@@ -71,22 +87,22 @@ pub fn generate_clash_config(
     let default_proxies = if proxy_names.is_empty() {
         vec![serde_yaml::Value::String("DIRECT".into())]
     } else {
-        proxy_names
+        proxy_names.clone()
     };
 
-    let mut group = serde_yaml::Mapping::new();
-    group.insert(
-        serde_yaml::Value::String("name".into()),
-        serde_yaml::Value::String("PROXY".into()),
-    );
-    group.insert(
-        serde_yaml::Value::String("type".into()),
-        serde_yaml::Value::String("select".into()),
-    );
-    group.insert(
-        serde_yaml::Value::String("proxies".into()),
-        serde_yaml::Value::Sequence(default_proxies),
-    );
+    // Server-RDP: select group for manual node selection
+    let mut server_rdp = serde_yaml::Mapping::new();
+    server_rdp.insert(ykey("name"), serde_yaml::Value::String("Server-RDP".into()));
+    server_rdp.insert(ykey("type"), serde_yaml::Value::String("select".into()));
+    server_rdp.insert(ykey("proxies"), serde_yaml::Value::Sequence(default_proxies.clone()));
+
+    // Auto-RDP: fallback group for automatic failover
+    let mut auto_rdp = serde_yaml::Mapping::new();
+    auto_rdp.insert(ykey("name"), serde_yaml::Value::String("Auto-RDP".into()));
+    auto_rdp.insert(ykey("type"), serde_yaml::Value::String("fallback".into()));
+    auto_rdp.insert(ykey("proxies"), serde_yaml::Value::Sequence(default_proxies));
+    auto_rdp.insert(ykey("url"), serde_yaml::Value::String("http://www.gstatic.com/generate_204".into()));
+    auto_rdp.insert(ykey("interval"), serde_yaml::Value::Number(serde_yaml::Number::from(240)));
 
     let mut config = serde_yaml::Mapping::new();
     insert_yaml_int(&mut config, "port", 17890);
@@ -107,7 +123,7 @@ pub fn generate_clash_config(
     );
     config.insert(
         ykey("geo-auto-update"),
-        serde_yaml::Value::Bool(false),
+        serde_yaml::Value::Bool(true),
     );
     config.insert(
         ykey("proxies"),
@@ -116,13 +132,15 @@ pub fn generate_clash_config(
     config.insert(
         ykey("proxy-groups"),
         serde_yaml::Value::Sequence(vec![
-            serde_yaml::Value::Mapping(group),
+            serde_yaml::Value::Mapping(server_rdp),
+            serde_yaml::Value::Mapping(auto_rdp),
         ]),
     );
+    // Rules: all traffic goes through proxy (so GeoIP updates also work)
     config.insert(
         ykey("rules"),
         serde_yaml::Value::Sequence(vec![
-            serde_yaml::Value::String("MATCH,PROXY".into()),
+            serde_yaml::Value::String("MATCH,Server-RDP".into()),
         ]),
     );
 
