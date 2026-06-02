@@ -19,6 +19,8 @@
 
 use crate::cliprdr as cliprdr_module;
 use crate::frame_ws::FrameSender;
+use std::collections::HashMap;
+
 use ironrdp::cliprdr;
 use ironrdp::cliprdr::backend::CliprdrBackendFactory as _;
 use ironrdp::connector::{self, ConnectionResult, ConnectorResult};
@@ -27,15 +29,22 @@ use ironrdp::echo::client::EchoClient;
 use ironrdp::graphics::image_processing::PixelFormat;
 use ironrdp::pdu::geometry::Rectangle as _;
 use ironrdp::pdu::input::fast_path::FastPathInputEvent;
+use ironrdp::pdu::input::mouse::{MousePdu, PointerFlags};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult};
 use ironrdp::{rdpdr, rdpsnd, session};
 use ironrdp_core::WriteBuf;
+use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
+use ironrdp_egfx::pdu::{
+    CapabilitiesV107Flags, CapabilitiesV10Flags, CapabilitiesV81Flags, CapabilitiesV8Flags,
+    CapabilitySet, Codec1Type, GfxPdu,
+};
+use ironrdp_graphics::rdp6::BitmapStreamDecoder;
 use ironrdp_rdpsnd_native::cpal::RdpsndBackend;
 use ironrdp_tokio::{single_sequence_step_read, split_tokio_framed, FramedWrite};
 use rdpdr::NoopRdpdrBackend;
 use serde::Serialize;
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
 use tauri::Emitter;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -43,11 +52,281 @@ use tokio::sync::mpsc;
 
 /// Binary frame header size: 6 × u16 = 12 bytes
 const FRAME_HEADER_SIZE: usize = 12;
+const GFX_FRAME_HEADER_SIZE: usize = 20;
+const GFX_FRAME_MAGIC: u16 = 0xffff;
+const GFX_FRAME_KIND_H264: u16 = 1;
+const INPUT_DRAIN_LIMIT: usize = 4096;
+const DEFAULT_NATIVE_RENDER_MODE: NativeRenderMode = NativeRenderMode::Bitmap;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeRenderMode {
+    Bitmap,
+    GfxH264,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeRdpRoute {
     Direct,
     Socks5 { port: u16 },
+}
+
+fn should_emit_bitmap_updates(mode: NativeRenderMode) -> bool {
+    mode == NativeRenderMode::Bitmap
+}
+
+fn native_render_mode() -> NativeRenderMode {
+    match std::env::var("NEXTDESK_NATIVE_GFX")
+        .ok()
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("1" | "true" | "yes" | "gfx" | "h264") => NativeRenderMode::GfxH264,
+        _ => DEFAULT_NATIVE_RENDER_MODE,
+    }
+}
+
+fn gfx_h264_capabilities() -> Vec<CapabilitySet> {
+    vec![
+        CapabilitySet::V10_7 {
+            flags: CapabilitiesV107Flags::SMALL_CACHE,
+        },
+        CapabilitySet::V10 {
+            flags: CapabilitiesV10Flags::SMALL_CACHE,
+        },
+        CapabilitySet::V8_1 {
+            flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
+        },
+        CapabilitySet::V8 {
+            flags: CapabilitiesV8Flags::SMALL_CACHE,
+        },
+    ]
+}
+
+fn build_gfx_h264_frame(
+    surface_id: u16,
+    codec_id: Codec1Type,
+    left: u16,
+    top: u16,
+    right: u16,
+    bottom: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(GFX_FRAME_HEADER_SIZE + payload.len());
+    buf.extend_from_slice(&GFX_FRAME_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&GFX_FRAME_KIND_H264.to_le_bytes());
+    buf.extend_from_slice(&surface_id.to_le_bytes());
+    buf.extend_from_slice(&u16::from(codec_id).to_le_bytes());
+    buf.extend_from_slice(&left.to_le_bytes());
+    buf.extend_from_slice(&top.to_le_bytes());
+    buf.extend_from_slice(&right.to_le_bytes());
+    buf.extend_from_slice(&bottom.to_le_bytes());
+    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    buf.extend_from_slice(payload);
+    buf
+}
+
+fn rgb24_to_rgba(rgb: &[u8]) -> Option<Vec<u8>> {
+    if rgb.len() % 3 != 0 {
+        return None;
+    }
+
+    let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
+    for pixel in rgb.chunks_exact(3) {
+        rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xff]);
+    }
+    Some(rgba)
+}
+
+fn hex_prefix(bytes: &[u8], max_len: usize) -> String {
+    bytes
+        .iter()
+        .take(max_len)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+struct NativeGfxHandler {
+    frame_tx: FrameSender,
+    bitmap_decoder: BitmapStreamDecoder,
+    surfaces: HashMap<u16, (u16, u16)>,
+}
+
+impl NativeGfxHandler {
+    fn new(frame_tx: FrameSender) -> Self {
+        Self {
+            frame_tx,
+            bitmap_decoder: BitmapStreamDecoder::default(),
+            surfaces: HashMap::new(),
+        }
+    }
+
+    fn handle_clearcodec(&mut self, w2s: ironrdp_egfx::pdu::WireToSurface1Pdu) {
+        let rect = w2s.destination_rectangle;
+        let width = rect.width();
+        let height = rect.height();
+        let Some((surface_width, surface_height)) = self.surfaces.get(&w2s.surface_id).copied()
+        else {
+            log::warn!(
+                "[rdp-native] GFX ClearCodec skipped: unknown surface id={}",
+                w2s.surface_id
+            );
+            return;
+        };
+
+        let mut rgb = Vec::new();
+        if let Err(err) = self.bitmap_decoder.decode_bitmap_stream_to_rgb24(
+            &w2s.bitmap_data,
+            &mut rgb,
+            usize::from(width),
+            usize::from(height),
+        ) {
+            log::error!(
+                "[rdp-native] GFX ClearCodec decode failed surface={} pixel_format={:?} rect={}x{}..{}x{} size={}x{} payload={}B prefix=[{}]: {err}",
+                w2s.surface_id,
+                w2s.pixel_format,
+                rect.left,
+                rect.top,
+                rect.right,
+                rect.bottom,
+                width,
+                height,
+                w2s.bitmap_data.len(),
+                hex_prefix(&w2s.bitmap_data, 16),
+            );
+            return;
+        }
+
+        let Some(rgba) = rgb24_to_rgba(&rgb) else {
+            log::error!(
+                "[rdp-native] GFX ClearCodec decode produced invalid rgb len={}",
+                rgb.len()
+            );
+            return;
+        };
+
+        let frame = build_raw_frame(
+            surface_width,
+            surface_height,
+            rect.left,
+            rect.top,
+            width,
+            height,
+            &rgba,
+        );
+        static CLEARCODEC_FRAME_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let n = CLEARCODEC_FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 5 || n % 100 == 0 {
+            log::info!(
+                "[rdp-native] GFX ClearCodec decoded #{n} surface={} rect={}x{}..{}x{} rgb={}B rgba={}B",
+                w2s.surface_id,
+                rect.left,
+                rect.top,
+                rect.right,
+                rect.bottom,
+                rgb.len(),
+                rgba.len()
+            );
+        }
+        let _ = self.frame_tx.send(frame);
+    }
+}
+
+impl GraphicsPipelineHandler for NativeGfxHandler {
+    fn capabilities(&self) -> Vec<CapabilitySet> {
+        gfx_h264_capabilities()
+    }
+
+    fn handle_pdu(&mut self, pdu: GfxPdu) -> Option<GfxPdu> {
+        match pdu {
+            GfxPdu::WireToSurface1(w2s) => {
+                let is_h264 = matches!(
+                    w2s.codec_id,
+                    Codec1Type::Avc420 | Codec1Type::Avc444 | Codec1Type::Avc444v2
+                );
+
+                if is_h264 {
+                    let rect = w2s.destination_rectangle;
+                    let frame = build_gfx_h264_frame(
+                        w2s.surface_id,
+                        w2s.codec_id,
+                        rect.left,
+                        rect.top,
+                        rect.right,
+                        rect.bottom,
+                        &w2s.bitmap_data,
+                    );
+                    static GFX_FRAME_COUNT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let n = GFX_FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 5 || n % 100 == 0 {
+                        log::info!(
+                            "[rdp-native] GFX H264 #{n} surface={} codec={:?} rect={}x{}..{}x{} payload={}B",
+                            w2s.surface_id,
+                            w2s.codec_id,
+                            rect.left,
+                            rect.top,
+                            rect.right,
+                            rect.bottom,
+                            w2s.bitmap_data.len()
+                        );
+                    }
+                    let _ = self.frame_tx.send(frame);
+                } else if w2s.codec_id == Codec1Type::ClearCodec {
+                    self.handle_clearcodec(w2s);
+                } else {
+                    log::warn!(
+                        "[rdp-native] GFX WireToSurface1 non-H264 codec={:?} payload={}B",
+                        w2s.codec_id,
+                        w2s.bitmap_data.len()
+                    );
+                }
+            }
+            GfxPdu::CreateSurface(surface) => {
+                self.surfaces
+                    .insert(surface.surface_id, (surface.width, surface.height));
+                log::info!(
+                    "[rdp-native] GFX CreateSurface id={} {}x{}",
+                    surface.surface_id,
+                    surface.width,
+                    surface.height
+                );
+            }
+            GfxPdu::DeleteSurface(surface) => {
+                self.surfaces.remove(&surface.surface_id);
+                log::info!("[rdp-native] GFX DeleteSurface id={}", surface.surface_id);
+            }
+            GfxPdu::MapSurfaceToOutput(map) => {
+                log::info!(
+                    "[rdp-native] GFX MapSurfaceToOutput id={} origin={},{}",
+                    map.surface_id,
+                    map.output_origin_x,
+                    map.output_origin_y
+                );
+            }
+            GfxPdu::ResetGraphics(reset) => {
+                self.surfaces.clear();
+                log::info!(
+                    "[rdp-native] GFX ResetGraphics {}x{}",
+                    reset.width,
+                    reset.height
+                );
+            }
+            GfxPdu::StartFrame(frame) => {
+                log::trace!("[rdp-native] GFX StartFrame id={}", frame.frame_id);
+            }
+            GfxPdu::EndFrame(frame) => {
+                log::trace!("[rdp-native] GFX EndFrame id={}", frame.frame_id);
+            }
+            other => {
+                log::trace!("[rdp-native] GFX PDU skipped: {:?}", other);
+            }
+        }
+
+        None
+    }
 }
 
 /// Build a raw binary frame packet with LZ4 compression.
@@ -135,11 +414,70 @@ pub struct RdpPointerEvent {
 
 // ── Input Events (Frontend → Rust) ──────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeRdpInput {
     FastPath(SmallVec<[FastPathInputEvent; 2]>),
+    MouseMove { x: u16, y: u16 },
     Resize { width: u16, height: u16 },
     Close,
+}
+
+fn coalesce_input_burst<I>(inputs: I) -> Vec<NativeRdpInput>
+where
+    I: IntoIterator<Item = NativeRdpInput>,
+{
+    let mut coalesced = Vec::new();
+    let mut pending_move = None;
+
+    for input in inputs {
+        match input {
+            NativeRdpInput::MouseMove { .. } => {
+                pending_move = Some(input);
+            }
+            NativeRdpInput::Close => {
+                if let Some(mouse_move) = pending_move.take() {
+                    coalesced.push(mouse_move);
+                }
+                coalesced.push(NativeRdpInput::Close);
+                break;
+            }
+            other => {
+                if let Some(mouse_move) = pending_move.take() {
+                    coalesced.push(mouse_move);
+                }
+                coalesced.push(other);
+            }
+        }
+    }
+
+    if let Some(mouse_move) = pending_move {
+        coalesced.push(mouse_move);
+    }
+
+    coalesced
+}
+
+fn drain_coalesced_inputs(
+    first: NativeRdpInput,
+    input_rx: &mut mpsc::UnboundedReceiver<NativeRdpInput>,
+) -> Vec<NativeRdpInput> {
+    let mut inputs = Vec::with_capacity(64);
+    inputs.push(first);
+
+    for _ in 0..INPUT_DRAIN_LIMIT {
+        match input_rx.try_recv() {
+            Ok(input) => {
+                let should_stop = matches!(input, NativeRdpInput::Close);
+                inputs.push(input);
+                if should_stop {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    coalesce_input_burst(inputs)
 }
 // ── Clipboard Actions (Backend → Session Loop) ──────────────
 
@@ -198,13 +536,13 @@ impl SessionManager {
 
 // ── Connection Configuration ────────────────────────────────
 
-/// Build IronRDP connector config from frontend parameters.
-pub fn connect_config(
+fn connect_config_for_route(
     username: &str,
     password: &str,
     domain: Option<&str>,
     width: u16,
     height: u16,
+    route: NativeRdpRoute,
 ) -> connector::Config {
     use ironrdp::pdu::gcc;
     use ironrdp::pdu::rdp::capability_sets;
@@ -237,13 +575,34 @@ pub fn connect_config(
         request_data: None,
         autologon: true,
         enable_audio_playback: true,
-        performance_flags: client_info::PerformanceFlags::default(),
+        performance_flags: performance_flags_for_route(route),
         license_cache: None,
         timezone_info: client_info::TimezoneInfo::default(),
         compression_type: None,
         enable_server_pointer: true,
         pointer_software_rendering: false,
         multitransport_flags: None,
+    }
+}
+
+fn performance_flags_for_route(
+    route: NativeRdpRoute,
+) -> ironrdp::pdu::rdp::client_info::PerformanceFlags {
+    use ironrdp::pdu::rdp::client_info;
+
+    match route {
+        NativeRdpRoute::Direct => {
+            client_info::PerformanceFlags::ENABLE_FONT_SMOOTHING
+                | client_info::PerformanceFlags::ENABLE_DESKTOP_COMPOSITION
+        }
+        NativeRdpRoute::Socks5 { .. } => {
+            client_info::PerformanceFlags::ENABLE_FONT_SMOOTHING
+                | client_info::PerformanceFlags::DISABLE_WALLPAPER
+                | client_info::PerformanceFlags::DISABLE_FULLWINDOWDRAG
+                | client_info::PerformanceFlags::DISABLE_MENUANIMATIONS
+                | client_info::PerformanceFlags::DISABLE_THEMING
+                | client_info::PerformanceFlags::DISABLE_CURSOR_SHADOW
+        }
     }
 }
 
@@ -353,7 +712,15 @@ async fn run_session(
     mut input_rx: mpsc::UnboundedReceiver<NativeRdpInput>,
     frame_tx: FrameSender,
 ) -> Result<GracefulDisconnectReason, String> {
-    let config = connect_config(&username, &password, domain.as_deref(), width, height);
+    let route = choose_native_rdp_route(&host, socks_port);
+    let config = connect_config_for_route(
+        &username,
+        &password,
+        domain.as_deref(),
+        width,
+        height,
+        route,
+    );
 
     // Create cliprdr action channel (backend → session loop)
     let (cliprdr_tx, mut cliprdr_rx) = mpsc::unbounded_channel::<CliprdrAction>();
@@ -368,7 +735,7 @@ async fn run_session(
     let (connection_result, framed) = connect_tcp(
         &host,
         port,
-        socks_port,
+        route,
         &config,
         cliprdr_tx,
         &temp_dir_str,
@@ -416,14 +783,14 @@ async fn run_session(
 async fn connect_tcp(
     host: &str,
     port: u16,
-    socks_port: u16,
+    route: NativeRdpRoute,
     config: &connector::Config,
     cliprdr_action_tx: mpsc::UnboundedSender<CliprdrAction>,
     temp_dir: &str,
-    _frame_tx: FrameSender,
+    frame_tx: FrameSender,
     app_handle: tauri::AppHandle,
 ) -> ConnectorResult<(ConnectionResult, UpgradedFramed)> {
-    let stream = connect_rdp_transport(host, port, socks_port).await?;
+    let stream = connect_rdp_transport(host, port, route).await?;
 
     stream
         .set_nodelay(true)
@@ -435,15 +802,18 @@ async fn connect_tcp(
 
     let mut framed = ironrdp_tokio::TokioFramed::new(stream);
 
-    // Do NOT register GFX Pipeline — let server use FastPath Surface Commands
-    // which ActiveStage's built-in decoder handles perfectly (RFX, RLE, Bitmap).
-    // This matches WASM behavior when no gfx_callback is provided.
-    eprintln!("[rdp-native] Using ActiveStage built-in decoders (no GFX Pipeline)");
+    let render_mode = native_render_mode();
+    match render_mode {
+        NativeRenderMode::Bitmap => {
+            log::info!("[rdp-native] Using ActiveStage bitmap dirty-rect pipeline");
+        }
+        NativeRenderMode::GfxH264 => {
+            log::info!("[rdp-native] Using RDPGFX + H.264/WebCodecs pipeline");
+        }
+    }
 
-    let drdynvc = ironrdp::dvc::DrdynvcClient::new()
-        .with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())))
-        .with_dynamic_channel(EchoClient::new());
-    eprintln!("[rdp-native] DrdynvcClient channels: {:?}", drdynvc);
+    let drdynvc = build_dynamic_virtual_channels(frame_tx.clone(), render_mode);
+    log::info!("[rdp-native] DrdynvcClient channels: {:?}", drdynvc);
 
     let cliprdr_factory =
         cliprdr_module::build_factory(cliprdr_action_tx, app_handle.clone(), temp_dir.to_string());
@@ -514,10 +884,10 @@ async fn connect_tcp(
 async fn connect_rdp_transport(
     host: &str,
     port: u16,
-    socks_port: u16,
+    route: NativeRdpRoute,
 ) -> ConnectorResult<TcpStream> {
     let dest = format!("{host}:{port}");
-    match choose_native_rdp_route(host, socks_port) {
+    match route {
         NativeRdpRoute::Direct => {
             log::info!("[rdp-native] Direct TCP -> {dest}");
             TcpStream::connect(&dest)
@@ -577,6 +947,64 @@ fn is_private_or_reserved_ip(host: &str) -> bool {
     }
 }
 
+fn build_dynamic_virtual_channels(
+    frame_tx: FrameSender,
+    mode: NativeRenderMode,
+) -> ironrdp::dvc::DrdynvcClient {
+    let mut drdynvc = ironrdp::dvc::DrdynvcClient::new()
+        .with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())))
+        .with_dynamic_channel(EchoClient::new());
+
+    if mode == NativeRenderMode::GfxH264 {
+        drdynvc = drdynvc.with_dynamic_channel(GraphicsPipelineClient::new(Box::new(
+            NativeGfxHandler::new(frame_tx),
+        )));
+        log::info!("[rdp-native] GFX graphics pipeline channel registered");
+    }
+
+    drdynvc
+}
+
+fn process_native_input(
+    active_stage: &mut ActiveStage,
+    image: &mut DecodedImage,
+    input: NativeRdpInput,
+) -> SessionResult<Vec<ActiveStageOutput>> {
+    match input {
+        NativeRdpInput::FastPath(events) => active_stage.process_fastpath_input(image, &events),
+        NativeRdpInput::MouseMove { x, y } => {
+            let event = FastPathInputEvent::MouseEvent(MousePdu {
+                flags: PointerFlags::MOVE,
+                number_of_wheel_rotation_units: 0,
+                x_position: x,
+                y_position: y,
+            });
+            let events: SmallVec<[FastPathInputEvent; 2]> = smallvec![event];
+            active_stage.process_fastpath_input(image, &events)
+        }
+        NativeRdpInput::Resize { width, height } => {
+            if let Some(result) =
+                active_stage.encode_resize(width as u32, height as u32, None, None)
+            {
+                match result {
+                    Ok(frame) => {
+                        log::info!("[rdp-native] DVC resize {width}x{height}");
+                        Ok(vec![ActiveStageOutput::ResponseFrame(frame)])
+                    }
+                    Err(e) => {
+                        log::warn!("[rdp-native] DVC resize encode error: {e}");
+                        Ok(Vec::new())
+                    }
+                }
+            } else {
+                log::debug!("[rdp-native] DVC not ready, resize {width}x{height} ignored");
+                Ok(Vec::new())
+            }
+        }
+        NativeRdpInput::Close => active_stage.graceful_shutdown(),
+    }
+}
+
 // ── Active Session Event Loop ───────────────────────────────
 
 /// Drive the active RDP session: process server frames + frontend input + clipboard.
@@ -632,46 +1060,23 @@ async fn active_session(
         connection_result.desktop_size.height,
     );
 
+    let render_mode = native_render_mode();
     let mut active_stage = ActiveStage::new(connection_result);
 
     let disconnect_reason = 'outer: loop {
         let outputs = tokio::select! {
-            biased;
             input_event = input_rx.recv() => {
                 let Some(ev) = input_event else {
                     log::warn!("[rdp-native] input channel closed; treating as user disconnect");
                     break 'outer GracefulDisconnectReason::UserInitiated;
                 };
 
-                match ev {
-                    NativeRdpInput::FastPath(events) => {
-                        active_stage
-                            .process_fastpath_input(&mut image, &events)?
-                    }
-                    NativeRdpInput::Resize { width, height } => {
-                        // Use DisplayControl DVC for dynamic resize (no reconnect needed)
-                        if let Some(result) = active_stage.encode_resize(
-                            width as u32, height as u32, None, None,
-                        ) {
-                            match result {
-                                Ok(frame) => {
-                                    log::info!("[rdp-native] DVC resize {width}x{height}");
-                                    vec![ActiveStageOutput::ResponseFrame(frame)]
-                                }
-                                Err(e) => {
-                                    log::warn!("[rdp-native] DVC resize encode error: {e}");
-                                    Vec::new()
-                                }
-                            }
-                        } else {
-                            log::debug!("[rdp-native] DVC not ready, resize {width}x{height} ignored");
-                            Vec::new()
-                        }
-                    }
-                    NativeRdpInput::Close => {
-                        active_stage.graceful_shutdown()?
-                    }
+                let inputs = drain_coalesced_inputs(ev, input_rx);
+                let mut outputs = Vec::new();
+                for input in inputs {
+                    outputs.extend(process_native_input(&mut active_stage, &mut image, input)?);
                 }
+                outputs
             }
             frame = reader.read_pdu() => {
                 let (action, payload) = match frame {
@@ -753,6 +1158,19 @@ async fn active_session(
                 }
 
                 ActiveStageOutput::GraphicsUpdate(region) => {
+                    if !should_emit_bitmap_updates(render_mode) {
+                        static SUPPRESSED_BITMAP_COUNT: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let n = SUPPRESSED_BITMAP_COUNT
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n < 5 || n % 100 == 0 {
+                            eprintln!(
+                                "[rdp-native] bitmap dirty-rect suppressed while GFX/H264 mode is active"
+                            );
+                        }
+                        continue;
+                    }
+
                     // Extract dirty region pixels from DecodedImage
                     let rw = region.width();
                     let rh = region.height();
@@ -915,6 +1333,7 @@ async fn active_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironrdp::pdu::rdp::client_info;
 
     #[test]
     fn native_rdp_routes_public_targets_through_socks() {
@@ -938,5 +1357,137 @@ mod tests {
             choose_native_rdp_route("127.0.0.1", 17897),
             NativeRdpRoute::Direct
         );
+    }
+
+    #[test]
+    fn native_rdp_requests_rich_visual_effects() {
+        let config =
+            connect_config_for_route("user", "pass", None, 1280, 720, NativeRdpRoute::Direct);
+
+        assert!(config
+            .performance_flags
+            .contains(client_info::PerformanceFlags::ENABLE_DESKTOP_COMPOSITION));
+        assert!(config
+            .performance_flags
+            .contains(client_info::PerformanceFlags::ENABLE_FONT_SMOOTHING));
+        assert!(!config
+            .performance_flags
+            .contains(client_info::PerformanceFlags::DISABLE_FULLWINDOWDRAG));
+        assert!(!config
+            .performance_flags
+            .contains(client_info::PerformanceFlags::DISABLE_THEMING));
+    }
+
+    #[test]
+    fn native_rdp_uses_low_bandwidth_visual_flags_for_socks_routes() {
+        let direct_flags = performance_flags_for_route(NativeRdpRoute::Direct);
+        let socks_flags = performance_flags_for_route(NativeRdpRoute::Socks5 { port: 17897 });
+
+        assert!(!direct_flags.contains(client_info::PerformanceFlags::DISABLE_FULLWINDOWDRAG));
+        assert!(!direct_flags.contains(client_info::PerformanceFlags::DISABLE_MENUANIMATIONS));
+        assert!(direct_flags.contains(client_info::PerformanceFlags::ENABLE_DESKTOP_COMPOSITION));
+
+        assert!(socks_flags.contains(client_info::PerformanceFlags::ENABLE_FONT_SMOOTHING));
+        assert!(socks_flags.contains(client_info::PerformanceFlags::DISABLE_WALLPAPER));
+        assert!(socks_flags.contains(client_info::PerformanceFlags::DISABLE_FULLWINDOWDRAG));
+        assert!(socks_flags.contains(client_info::PerformanceFlags::DISABLE_MENUANIMATIONS));
+        assert!(socks_flags.contains(client_info::PerformanceFlags::DISABLE_THEMING));
+        assert!(socks_flags.contains(client_info::PerformanceFlags::DISABLE_CURSOR_SHADOW));
+        assert!(!socks_flags.contains(client_info::PerformanceFlags::ENABLE_DESKTOP_COMPOSITION));
+    }
+
+    #[test]
+    fn coalesce_input_burst_keeps_latest_consecutive_mouse_move() {
+        let inputs = vec![
+            NativeRdpInput::MouseMove { x: 10, y: 20 },
+            NativeRdpInput::MouseMove { x: 11, y: 21 },
+            NativeRdpInput::MouseMove { x: 12, y: 22 },
+            NativeRdpInput::Resize {
+                width: 1280,
+                height: 720,
+            },
+            NativeRdpInput::MouseMove { x: 30, y: 40 },
+            NativeRdpInput::MouseMove { x: 31, y: 41 },
+            NativeRdpInput::Close,
+        ];
+
+        let coalesced = coalesce_input_burst(inputs);
+
+        assert_eq!(
+            coalesced,
+            vec![
+                NativeRdpInput::MouseMove { x: 12, y: 22 },
+                NativeRdpInput::Resize {
+                    width: 1280,
+                    height: 720,
+                },
+                NativeRdpInput::MouseMove { x: 31, y: 41 },
+                NativeRdpInput::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn gfx_h264_mode_suppresses_bitmap_dirty_rects() {
+        assert!(should_emit_bitmap_updates(NativeRenderMode::Bitmap));
+        assert!(!should_emit_bitmap_updates(NativeRenderMode::GfxH264));
+    }
+
+    #[test]
+    fn gfx_h264_capabilities_advertise_avc_without_disabling_it() {
+        let caps = gfx_h264_capabilities();
+
+        assert!(caps.iter().any(|cap| matches!(
+            cap,
+            ironrdp_egfx::pdu::CapabilitySet::V8_1 { flags }
+                if flags.contains(ironrdp_egfx::pdu::CapabilitiesV81Flags::AVC420_ENABLED)
+        )));
+        assert!(caps.iter().any(|cap| matches!(
+            cap,
+            ironrdp_egfx::pdu::CapabilitySet::V10 { flags }
+                if !flags.contains(ironrdp_egfx::pdu::CapabilitiesV10Flags::AVC_DISABLED)
+        )));
+        assert!(caps.iter().any(|cap| matches!(
+            cap,
+            ironrdp_egfx::pdu::CapabilitySet::V10_7 { flags }
+                if !flags.contains(ironrdp_egfx::pdu::CapabilitiesV107Flags::AVC_DISABLED)
+        )));
+    }
+
+    #[test]
+    fn rgb24_to_rgba_appends_opaque_alpha() {
+        let rgba = rgb24_to_rgba(&[1, 2, 3, 4, 5, 6]).expect("valid rgb24");
+
+        assert_eq!(rgba, vec![1, 2, 3, 0xff, 4, 5, 6, 0xff]);
+    }
+
+    #[test]
+    fn rgb24_to_rgba_rejects_partial_pixel() {
+        assert!(rgb24_to_rgba(&[1, 2, 3, 4]).is_none());
+    }
+
+    #[test]
+    fn build_gfx_h264_frame_matches_frontend_wire_header() {
+        let payload = [0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f];
+        let frame = build_gfx_h264_frame(
+            7,
+            ironrdp_egfx::pdu::Codec1Type::Avc420,
+            10,
+            20,
+            630,
+            470,
+            &payload,
+        );
+
+        assert_eq!(&frame[0..2], &0xffffu16.to_le_bytes());
+        assert_eq!(&frame[2..4], &1u16.to_le_bytes());
+        assert_eq!(&frame[4..6], &7u16.to_le_bytes());
+        assert_eq!(&frame[6..8], &0x000bu16.to_le_bytes());
+        assert_eq!(&frame[8..10], &10u16.to_le_bytes());
+        assert_eq!(&frame[10..12], &20u16.to_le_bytes());
+        assert_eq!(&frame[12..14], &630u16.to_le_bytes());
+        assert_eq!(&frame[14..16], &470u16.to_le_bytes());
+        assert_eq!(&frame[16..20], &(payload.len() as u32).to_le_bytes());
+        assert_eq!(&frame[20..], &payload);
     }
 }

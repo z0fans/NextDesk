@@ -24,6 +24,7 @@ mod windows_virtual_files;
 use serde_json::Value;
 use state::{AppState, RunMode, Server};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use tauri::{AppHandle, Manager, State};
 
 #[tauri::command]
@@ -32,6 +33,48 @@ async fn start_engine(
     force_internal: Option<bool>,
 ) -> Result<bool, String> {
     let _ = force_internal; // suppress unused variable warning
+    start_engine_inner(app_state.inner()).await
+}
+
+fn internal_engine_running(app_state: &AppState) -> bool {
+    let mut proc = app_state.clash_process.lock().unwrap();
+    let Some(child) = proc.as_mut() else {
+        return false;
+    };
+
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            log::warn!("[start_engine] Existing Clash process exited: {status}");
+            *proc = None;
+            false
+        }
+        Ok(None) => true,
+        Err(err) => {
+            log::warn!("[start_engine] Failed to probe Clash process: {err}");
+            false
+        }
+    }
+}
+
+fn is_private_or_reserved_host(host: &str) -> bool {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_unspecified()
+        }
+        Ok(IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Err(_) => false,
+    }
+}
+
+async fn start_engine_inner(app_state: &AppState) -> Result<bool, String> {
+    if internal_engine_running(app_state) {
+        log::info!("[start_engine] Internal Clash already running");
+        return Ok(true);
+    }
 
     // Always use independent kernel — no reuse mode
     *app_state.reuse_mode.lock().unwrap() = false;
@@ -608,6 +651,13 @@ async fn rdp_native_connect(
     height: u16,
     app_state: State<'_, AppState>,
 ) -> Result<u16, String> {
+    if is_private_or_reserved_host(&host) {
+        log::info!("[rdp-native] Private/local target {host}:{port}; using direct route");
+    } else {
+        log::info!("[rdp-native] Public target {host}:{port}; ensuring internal engine");
+        start_engine_inner(app_state.inner()).await?;
+    }
+
     // Start a local WebSocket server on a random port for frame delivery.
     // This bypasses Tauri Channel's 5-layer IPC overhead entirely.
     let (ws_port, frame_tx) = frame_ws::start_frame_server()
@@ -702,9 +752,11 @@ fn rdp_native_mouse(
     };
 
     if button < 0 {
-        let event = FastPathInputEvent::MouseEvent(move_pdu);
         return tx
-            .send(rdp_session::NativeRdpInput::FastPath(smallvec![event]))
+            .send(rdp_session::NativeRdpInput::MouseMove {
+                x: move_pdu.x_position,
+                y: move_pdu.y_position,
+            })
             .map_err(|e| format!("Send mouse failed: {e}"));
     }
 
@@ -1112,4 +1164,22 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_private_or_reserved_host;
+
+    #[test]
+    fn rdp_engine_guard_treats_private_targets_as_direct() {
+        assert!(is_private_or_reserved_host("192.168.3.108"));
+        assert!(is_private_or_reserved_host("10.0.0.8"));
+        assert!(is_private_or_reserved_host("127.0.0.1"));
+    }
+
+    #[test]
+    fn rdp_engine_guard_treats_public_targets_as_proxy_required() {
+        assert!(!is_private_or_reserved_host("68.64.138.254"));
+        assert!(!is_private_or_reserved_host("example.com"));
+    }
 }

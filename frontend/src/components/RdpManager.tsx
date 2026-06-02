@@ -16,7 +16,7 @@ import { codeToScancode } from '@/lib/scancodeMap';
 import DecodeWorkerUrl from '@/lib/decode-worker.ts?worker&url';
 import { rdpLog } from '@/lib/rdp-logger';
 import { api } from '@/api';
-import { useNativeRdp, connectFrameWebSocket } from '@/hooks/useNativeRdp';
+import { useNativeRdp, connectFrameWebSocket, type NativeGfxH264Frame } from '@/hooks/useNativeRdp';
 
 /**
  * Native RDP mode flag.
@@ -24,6 +24,10 @@ import { useNativeRdp, connectFrameWebSocket } from '@/hooks/useNativeRdp';
  * When false, uses the WASM-based IronRDP via WebSocket proxy (legacy).
  */
 const USE_NATIVE_RDP = true;
+const USE_NATIVE_GFX_H264 = true;
+const ADAPTIVE_RESIZE_DEBOUNCE_MS = 800;
+const ADAPTIVE_RESIZE_THRESHOLD_PX = 20;
+const THUMBNAIL_CAPTURE_INTERVAL_MS = 10000;
 
 // Clipboard debug helper — delegates to rdpLog
 function cblog(...args: any[]) {
@@ -415,9 +419,62 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
   // to display decoded VideoFrames without context-type conflicts.
   const decodeWorkerRef = useRef<Worker | null>(null);
   const h264OverlayRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
+
+  const cleanupH264Worker = useCallback((tabId?: string) => {
+    if (decodeWorkerRef.current) {
+      decodeWorkerRef.current.postMessage({ type: 'close' });
+      decodeWorkerRef.current.terminate();
+      decodeWorkerRef.current = null;
+    }
+    if (tabId) {
+      const overlay = h264OverlayRefs.current.get(tabId);
+      if (overlay) overlay.style.opacity = '0';
+    }
+  }, []);
+
+  const ensureH264Worker = useCallback((tabId: string): Worker | null => {
+    if (typeof VideoDecoder === 'undefined') {
+      rdpLog.warn('render', 'WebCodecs not available, native GFX H.264 disabled');
+      return null;
+    }
+    if (decodeWorkerRef.current) return decodeWorkerRef.current;
+
+    try {
+      const worker = new Worker(DecodeWorkerUrl, { type: 'module' });
+      decodeWorkerRef.current = worker;
+      worker.postMessage({ type: 'configure', codec: 'avc1.64001f' });
+
+      worker.onmessage = (e: MessageEvent) => {
+        const msg = e.data;
+        if (msg.type === 'frame') {
+          const frame = msg.frame as VideoFrame;
+          const overlay = h264OverlayRefs.current.get(tabId);
+          if (overlay) {
+            if (overlay.width !== frame.displayWidth || overlay.height !== frame.displayHeight) {
+              overlay.width = frame.displayWidth;
+              overlay.height = frame.displayHeight;
+            }
+            const ctx2d = overlay.getContext('2d');
+            if (ctx2d) ctx2d.drawImage(frame, 0, 0, overlay.width, overlay.height);
+            overlay.style.opacity = '1';
+          }
+          frame.close();
+        } else if (msg.type === 'error') {
+          rdpLog.warn('render', 'h264 worker error', { message: msg.message });
+        }
+      };
+
+      return worker;
+    } catch (e) {
+      rdpLog.warn('render', 'Worker creation failed, native GFX H.264 disabled', { error: String(e) });
+      decodeWorkerRef.current = null;
+      return null;
+    }
+  }, []);
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasWrapRef = useRef<HTMLDivElement>(null);
   const activeTabIdRef = useRef<string | null>(null);
+  const tabsRef = useRef(store.tabs);
   const lastSizeRef = useRef({ w: 0, h: 0 });
   const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const resizeCooldownRef = useRef(false); // suppress adaptive resize after connect
@@ -445,6 +502,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
   const sendCtrlAltDelRef = useRef<(() => void) | null>(null);
   const prevSidebarOpenRef = useRef(store.sidebarOpen);
   activeTabIdRef.current = store.activeTabId;
+  tabsRef.current = store.tabs;
 
   // Ref to track which tabs are connected via native backend
   const nativeTabsRef = useRef<Set<string>>(new Set());
@@ -463,6 +521,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       nativeTabsRef.current.add(tabId);
     } else if (status === 'disconnected') {
       nativeTabsRef.current.delete(tabId);
+      cleanupH264Worker(tabId);
       if (userDisconnectedRef.current.has(tabId)) {
         store.updateTabStatus(tabId, 'disconnected');
       } else {
@@ -481,10 +540,11 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       }
     } else if (status === 'error') {
       nativeTabsRef.current.delete(tabId);
+      cleanupH264Worker(tabId);
       store.updateTabStatus(tabId, 'error');
       rdpLog.error('native', `session error: ${message}`, { tabId });
     }
-  }, [store]);
+  }, [store, cleanupH264Worker]);
 
   useNativeRdp({
     tabId: USE_NATIVE_RDP ? store.activeTabId : null,
@@ -660,6 +720,15 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       // ── Native RDP mode: connect via Rust backend ──
       if (USE_NATIVE_RDP) {
         rdpLog.info('native', `connecting natively: ${server.host}:${server.port} @ ${w}x${h}`);
+        const nativeGfxWorker = USE_NATIVE_GFX_H264 ? ensureH264Worker(tabId) : null;
+        const handleNativeGfxFrame = USE_NATIVE_GFX_H264
+          ? (frame: NativeGfxH264Frame) => {
+              nativeGfxWorker?.postMessage(
+                { type: 'decode', data: frame.data, timestamp: performance.now() * 1000 },
+                [frame.data],
+              );
+            }
+          : undefined;
 
         // Connect via Rust backend — returns WS port for frame streaming
         const wsPort = await api.rdpNativeConnect({
@@ -675,9 +744,14 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         rdpLog.info('native', `rdp_native_connect returned ws_port=${wsPort}`);
 
         // Connect WebSocket for zero-overhead frame streaming
-        const cleanupWs = connectFrameWebSocket(wsPort, canvas, () => {
-          fpsCountRef.current++;
-        });
+        const cleanupWs = connectFrameWebSocket(
+          wsPort,
+          canvas,
+          () => {
+            fpsCountRef.current++;
+          },
+          handleNativeGfxFrame,
+        );
         // Store cleanup for later disconnection
         (window as any).__rdp_ws_cleanup__ = cleanupWs;
 
@@ -1493,7 +1567,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         store.updateTabStatus(tabId, 'error', friendlyRdpError(raw, t));
       }
     }
-  }, [store, proxyPort, getCanvasSize]);
+  }, [store, proxyPort, getCanvasSize, ensureH264Worker]);
   connectSessionRef.current = connectSession;
 
   // ── Auto-reconnect with exponential backoff ──
@@ -1522,7 +1596,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       connectSessionRef.current?.(tabId);
     }, delay);
     reconnectTimerRef.current.set(tabId, timer);
-  }, [store]);
+  }, [store, cleanupH264Worker]);
 
   // Reset reconnect counter on successful connection
   useEffect(() => {
@@ -1567,6 +1641,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       api.rdpNativeDisconnect(tabId).catch(() => {});
       nativeTabsRef.current.delete(tabId);
     }
+    cleanupH264Worker(tabId);
     // Shutdown WASM session if any
     const session = sessionRefs.current.get(tabId);
     if (session) {
@@ -1586,7 +1661,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
     if (store.tabs.length <= 1) {
       store.setSidebarOpen(true);
     }
-  }, [store]);
+  }, [store, cleanupH264Worker]);
 
   const handleNewSaved = useCallback((serverId: string, connect: boolean) => {
     setShowNewConn(false);
@@ -1607,6 +1682,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       api.rdpNativeDisconnect(tabId).catch(() => {});
       nativeTabsRef.current.delete(tabId);
     }
+    cleanupH264Worker(tabId);
     const session = sessionRefs.current.get(tabId);
     if (session) {
       try { session.shutdown(); } catch { /* ignore */ }
@@ -2038,14 +2114,19 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
           sendInput(wasmModule!.DeviceEvent.unicodeReleased(e.key));
         }
       };
-      const onMouseMove = (e: MouseEvent) => {
+      const canvasPointToRemote = (e: MouseEvent) => {
         const r = canvas.getBoundingClientRect();
         const sx = canvas.width / r.width;
         const sy = canvas.height / r.height;
-        const mx = (e.clientX - r.left) * sx;
-        const my = (e.clientY - r.top) * sy;
+        return {
+          x: (e.clientX - r.left) * sx,
+          y: (e.clientY - r.top) * sy,
+        };
+      };
+
+      const onMouseMove = (e: MouseEvent) => {
+        const { x: mx, y: my } = canvasPointToRemote(e);
         if (isNative) {
-          // -1 = no button (pure move)
           api.rdpNativeMouse(tabId, mx, my, -1, false).catch(() => {});
         } else {
           if (!wasmModule) return;
@@ -2056,11 +2137,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       const onMouseDown = (e: MouseEvent) => {
         e.preventDefault();
         pressedButtons.add(e.button);
-        const r = canvas.getBoundingClientRect();
-        const sx = canvas.width / r.width;
-        const sy = canvas.height / r.height;
-        const mx = (e.clientX - r.left) * sx;
-        const my = (e.clientY - r.top) * sy;
+        const { x: mx, y: my } = canvasPointToRemote(e);
         rdpLog.info('input', `mouse DOWN btn=${e.button}`, {
           x: Math.round(mx),
           y: Math.round(my),
@@ -2084,11 +2161,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
           return;
         }
         pressedButtons.delete(e.button);
-        const r = canvas.getBoundingClientRect();
-        const sx = canvas.width / r.width;
-        const sy = canvas.height / r.height;
-        const mx = (e.clientX - r.left) * sx;
-        const my = (e.clientY - r.top) * sy;
+        const { x: mx, y: my } = canvasPointToRemote(e);
         rdpLog.info('input', `mouse UP btn=${e.button} SENT`, {
           x: Math.round(mx),
           y: Math.round(my),
@@ -2111,10 +2184,8 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         const amount = Math.round(Math.max(-32767, Math.min(32767, -delta)));
         if (amount === 0) return;
         if (isNative) {
-          const r = canvas.getBoundingClientRect();
-          const sx = canvas.width / r.width;
-          const sy = canvas.height / r.height;
-          api.rdpNativeWheel(tabId, (e.clientX - r.left) * sx, (e.clientY - r.top) * sy, amount, !vertical).catch(() => {});
+          const { x, y } = canvasPointToRemote(e);
+          api.rdpNativeWheel(tabId, x, y, amount, !vertical).catch(() => {});
         } else {
           if (!wasmModule) return;
           const unit = e.deltaMode;
@@ -2368,10 +2439,11 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
 
       const { w, h } = getCanvasSize();
       if (w <= 0 || h <= 0) return;
-      // Skip if size change is too small (< 10px in either dimension)
+      // Skip if size change is too small. Window drags generate many layout
+      // changes; only resize the RDP desktop once the user has made a real move.
       const dw = Math.abs(w - lastSizeRef.current.w);
       const dh = Math.abs(h - lastSizeRef.current.h);
-      if (dw < 10 && dh < 10) return;
+      if (dw < ADAPTIVE_RESIZE_THRESHOLD_PX && dh < ADAPTIVE_RESIZE_THRESHOLD_PX) return;
 
       lastSizeRef.current = { w, h };
 
@@ -2405,7 +2477,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
 
     const scheduleResize = () => {
       if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
-      resizeTimerRef.current = setTimeout(doResize, 300);
+      resizeTimerRef.current = setTimeout(doResize, ADAPTIVE_RESIZE_DEBOUNCE_MS);
     };
 
     // ResizeObserver for wrapper layout changes
@@ -2452,7 +2524,9 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
   // ── Periodic canvas snapshots for sidebar & grid thumbnails ──
   useEffect(() => {
     const iv = setInterval(() => {
-      for (const tab of store.tabs) {
+      const activeTabId = activeTabIdRef.current;
+      for (const tab of tabsRef.current) {
+        if (tab.id === activeTabId) continue;
         if (tab.status === 'connected') {
           const canvas = canvasRefs.current.get(tab.id);
           if (canvas && canvas.width > 0 && canvas.height > 0) {
@@ -2463,9 +2537,9 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
           }
         }
       }
-    }, 3000);
+    }, THUMBNAIL_CAPTURE_INTERVAL_MS);
     return () => clearInterval(iv);
-  }, [store.tabs]);
+  }, [store.updateTabThumbnail]);
 
   return (
     <div className="flex h-full overflow-hidden">

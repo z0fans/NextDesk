@@ -5,10 +5,26 @@
  * Frame format: [12B header] + [RGBA pixels].
  * Compressed frames set desktop_width bit15=1 and append
  * [4B uncompressed_len] + [LZ4 data].
+ * GFX H.264 frames use [0xFFFF magic] + metadata + payload.
  */
 import { useEffect, useRef } from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { RdpPointerEvent, RdpStatusEvent } from '@/api';
+import { rdpLog } from '@/lib/rdp-logger';
+
+const GFX_FRAME_MAGIC = 0xffff;
+const GFX_FRAME_KIND_H264 = 1;
+const GFX_FRAME_HEADER_SIZE = 20;
+
+export interface NativeGfxH264Frame {
+  surfaceId: number;
+  codecId: number;
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  data: ArrayBuffer;
+}
 
 // ── LZ4 Block Decompressor (pure TypeScript, no deps) ───────
 
@@ -165,13 +181,24 @@ export function connectFrameWebSocket(
   wsPort: number,
   canvas: HTMLCanvasElement,
   onFrame?: () => void,
+  onGfxH264Frame?: (frame: NativeGfxH264Frame) => void,
 ): () => void {
   const renderer = initGL2(canvas);
   if (!renderer) {
+    rdpLog.error('render', 'WebGL2 init failed for native frame websocket', {
+      wsPort,
+      canvasWidth: canvas.width,
+      canvasHeight: canvas.height,
+    });
     throw new Error('WebGL2 not supported');
   }
 
   const { gl, texture } = renderer;
+  rdpLog.info('render', 'native frame renderer initialized', {
+    wsPort,
+    canvasWidth: canvas.width,
+    canvasHeight: canvas.height,
+  });
 
   // ── Bitmap state ──
   let currentW = 0;
@@ -197,6 +224,8 @@ export function connectFrameWebSocket(
   // ── Frame stats ──
   let frameCount = 0;
   let lastLogTime = performance.now();
+  let firstBitmapFrameLogged = false;
+  let firstGfxFrameLogged = false;
 
   function logFps() {
     frameCount++;
@@ -218,18 +247,39 @@ export function connectFrameWebSocket(
 
   ws.onopen = () => {
     console.log(`[frame-ws] connected to port ${wsPort}`);
+    rdpLog.info('render', 'native frame websocket opened', { wsPort });
   };
 
   ws.onmessage = (event: MessageEvent) => {
     const raw: ArrayBuffer = event.data;
-    handleBitmapFrame(raw);
+    try {
+      handleBitmapFrame(raw);
+    } catch (error) {
+      rdpLog.error('render', 'native frame handling failed', {
+        wsPort,
+        byteLength: raw.byteLength,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
   };
 
   // ── Bitmap frame handler (with LZ4 decompression) ──
   function handleBitmapFrame(raw: ArrayBuffer) {
-    if (raw.byteLength < HEADER_SIZE) return;
+    if (raw.byteLength < HEADER_SIZE) {
+      rdpLog.warn('render', 'native frame too short', {
+        wsPort,
+        byteLength: raw.byteLength,
+      });
+      return;
+    }
 
     const hdr = new DataView(raw, 0, HEADER_SIZE);
+    if (hdr.getUint16(0, true) === GFX_FRAME_MAGIC) {
+      handleGfxFrame(raw);
+      return;
+    }
+
     const rawDesktopW = hdr.getUint16(0, true);
     const desktopH = hdr.getUint16(2, true);
     const x        = hdr.getUint16(4, true);
@@ -240,6 +290,21 @@ export function connectFrameWebSocket(
     // Check compression flag (bit15 of desktop_width)
     const isCompressed = (rawDesktopW & 0x8000) !== 0;
     const desktopW = rawDesktopW & 0x7FFF;
+
+    if (!firstBitmapFrameLogged) {
+      firstBitmapFrameLogged = true;
+      rdpLog.info('render', 'first native bitmap frame received', {
+        wsPort,
+        desktopW,
+        desktopH,
+        x,
+        y,
+        width,
+        height,
+        compressed: isCompressed,
+        byteLength: raw.byteLength,
+      });
+    }
 
     if (currentW !== desktopW || currentH !== desktopH) {
       canvas.width = desktopW;
@@ -270,6 +335,16 @@ export function connectFrameWebSocket(
       pixelData = decompressLz4(lz4Data);
     } else {
       const expectedBytes = width * height * 4;
+      if (raw.byteLength < HEADER_SIZE + expectedBytes) {
+        rdpLog.warn('render', 'native bitmap frame payload too short', {
+          wsPort,
+          width,
+          height,
+          expectedBytes,
+          byteLength: raw.byteLength,
+        });
+        return;
+      }
       pixelData = new Uint8Array(raw, HEADER_SIZE, expectedBytes);
     }
 
@@ -285,12 +360,54 @@ export function connectFrameWebSocket(
     logFps();
   }
 
+  function handleGfxFrame(raw: ArrayBuffer) {
+    if (!onGfxH264Frame || raw.byteLength < GFX_FRAME_HEADER_SIZE) return;
+
+    const hdr = new DataView(raw, 0, GFX_FRAME_HEADER_SIZE);
+    const kind = hdr.getUint16(2, true);
+    if (kind !== GFX_FRAME_KIND_H264) return;
+
+    const payloadLen = hdr.getUint32(16, true);
+    const payloadStart = GFX_FRAME_HEADER_SIZE;
+    const payloadEnd = payloadStart + payloadLen;
+    if (payloadEnd > raw.byteLength) {
+      rdpLog.warn('render', 'native GFX frame payload too short', {
+        wsPort,
+        payloadLen,
+        byteLength: raw.byteLength,
+      });
+      return;
+    }
+
+    const data = raw.slice(payloadStart, payloadEnd);
+    if (!firstGfxFrameLogged) {
+      firstGfxFrameLogged = true;
+      rdpLog.info('render', 'first native GFX frame received', {
+        wsPort,
+        surfaceId: hdr.getUint16(4, true),
+        codecId: hdr.getUint16(6, true),
+        payloadLen,
+      });
+    }
+    onGfxH264Frame({
+      surfaceId: hdr.getUint16(4, true),
+      codecId: hdr.getUint16(6, true),
+      left: hdr.getUint16(8, true),
+      top: hdr.getUint16(10, true),
+      right: hdr.getUint16(12, true),
+      bottom: hdr.getUint16(14, true),
+      data,
+    });
+  }
+
   ws.onerror = (e) => {
     console.error('[frame-ws] error:', e);
+    rdpLog.error('render', 'native frame websocket error', { wsPort });
   };
 
   ws.onclose = () => {
     console.log('[frame-ws] disconnected');
+    rdpLog.info('render', 'native frame websocket closed', { wsPort });
     cancelAnimationFrame(rafId);
   };
 

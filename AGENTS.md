@@ -7,7 +7,7 @@
 NextDesk 是一款 **跨平台加速远程桌面客户端**，集成了 RDP 远程桌面（IronRDP WASM）与 Clash 网络加速引擎，基于 **Tauri 2 + React 19** 构建。
 
 - **仓库**: `z0fans/NextDesk`
-- **当前版本**: `1.0.99`
+- **当前版本**: `1.0.100`
 - **目标平台**: macOS (主要), Windows
 
 ---
