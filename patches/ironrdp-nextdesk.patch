@@ -1,0 +1,3479 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 2f87aae..f2903a9 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3054,17 +3054,22 @@ dependencies = [
+  "ironrdp",
+  "ironrdp-cliprdr-format",
+  "ironrdp-core",
++ "ironrdp-egfx",
+  "ironrdp-futures",
+  "ironrdp-propertyset",
+  "ironrdp-rdcleanpath",
++ "ironrdp-rdpdr",
+  "ironrdp-rdpfile",
++ "ironrdp-rdpsnd",
+  "js-sys",
+  "png",
+  "resize",
+  "rgb",
+  "semver",
++ "serde",
++ "serde-wasm-bindgen",
++ "serde_json",
+  "smallvec",
+- "softbuffer",
+  "tap",
+  "time",
+  "tracing",
+@@ -5174,6 +5179,17 @@ dependencies = [
+  "serde_derive",
+ ]
+ 
++[[package]]
++name = "serde-wasm-bindgen"
++version = "0.6.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
++dependencies = [
++ "js-sys",
++ "serde",
++ "wasm-bindgen",
++]
++
+ [[package]]
+ name = "serde_bytes"
+ version = "0.11.19"
+diff --git a/crates/iron-remote-desktop/src/lib.rs b/crates/iron-remote-desktop/src/lib.rs
+index a4d309b..c105e1e 100644
+--- a/crates/iron-remote-desktop/src/lib.rs
++++ b/crates/iron-remote-desktop/src/lib.rs
+@@ -277,6 +277,36 @@ macro_rules! make_bridge {
+                 ))
+             }
+ 
++            #[wasm_bindgen(js_name = fileContentsRequestCallback)]
++            pub fn file_contents_request_callback(
++                &self,
++                callback: $crate::internal::web_sys::js_sys::Function,
++            ) -> Self {
++                Self($crate::SessionBuilder::file_contents_request_callback(
++                    &self.0, callback,
++                ))
++            }
++
++            #[wasm_bindgen(js_name = fileContentsResponseCallback)]
++            pub fn file_contents_response_callback(
++                &self,
++                callback: $crate::internal::web_sys::js_sys::Function,
++            ) -> Self {
++                Self($crate::SessionBuilder::file_contents_response_callback(
++                    &self.0, callback,
++                ))
++            }
++
++            #[wasm_bindgen(js_name = fileChunkCallback)]
++            pub fn file_chunk_callback(
++                &self,
++                callback: $crate::internal::web_sys::js_sys::Function,
++            ) -> Self {
++                Self($crate::SessionBuilder::file_chunk_callback(
++                    &self.0, callback,
++                ))
++            }
++
+             #[wasm_bindgen(js_name = canvasResizedCallback)]
+             pub fn canvas_resized_callback(&self, callback: $crate::internal::web_sys::js_sys::Function) -> Self {
+                 Self($crate::SessionBuilder::canvas_resized_callback(&self.0, callback))
+diff --git a/crates/iron-remote-desktop/src/session.rs b/crates/iron-remote-desktop/src/session.rs
+index db347f0..e8262ed 100644
+--- a/crates/iron-remote-desktop/src/session.rs
++++ b/crates/iron-remote-desktop/src/session.rs
+@@ -48,6 +48,15 @@ pub trait SessionBuilder {
+     #[must_use]
+     fn force_clipboard_update_callback(&self, callback: js_sys::Function) -> Self;
+ 
++    #[must_use]
++    fn file_contents_request_callback(&self, callback: js_sys::Function) -> Self;
++
++    #[must_use]
++    fn file_contents_response_callback(&self, callback: js_sys::Function) -> Self;
++
++    #[must_use]
++    fn file_chunk_callback(&self, callback: js_sys::Function) -> Self;
++
+     #[must_use]
+     fn canvas_resized_callback(&self, callback: js_sys::Function) -> Self;
+ 
+diff --git a/crates/ironrdp-cliprdr/src/pdu/format_data/file_list.rs b/crates/ironrdp-cliprdr/src/pdu/format_data/file_list.rs
+index 975c0f5..fe3ef1a 100644
+--- a/crates/ironrdp-cliprdr/src/pdu/format_data/file_list.rs
++++ b/crates/ironrdp-cliprdr/src/pdu/format_data/file_list.rs
+@@ -17,6 +17,10 @@ bitflags! {
+         const FILE_SIZE = 0x0000_0040;
+         /// The lastWriteTime field contains valid data.
+         const LAST_WRITE_TIME = 0x0000_0020;
++        /// A progress indicator is shown with drag-and-drop operations.
++        const PROGRESS_UI = 0x0000_4000;
++        /// Treat the operation as a shortcut.
++        const LINK_UI = 0x0000_8000;
+ 
+         const _ = !0;
+     }
+@@ -56,6 +60,9 @@ pub struct FileDescriptor {
+     pub attributes: Option<ClipboardFileAttributes>,
+     pub last_write_time: Option<u64>,
+     pub file_size: Option<u64>,
++    /// Additional flags to include in the descriptor (e.g., FD_PROGRESSUI).
++    /// These are OR-ed with the auto-computed flags.
++    pub extra_flags: ClipboardFileFlags,
+     // TODO: Define a new type for "bounded" strings (this one should never be bigger than 260 characters, including the null-terminator)
+     pub name: String,
+ }
+@@ -80,7 +87,7 @@ impl Encode for FileDescriptor {
+     fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+         ensure_fixed_part_size!(in: dst);
+ 
+-        let mut flags = ClipboardFileFlags::empty();
++        let mut flags = self.extra_flags;
+         if self.attributes.is_some() {
+             flags |= ClipboardFileFlags::ATTRIBUTES;
+         }
+@@ -150,10 +157,14 @@ impl<'de> Decode<'de> for FileDescriptor {
+         let name = decode_string(src.remaining(), CharacterSet::Unicode, true)?;
+         src.advance(NAME_LENGTH);
+ 
++        // Extract extra flags (bits not covered by auto-computed fields)
++        let extra = flags & !(ClipboardFileFlags::ATTRIBUTES | ClipboardFileFlags::LAST_WRITE_TIME | ClipboardFileFlags::FILE_SIZE);
++
+         Ok(Self {
+             attributes,
+             last_write_time,
+             file_size,
++            extra_flags: extra,
+             name,
+         })
+     }
+diff --git a/crates/ironrdp-connector/src/connection.rs b/crates/ironrdp-connector/src/connection.rs
+index 9a4552a..73e8d4a 100644
+--- a/crates/ironrdp-connector/src/connection.rs
++++ b/crates/ironrdp-connector/src/connection.rs
+@@ -689,7 +689,8 @@ fn create_gcc_blocks<'a>(
+                     let mut early_capability_flags = ClientEarlyCapabilityFlags::VALID_CONNECTION_TYPE
+                         | ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
+                         | ClientEarlyCapabilityFlags::STRONG_ASYMMETRIC_KEYS
+-                        | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN;
++                        | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN
++                        | ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL;
+ 
+                     // TODO(#136): support for ClientEarlyCapabilityFlags::SUPPORT_STATUS_INFO_PDU
+ 
+diff --git a/crates/ironrdp-connector/src/connection_activation.rs b/crates/ironrdp-connector/src/connection_activation.rs
+index 928e8c3..00f1f12 100644
+--- a/crates/ironrdp-connector/src/connection_activation.rs
++++ b/crates/ironrdp-connector/src/connection_activation.rs
+@@ -368,7 +368,7 @@ fn create_client_confirm_active(
+             chunk_size: Some(0), // ignored
+         }),
+         CapabilitySet::Sound(Sound {
+-            flags: SoundFlags::empty(),
++            flags: SoundFlags::BEEPS,
+         }),
+         CapabilitySet::LargePointer(LargePointer {
+             // Setting `LargePointerSupportFlags::UP_TO_384X384_PIXELS` allows server to send
+diff --git a/crates/ironrdp-dvc/src/client.rs b/crates/ironrdp-dvc/src/client.rs
+index 6d70c84..c57d5dc 100644
+--- a/crates/ironrdp-dvc/src/client.rs
++++ b/crates/ironrdp-dvc/src/client.rs
+@@ -192,10 +192,18 @@ impl SvcProcessor for DrdynvcClient {
+ 
+         match pdu {
+             DrdynvcServerPdu::Capabilities(caps_request) => {
++                #[cfg(feature = "std")]
++                eprintln!("[dvc] Got DVC Capabilities Request: {caps_request:?}");
+                 debug!("Got DVC Capabilities Request PDU: {caps_request:?}");
+                 responses.push(self.create_capabilities_response(caps_request.version()));
+             }
+             DrdynvcServerPdu::Create(create_request) => {
++                #[cfg(feature = "std")]
++                eprintln!(
++                    "[dvc] Server requests DVC channel: '{}' (id={})",
++                    create_request.channel_name(),
++                    create_request.channel_id()
++                );
+                 debug!("Got DVC Create Request PDU: {create_request:?}");
+                 let channel_id = create_request.channel_id();
+                 let channel_name = create_request.into_channel_name();
+diff --git a/crates/ironrdp-egfx/src/client.rs b/crates/ironrdp-egfx/src/client.rs
+index 19ca4de..c77bb4b 100644
+--- a/crates/ironrdp-egfx/src/client.rs
++++ b/crates/ironrdp-egfx/src/client.rs
+@@ -17,8 +17,10 @@ pub trait GraphicsPipelineHandler: Send {
+         }]
+     }
+ 
+-    fn handle_pdu(&mut self, pdu: GfxPdu) {
++    /// Handle a GFX PDU. Return `Some(reply)` to send a response (e.g. FrameAcknowledge).
++    fn handle_pdu(&mut self, pdu: GfxPdu) -> Option<GfxPdu> {
+         trace!(?pdu);
++        None
+     }
+ }
+ 
+@@ -47,7 +49,12 @@ impl DvcProcessor for GraphicsPipelineClient {
+     }
+ 
+     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
+-        let pdu = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu(self.handler.capabilities()));
++        let caps = self.handler.capabilities();
++        eprintln!(
++            "[egfx] GFX DVC opened by server (channel_id={}), sending CapabilitiesAdvertise ({} caps)",
++            _channel_id, caps.len()
++        );
++        let pdu = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu(caps));
+ 
+         Ok(vec![Box::new(pdu)])
+     }
+@@ -60,12 +67,15 @@ impl DvcProcessor for GraphicsPipelineClient {
+             .map_err(|e| decode_err!(e))?;
+ 
+         let mut cursor = ReadCursor::new(self.decompressed_buffer.as_slice());
++        let mut replies: Vec<DvcMessage> = Vec::new();
+         while !cursor.is_empty() {
+             let pdu = decode_cursor(&mut cursor).map_err(|e| decode_err!(e))?;
+-            self.handler.handle_pdu(pdu);
++            if let Some(reply) = self.handler.handle_pdu(pdu) {
++                replies.push(Box::new(reply));
++            }
+         }
+ 
+-        Ok(vec![])
++        Ok(replies)
+     }
+ }
+ 
+diff --git a/crates/ironrdp-rdpsnd-native/src/cpal.rs b/crates/ironrdp-rdpsnd-native/src/cpal.rs
+index ef33810..5c6331d 100644
+--- a/crates/ironrdp-rdpsnd-native/src/cpal.rs
++++ b/crates/ironrdp-rdpsnd-native/src/cpal.rs
+@@ -18,7 +18,7 @@ pub struct RdpsndBackend {
+     stream_handle: Option<JoinHandle<()>>,
+     stream_ended: Arc<AtomicBool>,
+     tx: Option<Sender<Vec<u8>>>,
+-    format_no: Option<usize>,
++    format_no: Option<u32>,
+ }
+ 
+ impl Default for RdpsndBackend {
+@@ -69,8 +69,8 @@ impl RdpsndClientHandler for RdpsndBackend {
+         ]
+     }
+ 
+-    fn wave(&mut self, format_no: usize, _ts: u32, data: Cow<'_, [u8]>) {
+-        if Some(format_no) != self.format_no {
++    fn wave(&mut self, format: &AudioFormat, _ts: u32, data: Cow<'_, [u8]>) {
++        if self.format_no.map_or(true, |prev| prev != format.n_samples_per_sec) {
+             debug!("New audio format");
+             self.close();
+         }
+@@ -79,11 +79,7 @@ impl RdpsndClientHandler for RdpsndBackend {
+             let (tx, rx) = mpsc::channel();
+             self.tx = Some(tx);
+ 
+-            self.format_no = Some(format_no);
+-            let Some(format) = self.get_formats().get(format_no) else {
+-                warn!(?format_no, "Invalid format_no");
+-                return;
+-            };
++            self.format_no = Some(format.n_samples_per_sec);
+             let format = format.clone();
+             self.stream_ended.store(false, Ordering::Relaxed);
+             let stream_ended = Arc::clone(&self.stream_ended);
+diff --git a/crates/ironrdp-rdpsnd/src/client.rs b/crates/ironrdp-rdpsnd/src/client.rs
+index ca640db..b42e93f 100644
+--- a/crates/ironrdp-rdpsnd/src/client.rs
++++ b/crates/ironrdp-rdpsnd/src/client.rs
+@@ -1,11 +1,10 @@
+ use std::borrow::Cow;
+-use std::collections::HashSet;
+ 
+ use ironrdp_core::{Decode as _, EncodeResult, ReadCursor, cast_length, impl_as_any};
+ use ironrdp_pdu::gcc::ChannelName;
+ use ironrdp_pdu::{PduResult, decode_err, encode_err, pdu_other_err};
+ use ironrdp_svc::{CompressionCondition, SvcClientProcessor, SvcMessage, SvcProcessor};
+-use tracing::{debug, error};
++use tracing::{debug, error, warn};
+ 
+ use crate::pdu::{self, AudioFormat, PitchPdu, ServerAudioFormatPdu, TrainingPdu, VolumePdu};
+ use crate::server::RdpsndSvcMessages;
+@@ -17,7 +16,7 @@ pub trait RdpsndClientHandler: Send + core::fmt::Debug {
+ 
+     fn get_formats(&self) -> &[AudioFormat];
+ 
+-    fn wave(&mut self, format_no: usize, ts: u32, data: Cow<'_, [u8]>);
++    fn wave(&mut self, format: &AudioFormat, ts: u32, data: Cow<'_, [u8]>);
+ 
+     fn set_volume(&mut self, volume: VolumePdu);
+ 
+@@ -34,7 +33,7 @@ impl RdpsndClientHandler for NoopRdpsndBackend {
+         &[]
+     }
+ 
+-    fn wave(&mut self, _format_no: usize, _ts: u32, _data: Cow<'_, [u8]>) {}
++    fn wave(&mut self, _format: &AudioFormat, _ts: u32, _data: Cow<'_, [u8]>) {}
+ 
+     fn set_volume(&mut self, _volume: VolumePdu) {}
+ 
+@@ -59,6 +58,7 @@ pub struct Rdpsnd {
+     handler: Box<dyn RdpsndClientHandler>,
+     state: RdpsndState,
+     server_format: Option<ServerAudioFormatPdu>,
++    negotiated_formats: Vec<AudioFormat>,
+ }
+ 
+ impl Rdpsnd {
+@@ -69,17 +69,12 @@ impl Rdpsnd {
+             handler,
+             state: RdpsndState::Start,
+             server_format: None,
++            negotiated_formats: Vec::new(),
+         }
+     }
+ 
+     pub fn get_format(&self, format_no: u16) -> PduResult<&AudioFormat> {
+-        let server_format = self
+-            .server_format
+-            .as_ref()
+-            .ok_or_else(|| pdu_other_err!("invalid state - no format"))?;
+-
+-        server_format
+-            .formats
++        self.negotiated_formats
+             .get(usize::from(format_no))
+             .ok_or_else(|| pdu_other_err!("invalid format"))
+     }
+@@ -94,22 +89,48 @@ impl Rdpsnd {
+     }
+ 
+     pub fn client_formats(&mut self) -> PduResult<RdpsndSvcMessages> {
+-        // Windows seems to be confused if the client replies with more formats, or unknown formats (e.g.: opus).
+-        // We ensure to only send supported formats in common with the server.
+-        let server_format: HashSet<_> = self
++        // Match client formats against server formats by core audio parameters only.
++        // We must NOT use HashSet intersection because AudioFormat's Hash/Eq includes
++        // the `data` field, which differs between client (None) and server (may have codec data).
++        let server_formats = &self
+             .server_format
+             .as_ref()
+             .ok_or_else(|| pdu_other_err!("invalid state - no server format"))?
+-            .formats
+-            .iter()
+-            .collect();
+-        let formats: HashSet<_> = self.handler.get_formats().iter().collect();
+-        let formats = formats.intersection(&server_format).map(|&x| x.clone()).collect();
++            .formats;
++
++        let client_formats = self.handler.get_formats();
++        let mut matched: Vec<AudioFormat> = Vec::new();
++
++        for cf in client_formats {
++            for sf in server_formats {
++                if cf.format == sf.format
++                    && cf.n_channels == sf.n_channels
++                    && cf.n_samples_per_sec == sf.n_samples_per_sec
++                    && cf.bits_per_sample == sf.bits_per_sample
++                {
++                    // Use the SERVER's format (including its data field) so the
++                    // server recognises it in subsequent wave PDUs.
++                    if !matched.iter().any(|m| m == sf) {
++                        matched.push(sf.clone());
++                    }
++                    break;
++                }
++            }
++        }
++
++        self.negotiated_formats = matched.clone();
++
++        warn!(
++            "rdpsnd: format negotiation - server={} client={} matched={}",
++            server_formats.len(),
++            client_formats.len(),
++            matched.len()
++        );
+ 
+         let pdu = pdu::ClientAudioFormatPdu {
+             version: self.version()?,
+             flags: self.handler.get_flags() | pdu::AudioFormatFlags::ALIVE,
+-            formats,
++            formats: matched,
+             volume_left: 0xFFFF,
+             volume_right: 0xFFFF,
+             pitch: 0x00010000,
+@@ -171,7 +192,12 @@ impl SvcProcessor for Rdpsnd {
+                     self.state = RdpsndState::Stop;
+                     return Ok(vec![]);
+                 };
+-                self.server_format = Some(af);
++                self.server_format = Some(af.clone());
++                warn!(
++                    "rdpsnd: received {} server audio formats, version {:?}",
++                    af.formats.len(),
++                    af.version
++                );
+                 self.state = RdpsndState::WaitingForTraining;
+                 let mut msgs: Vec<SvcMessage> = self.client_formats()?.into();
+                 if self.version()? >= pdu::Version::V6 {
+@@ -187,15 +213,28 @@ impl SvcProcessor for Rdpsnd {
+                     return Ok(vec![]);
+                 };
+                 self.state = RdpsndState::Ready;
++                warn!("rdpsnd: training complete, channel READY");
+                 self.training_confirm(&pdu)?.into()
+             }
+             RdpsndState::Ready => {
+                 match pdu {
+-                    // TODO: handle WaveInfo for < v8
+                     pdu::ServerAudioOutputPdu::Wave2(pdu) => {
+-                        let format_no = usize::from(pdu.format_no);
++                        let format = self.get_format(pdu.format_no)?.clone();
++                        warn!(
++                            "rdpsnd: wave2 format_no={} channels={} rate={} bits={}",
++                            pdu.format_no, format.n_channels, format.n_samples_per_sec, format.bits_per_sample
++                        );
+                         let ts = pdu.audio_timestamp;
+-                        self.handler.wave(format_no, ts, pdu.data);
++                        self.handler.wave(&format, ts, pdu.data);
++                        return Ok(self.wave_confirm(pdu.timestamp, pdu.block_no)?.into());
++                    }
++                    pdu::ServerAudioOutputPdu::Wave(pdu) => {
++                        let format = self.get_format(pdu.format_no)?.clone();
++                        warn!(
++                            "rdpsnd: wave format_no={} channels={} rate={} bits={}",
++                            pdu.format_no, format.n_channels, format.n_samples_per_sec, format.bits_per_sample
++                        );
++                        self.handler.wave(&format, u32::from(pdu.timestamp), pdu.data);
+                         return Ok(self.wave_confirm(pdu.timestamp, pdu.block_no)?.into());
+                     }
+                     pdu::ServerAudioOutputPdu::Volume(pdu) => {
+@@ -244,3 +283,58 @@ impl Drop for Rdpsnd {
+ }
+ 
+ impl SvcClientProcessor for Rdpsnd {}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::pdu::WaveFormat;
++
++    #[derive(Debug)]
++    struct TestHandler {
++        formats: Vec<AudioFormat>,
++    }
++
++    impl RdpsndClientHandler for TestHandler {
++        fn get_formats(&self) -> &[AudioFormat] {
++            &self.formats
++        }
++
++        fn wave(&mut self, _format: &AudioFormat, _ts: u32, _data: Cow<'_, [u8]>) {}
++
++        fn set_volume(&mut self, _volume: VolumePdu) {}
++
++        fn set_pitch(&mut self, _pitch: PitchPdu) {}
++
++        fn close(&mut self) {}
++    }
++
++    fn audio_format(format: WaveFormat, sample_rate: u32) -> AudioFormat {
++        AudioFormat {
++            format,
++            n_channels: 2,
++            n_samples_per_sec: sample_rate,
++            n_avg_bytes_per_sec: sample_rate * 4,
++            n_block_align: 4,
++            bits_per_sample: 16,
++            data: None,
++        }
++    }
++
++    #[test]
++    fn negotiated_format_numbers_index_client_format_list() {
++        let pcm = audio_format(WaveFormat::PCM, 44_100);
++        let unsupported = audio_format(WaveFormat::ALAW, 44_100);
++        let mut rdpsnd = Rdpsnd::new(Box::new(TestHandler {
++            formats: vec![pcm.clone()],
++        }));
++        rdpsnd.server_format = Some(ServerAudioFormatPdu {
++            version: pdu::Version::V8,
++            formats: vec![unsupported, pcm.clone()],
++        });
++
++        let _ = rdpsnd.client_formats().expect("format negotiation succeeds");
++
++        let selected = rdpsnd.get_format(0).expect("format 0 is negotiated");
++        assert_eq!(pcm, *selected);
++    }
++}
+diff --git a/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs b/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs
+index 7205bf3..d7416ae 100644
+--- a/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs
++++ b/crates/ironrdp-testsuite-core/tests/clipboard/mod.rs
+@@ -414,6 +414,9 @@ fn file_list_pdu_ms() {
+                     file_size: Some(
+                         44,
+                     ),
++                    extra_flags: ClipboardFileFlags(
++                        0x0,
++                    ),
+                     name: "File1.txt",
+                 },
+                 FileDescriptor {
+@@ -428,6 +431,9 @@ fn file_list_pdu_ms() {
+                     file_size: Some(
+                         10,
+                     ),
++                    extra_flags: ClipboardFileFlags(
++                        0x0,
++                    ),
+                     name: "File2.txt",
+                 },
+             ]
+diff --git a/crates/ironrdp-web/Cargo.toml b/crates/ironrdp-web/Cargo.toml
+index e990555..e4fc07a 100644
+--- a/crates/ironrdp-web/Cargo.toml
++++ b/crates/ironrdp-web/Cargo.toml
+@@ -35,11 +35,16 @@ ironrdp = { path = "../ironrdp", features = [
+     "svc",
+     "displaycontrol",
+     "pdu",
++    "rdpdr",
++    "rdpsnd",
+ ] }
+ ironrdp-core.path = "../ironrdp-core"
+ ironrdp-cliprdr-format.path = "../ironrdp-cliprdr-format"
+ ironrdp-futures.path = "../ironrdp-futures"
+ ironrdp-rdcleanpath.path = "../ironrdp-rdcleanpath"
++ironrdp-rdpdr.path = "../ironrdp-rdpdr"
++ironrdp-rdpsnd.path = "../ironrdp-rdpsnd"
++ironrdp-egfx.path = "../ironrdp-egfx"
+ ironrdp-propertyset.path = "../ironrdp-propertyset"
+ ironrdp-rdpfile.path = "../ironrdp-rdpfile"
+ iron-remote-desktop.path = "../iron-remote-desktop"
+@@ -47,13 +52,25 @@ iron-remote-desktop.path = "../iron-remote-desktop"
+ # WASM
+ wasm-bindgen = "0.2"
+ wasm-bindgen-futures = "0.4"
+-web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
++web-sys = { version = "0.3", features = [
++    "HtmlCanvasElement",
++    "WebGl2RenderingContext",
++    "WebGlTexture",
++    "WebGlProgram",
++    "WebGlShader",
++    "WebGlBuffer",
++    "WebGlUniformLocation",
++    "WebGlVertexArrayObject",
++    "WebSocket",
++    "BinaryType",
++    "Event",
++    "MessageEvent",
++] }
+ js-sys = "0.3"
+ gloo-net = { version = "0.6", default-features = false, features = ["websocket", "http", "io-util"] }
+ gloo-timers = { version = "0.3", default-features = false, features = ["futures"] }
+ 
+ # Rendering
+-softbuffer = { version = "0.4", default-features = false }
+ png = "0.18"
+ resize = { version = "0.8", features = ["std"], default-features = false }
+ rgb = "0.8"
+@@ -71,6 +88,11 @@ futures-channel = "0.3"
+ # Logging
+ tracing = { version = "0.1", features = ["log"] }
+ 
++# Serialization
++serde = { version = "1", features = ["derive"] }
++serde_json = "1"
++serde-wasm-bindgen = "0.6"
++
+ # Utils
+ anyhow = "1"
+ smallvec = "1.15"
+diff --git a/crates/ironrdp-web/src/canvas.rs b/crates/ironrdp-web/src/canvas.rs
+index 96b9df5..4bef937 100644
+--- a/crates/ironrdp-web/src/canvas.rs
++++ b/crates/ironrdp-web/src/canvas.rs
+@@ -1,93 +1,256 @@
+ use core::num::NonZeroU32;
+ 
+-use anyhow::Context as _;
++use anyhow::{Context as _, anyhow};
+ use ironrdp::pdu::geometry::{InclusiveRectangle, Rectangle as _};
+-use softbuffer::{NoDisplayHandle, NoWindowHandle};
+-use web_sys::HtmlCanvasElement;
++use wasm_bindgen::JsCast as _;
++use web_sys::{HtmlCanvasElement, WebGl2RenderingContext as GL, WebGlProgram, WebGlTexture};
++
++const VERTEX_SHADER_SRC: &str = r#"#version 300 es
++layout(location = 0) in vec2 a_pos;
++out vec2 v_uv;
++void main() {
++    // Map [-1,1] quad to [0,1] UV, flip Y for canvas coords
++    v_uv = vec2(a_pos.x * 0.5 + 0.5, 1.0 - (a_pos.y * 0.5 + 0.5));
++    gl_Position = vec4(a_pos, 0.0, 1.0);
++}
++"#;
++
++const FRAGMENT_SHADER_SRC: &str = r#"#version 300 es
++precision mediump float;
++in vec2 v_uv;
++uniform sampler2D u_texture;
++out vec4 fragColor;
++void main() {
++    fragColor = texture(u_texture, v_uv);
++}
++"#;
+ 
+ pub(crate) struct Canvas {
+-    width: NonZeroU32,
+-    surface: softbuffer::Surface<NoDisplayHandle, NoWindowHandle>,
++    gl: GL,
++    texture: WebGlTexture,
++    _program: WebGlProgram,
++    width: u32,
++    height: u32,
+ }
+ 
+ impl Canvas {
+-    pub(crate) fn new(render_canvas: HtmlCanvasElement, width: NonZeroU32, height: NonZeroU32) -> anyhow::Result<Self> {
++    pub(crate) fn new(
++        render_canvas: HtmlCanvasElement,
++        width: NonZeroU32,
++        height: NonZeroU32,
++    ) -> anyhow::Result<Self> {
+         render_canvas.set_width(width.get());
+         render_canvas.set_height(height.get());
+ 
+-        #[cfg(target_arch = "wasm32")]
+-        let mut surface = {
+-            use softbuffer::SurfaceExtWeb as _;
+-            softbuffer::Surface::from_canvas(render_canvas).expect("surface")
+-        };
++        // preserveDrawingBuffer: true lets JS call toDataURL() for thumbnails
++        let ctx_attrs = js_sys::Object::new();
++        let _ = js_sys::Reflect::set(&ctx_attrs, &"preserveDrawingBuffer".into(), &true.into());
++        let gl: GL = render_canvas
++            .get_context_with_context_options("webgl2", &ctx_attrs)
++            .map_err(|e| anyhow!("getContext failed: {e:?}"))?
++            .ok_or_else(|| anyhow!("WebGL2 not supported"))?
++            .dyn_into::<GL>()
++            .map_err(|_| anyhow!("failed to cast to WebGl2RenderingContext"))?;
+ 
+-        #[cfg(not(target_arch = "wasm32"))]
+-        let mut surface = {
+-            fn stub(_: HtmlCanvasElement) -> softbuffer::Surface<NoDisplayHandle, NoWindowHandle> {
+-                unimplemented!()
+-            }
++        // Compile shaders
++        let vs = compile_shader(&gl, GL::VERTEX_SHADER, VERTEX_SHADER_SRC)?;
++        let fs = compile_shader(&gl, GL::FRAGMENT_SHADER, FRAGMENT_SHADER_SRC)?;
+ 
+-            stub(render_canvas)
+-        };
++        let program = gl.create_program().context("create_program")?;
++        gl.attach_shader(&program, &vs);
++        gl.attach_shader(&program, &fs);
++        gl.link_program(&program);
++        if !gl
++            .get_program_parameter(&program, GL::LINK_STATUS)
++            .as_bool()
++            .unwrap_or(false)
++        {
++            let log = gl.get_program_info_log(&program).unwrap_or_default();
++            return Err(anyhow!("shader link failed: {log}"));
++        }
++        gl.use_program(Some(&program));
++
++        // Full-screen quad: 2 triangles via TRIANGLE_STRIP
++        let verts: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
++        let vbo = gl.create_buffer().context("create_buffer")?;
++        gl.bind_buffer(GL::ARRAY_BUFFER, Some(&vbo));
++        // Safety: f32 slice to u8 view for WebGL buffer upload
++        unsafe {
++            let view = js_sys::Float32Array::view(&verts);
++            gl.buffer_data_with_array_buffer_view(
++                GL::ARRAY_BUFFER,
++                &view,
++                GL::STATIC_DRAW,
++            );
++        }
+ 
+-        surface.resize(width, height).expect("surface resize");
++        let vao = gl.create_vertex_array().context("create_vao")?;
++        gl.bind_vertex_array(Some(&vao));
++        gl.enable_vertex_attrib_array(0);
++        gl.vertex_attrib_pointer_with_i32(0, 2, GL::FLOAT, false, 0, 0);
+ 
+-        Ok(Self { width, surface })
++        // Create texture
++        let texture = gl.create_texture().context("create_texture")?;
++        gl.bind_texture(GL::TEXTURE_2D, Some(&texture));
++        gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_MIN_FILTER, GL::LINEAR as i32);
++        gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_MAG_FILTER, GL::LINEAR as i32);
++        gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_WRAP_S, GL::CLAMP_TO_EDGE as i32);
++        gl.tex_parameteri(GL::TEXTURE_2D, GL::TEXTURE_WRAP_T, GL::CLAMP_TO_EDGE as i32);
++
++        // Allocate texture storage (RGBA)
++        gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
++            GL::TEXTURE_2D,
++            0,
++            GL::RGBA as i32,
++            width.get() as i32,
++            height.get() as i32,
++            0,
++            GL::RGBA,
++            GL::UNSIGNED_BYTE,
++            None,
++        )
++        .map_err(|e| anyhow!("tex_image_2d alloc failed: {e:?}"))?;
++
++        // Set texture unit uniform
++        let u_texture = gl.get_uniform_location(&program, "u_texture");
++        gl.uniform1i(u_texture.as_ref(), 0);
++
++        gl.viewport(0, 0, width.get() as i32, height.get() as i32);
++
++        Ok(Self {
++            gl,
++            texture,
++            _program: program,
++            width: width.get(),
++            height: height.get(),
++        })
+     }
+ 
+     pub(crate) fn resize(&mut self, width: NonZeroU32, height: NonZeroU32) {
+-        self.surface.resize(width, height).expect("surface resize");
+-        self.width = width;
++        self.width = width.get();
++        self.height = height.get();
++
++        self.gl.bind_texture(GL::TEXTURE_2D, Some(&self.texture));
++        let _ = self
++            .gl
++            .tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
++                GL::TEXTURE_2D,
++                0,
++                GL::RGBA as i32,
++                self.width as i32,
++                self.height as i32,
++                0,
++                GL::RGBA,
++                GL::UNSIGNED_BYTE,
++                None,
++            );
++
++        self.gl
++            .viewport(0, 0, self.width as i32, self.height as i32);
+     }
+ 
+-    pub(crate) fn draw(&mut self, buffer: &[u8], region: InclusiveRectangle) -> anyhow::Result<()> {
+-        let region_width = region.width();
+-        let region_height = region.height();
++    /// Upload a dirty region of RGBA pixels to the GPU texture and redraw.
++    ///
++    /// `buffer` contains packed RGBA pixels for the region specified by `region`.
++    /// The region may span the full image width (when `extract_whole_rows` was used)
++    /// or be a smaller sub-rectangle.
++    pub(crate) fn draw(&self, buffer: &[u8], region: InclusiveRectangle) -> anyhow::Result<()> {
++        let x = i32::from(region.left);
++        let y = i32::from(region.top);
++        let w = i32::from(region.width());
++        let h = i32::from(region.height());
+ 
+-        let mut src = buffer.chunks_exact(4).map(|pixel| {
+-            let r = pixel[0];
+-            let g = pixel[1];
+-            let b = pixel[2];
+-            u32::from_be_bytes([0, r, g, b])
+-        });
++        if w == 0 || h == 0 {
++            return Ok(());
++        }
+ 
+-        let mut dst = self.surface.buffer_mut().expect("surface buffer");
++        self.gl.bind_texture(GL::TEXTURE_2D, Some(&self.texture));
+ 
+-        {
+-            // Copy src into dst
+-
+-            let region_top_usize = usize::from(region.top);
+-            let region_height_usize = usize::from(region_height);
+-            let region_left_usize = usize::from(region.left);
+-            let region_width_usize = usize::from(region_width);
+-
+-            for dst_row in dst
+-                .chunks_exact_mut(usize::try_from(self.width.get()).context("canvas width")?)
+-                .skip(region_top_usize)
+-                .take(region_height_usize)
+-            {
+-                let src_row = src.by_ref().take(region_width_usize);
+-
+-                dst_row
+-                    .iter_mut()
+-                    .skip(region_left_usize)
+-                    .take(region_width_usize)
+-                    .zip(src_row)
+-                    .for_each(|(dst, src)| *dst = src);
+-            }
++        // Upload only the dirty region to GPU texture
++        self.gl
++            .tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_u8_array(
++                GL::TEXTURE_2D,
++                0,
++                x,
++                y,
++                w,
++                h,
++                GL::RGBA,
++                GL::UNSIGNED_BYTE,
++                Some(buffer),
++            )
++            .map_err(|e| anyhow!("tex_sub_image_2d failed: {e:?}"))?;
++
++        // Draw full-screen quad (the shader samples the updated texture)
++        self.gl.draw_arrays(GL::TRIANGLE_STRIP, 0, 4);
++
++        Ok(())
++    }
++
++    /// Zero-copy upload: uses UNPACK_ROW_LENGTH to read a sub-rect from a strided buffer
++    /// without copying pixel data. The `data` slice covers full rows of the image,
++    /// and `image_width` is the stride in pixels.
++    pub(crate) fn draw_strided(
++        &self,
++        data: &[u8],
++        region: InclusiveRectangle,
++        image_width: u32,
++    ) -> anyhow::Result<()> {
++        let x = i32::from(region.left);
++        let y = i32::from(region.top);
++        let w = i32::from(region.width());
++        let h = i32::from(region.height());
++
++        if w == 0 || h == 0 {
++            return Ok(());
+         }
+ 
+-        let damage_rect = softbuffer::Rect {
+-            x: u32::from(region.left),
+-            y: u32::from(region.top),
+-            width: NonZeroU32::new(u32::from(region_width))
+-                .expect("per InclusiveRectangle invariants: 0 < region_width"),
+-            height: NonZeroU32::new(u32::from(region_height))
+-                .expect("per InclusiveRectangle invariants: 0 < region_height"),
+-        };
++        self.gl.bind_texture(GL::TEXTURE_2D, Some(&self.texture));
+ 
+-        dst.present_with_damage(&[damage_rect]).expect("buffer present");
++        // Tell WebGL2 the row stride of the source buffer
++        self.gl.pixel_storei(GL::UNPACK_ROW_LENGTH, image_width as i32);
++        self.gl.pixel_storei(GL::UNPACK_SKIP_PIXELS, x);
++        self.gl.pixel_storei(GL::UNPACK_SKIP_ROWS, 0); // data already starts at region.top
++
++        self.gl
++            .tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_u8_array(
++                GL::TEXTURE_2D,
++                0,
++                x,
++                y,
++                w,
++                h,
++                GL::RGBA,
++                GL::UNSIGNED_BYTE,
++                Some(data),
++            )
++            .map_err(|e| anyhow!("tex_sub_image_2d strided failed: {e:?}"))?;
++
++        // Reset pixel store state
++        self.gl.pixel_storei(GL::UNPACK_ROW_LENGTH, 0);
++        self.gl.pixel_storei(GL::UNPACK_SKIP_PIXELS, 0);
++        self.gl.pixel_storei(GL::UNPACK_SKIP_ROWS, 0);
+ 
+         Ok(())
+     }
++
++    /// Render the current texture to screen. Call after one or more draw_strided uploads.
++    pub(crate) fn flush(&self) {
++        self.gl.draw_arrays(GL::TRIANGLE_STRIP, 0, 4);
++    }
++}
++
++fn compile_shader(gl: &GL, shader_type: u32, source: &str) -> anyhow::Result<web_sys::WebGlShader> {
++    let shader = gl.create_shader(shader_type).context("create_shader")?;
++    gl.shader_source(&shader, source);
++    gl.compile_shader(&shader);
++    if !gl
++        .get_shader_parameter(&shader, GL::COMPILE_STATUS)
++        .as_bool()
++        .unwrap_or(false)
++    {
++        let log = gl.get_shader_info_log(&shader).unwrap_or_default();
++        return Err(anyhow!("shader compile failed: {log}"));
++    }
++    Ok(shader)
+ }
+diff --git a/crates/ironrdp-web/src/clipboard.rs b/crates/ironrdp-web/src/clipboard.rs
+index 9557741..a5448fd 100644
+--- a/crates/ironrdp-web/src/clipboard.rs
++++ b/crates/ironrdp-web/src/clipboard.rs
+@@ -11,18 +11,23 @@
+ //! requested: when pasting into notepad, which does not support "text/html", "text/plain"
+ //! will be requested, and when pasting into WordPad, "text/html" will be requested.
+ 
+-use std::collections::HashMap;
++use std::collections::{HashMap, HashSet};
++use std::rc::Rc;
++use std::cell::{Cell, RefCell};
++
++use serde::{Deserialize, Serialize};
+ 
+ use futures_channel::mpsc;
+ use iron_remote_desktop::ClipboardData as _;
+ use ironrdp::cliprdr::backend::{ClipboardMessage, CliprdrBackend};
+ use ironrdp::cliprdr::pdu::{
+-    ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags, FileContentsRequest,
+-    FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
++    ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags, FORMAT_NAME_FILE_LIST,
++    FileContentsRequest, FileContentsResponse, FileDescriptor, FormatDataRequest, FormatDataResponse, LockDataId,
++    PackedFileList,
+ };
+ use ironrdp_cliprdr_format::bitmap::{dib_to_png, dibv5_to_png, png_to_cf_dibv5};
+ use ironrdp_cliprdr_format::html::{cf_html_to_plain_html, plain_html_to_cf_html};
+-use ironrdp_core::{IntoOwned as _, impl_as_any};
++use ironrdp_core::{IntoOwned as _, encode_vec, impl_as_any};
+ use tracing::{error, trace, warn};
+ use wasm_bindgen::prelude::*;
+ 
+@@ -31,6 +36,7 @@ use crate::session::RdpInputEvent;
+ const MIME_TEXT: &str = "text/plain";
+ const MIME_HTML: &str = "text/html";
+ const MIME_PNG: &str = "image/png";
++const MIME_FILE: &str = "application/x-rdp-file";
+ 
+ #[derive(Clone, Copy)]
+ struct ClientFormatDescriptor {
+@@ -54,6 +60,7 @@ const FORMAT_WIN_HTML_ID: ClipboardFormatId = ClipboardFormatId(0xC001);
+ const FORMAT_MIME_HTML_ID: ClipboardFormatId = ClipboardFormatId(0xC002);
+ const FORMAT_PNG_ID: ClipboardFormatId = ClipboardFormatId(0xC003);
+ const FORMAT_MIME_PNG_ID: ClipboardFormatId = ClipboardFormatId(0xC004);
++const FORMAT_FILE_LIST_ID: ClipboardFormatId = ClipboardFormatId(0xC005);
+ 
+ const FORMAT_WIN_HTML_NAME: &str = "HTML Format";
+ const FORMAT_MIME_HTML_NAME: &str = "text/html";
+@@ -65,6 +72,8 @@ const FORMAT_MIME_HTML: ClientFormatDescriptor =
+     ClientFormatDescriptor::new(FORMAT_MIME_HTML_ID, FORMAT_MIME_HTML_NAME);
+ const FORMAT_PNG: ClientFormatDescriptor = ClientFormatDescriptor::new(FORMAT_PNG_ID, FORMAT_PNG_NAME);
+ const FORMAT_MIME_PNG: ClientFormatDescriptor = ClientFormatDescriptor::new(FORMAT_MIME_PNG_ID, FORMAT_MIME_PNG_NAME);
++const FORMAT_FILE_LIST: ClientFormatDescriptor =
++    ClientFormatDescriptor::new(FORMAT_FILE_LIST_ID, FORMAT_NAME_FILE_LIST);
+ 
+ /// Message proxy used to send clipboard-related messages to the application main event loop
+ #[derive(Debug, Clone)]
+@@ -106,6 +115,11 @@ pub(crate) enum WasmClipboardBackendMessage {
+     RemoteDataResponse(FormatDataResponse<'static>),
+ 
+     ForceClipboardUpdate,
++
++    // File transfer messages
++    FileContentsRequest(FileContentsRequest),
++    FileContentsResponse(FileContentsResponse<'static>),
++    LockClipboard(u32),
+ }
+ 
+ /// Clipboard backend implementation for web. This object should be created once per session and
+@@ -117,14 +131,39 @@ pub(crate) struct WasmClipboard {
+     remote_mapping: HashMap<ClipboardFormatId, String>,
+     remote_formats_to_read: Vec<ClipboardFormatId>,
+ 
++    // File transfer state
++    local_files: Vec<Vec<u8>>,               // Stored local file bytes (indexed by file order)
++    local_file_paths: Vec<String>,           // File paths for lazy loading (indexed by file order)
++    local_file_sizes: Vec<u64>,              // Actual file sizes (indexed by file order)
++    remote_file_descriptors: Vec<FileInfo>,  // File descriptors from remote
++    pending_chunked_downloads: HashMap<u32, PendingChunkedDownload>, // stream_id -> chunked download state
++    next_stream_id: u32,
++    last_lock_data_id: Option<u32>,
++    force_update_pending: bool, // Defer ForceClipboardUpdate until file download completes
++    total_files_to_download: usize, // Total number of remote files expected
++    files_completed: usize,        // Number of files fully downloaded
++    download_generation: u64,      // Incremented on each new remote FormatList to detect stale responses
++    last_committed_descriptors: Vec<FileInfo>, // Dedup: skip re-download if identical to last committed
++
++    /// Tracks in-flight async file reads to prevent clipboard update race conditions.
++    active_transfer_count: Rc<Cell<u32>>,
++    /// When a clipboard update arrives during an active transfer, store it here to replay later.
++    pending_clipboard_update: Option<ClipboardData>,
++
+     proxy: WasmClipboardMessageProxy,
+     js_callbacks: JsClipboardCallbacks,
++    file_read_callback: Option<Rc<RefCell<js_sys::Function>>>,
++    file_transfer_ws: Option<web_sys::WebSocket>,
++    file_transfer_ws_ready: Rc<Cell<bool>>,
+ }
+ 
+ /// Callbacks, required to interact with JS code from within the backend.
+ pub(crate) struct JsClipboardCallbacks {
+     pub(crate) on_remote_clipboard_changed: js_sys::Function,
+     pub(crate) on_force_clipboard_update: Option<js_sys::Function>,
++    pub(crate) on_file_contents_request: Option<js_sys::Function>,
++    pub(crate) on_file_contents_response: Option<js_sys::Function>,
++    pub(crate) on_file_chunk: Option<js_sys::Function>,
+ }
+ 
+ impl WasmClipboard {
+@@ -137,6 +176,24 @@ impl WasmClipboard {
+ 
+             remote_mapping: HashMap::new(),
+             remote_formats_to_read: Vec::new(),
++
++            local_files: Vec::new(),
++            local_file_paths: Vec::new(),
++            local_file_sizes: Vec::new(),
++            remote_file_descriptors: Vec::new(),
++            pending_chunked_downloads: HashMap::new(),
++            next_stream_id: 1,
++            last_lock_data_id: None,
++            force_update_pending: false,
++            total_files_to_download: 0,
++            files_completed: 0,
++            download_generation: 0,
++            last_committed_descriptors: Vec::new(),
++            active_transfer_count: Rc::new(Cell::new(0)),
++            pending_clipboard_update: None,
++            file_read_callback: None,
++            file_transfer_ws: None,
++            file_transfer_ws_ready: Rc::new(Cell::new(false)),
+         }
+     }
+ 
+@@ -147,6 +204,50 @@ impl WasmClipboard {
+         }
+     }
+ 
++    /// Set the JS callback for async file reads (lazy loading)
++    /// Callback signature: (path: string, offset: number, length: number) => Promise<Uint8Array>
++    pub(crate) fn set_file_read_callback(&mut self, callback: js_sys::Function) {
++        self.file_read_callback = Some(Rc::new(RefCell::new(callback)));
++    }
++
++    /// Connect to the file transfer WebSocket for large file bypass (≥2MB).
++    /// Data is pushed directly to the Rust backend, skipping the JS callback path.
++    pub(crate) fn set_file_transfer_ws_port(&mut self, port: u16) {
++        use wasm_bindgen::closure::Closure;
++        use wasm_bindgen::JsCast;
++
++        let url = format!("ws://127.0.0.1:{}", port);
++        match web_sys::WebSocket::new(&url) {
++            Ok(ws) => {
++                ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
++
++                let ready = self.file_transfer_ws_ready.clone();
++                let onopen = Closure::wrap(Box::new(move |_: web_sys::Event| {
++                    ready.set(true);
++                    warn!("[cliprdr] File transfer WS connected");
++                }) as Box<dyn FnMut(_)>);
++                ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
++                onopen.forget(); // leak closure (lives for session lifetime)
++
++                let onerror = Closure::wrap(Box::new(move |_: web_sys::Event| {
++                    warn!("[cliprdr] File transfer WS error");
++                }) as Box<dyn FnMut(_)>);
++                ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
++                onerror.forget();
++
++                self.file_transfer_ws = Some(ws);
++                warn!("[cliprdr] File transfer WS connecting to {}", url);
++            }
++            Err(e) => {
++                warn!("[cliprdr] Failed to create file transfer WS: {:?}", e);
++            }
++        }
++    }
++
++    /// Set file paths for lazy loading (indexed by file order)
++    pub(crate) fn set_local_file_paths(&mut self, paths: Vec<String>) {
++        self.local_file_paths = paths;
++    }
+     fn handle_local_clipboard_changed(
+         &mut self,
+         clipboard_data: ClipboardData,
+@@ -173,10 +274,69 @@ impl WasmClipboard {
+                         FORMAT_MIME_PNG.into(),
+                     ]);
+                 }
++                MIME_FILE => {
++                    // File transfer via CLIPRDR: advertise FileGroupDescriptorW format
++                    formats.push(FORMAT_FILE_LIST.into());
++                }
+                 _ => {}
+             };
+         });
+ 
++        // --- Transfer lock: defer clipboard update if async file reads are in-flight ---
++        if self.active_transfer_count.get() > 0 {
++            warn!("handle_local_clipboard_changed: transfer in progress (count={}), deferring clipboard update",
++                self.active_transfer_count.get());
++            self.pending_clipboard_update = Some(clipboard_data);
++            return Ok(Vec::new());
++        }
++
++        // Extract and store file info for FileContentsRequest handling
++        self.local_files.clear();
++        self.local_file_paths.clear();
++        self.local_file_sizes.clear();
++
++        // First, parse file descriptors to get sizes
++        let mut descriptor_sizes: Vec<u64> = Vec::new();
++        for item in clipboard_data.items() {
++            if item.mime_type == MIME_FILE {
++                if let ClipboardItemValue::Binary(data) = &item.value {
++                    if let Ok(json_str) = std::str::from_utf8(data) {
++                        #[derive(Deserialize)]
++                        struct FileDesc { size: u64 }
++                        if let Ok(descs) = serde_json::from_str::<Vec<FileDesc>>(json_str) {
++                            descriptor_sizes = descs.into_iter().map(|d| d.size).collect();
++                            warn!("Parsed {} file descriptors with sizes: {:?}", descriptor_sizes.len(), descriptor_sizes);
++                        }
++                    }
++                }
++            }
++        }
++
++        let mut file_idx = 0usize;
++        for item in clipboard_data.items() {
++            // Files are stored with their filename as MIME type (not standard MIME)
++            if !matches!(item.mime_type.as_str(), MIME_TEXT | MIME_HTML | MIME_PNG | MIME_FILE) {
++                match &item.value {
++                    ClipboardItemValue::Binary(data) if !data.is_empty() => {
++                        // Has data in memory
++                        warn!("Stored local file (in-memory): {} ({} bytes)", item.mime_type, data.len());
++                        self.local_file_sizes.push(data.len() as u64);
++                        self.local_files.push(data.clone());
++                        self.local_file_paths.push(String::new());
++                    }
++                    _ => {
++                        // No data — lazy: get size from descriptor, path from mime_type
++                        let size = descriptor_sizes.get(file_idx).copied().unwrap_or(0);
++                        warn!("Stored local file (path-only): {} size={}", item.mime_type, size);
++                        self.local_file_sizes.push(size);
++                        self.local_files.push(Vec::new());
++                        self.local_file_paths.push(item.mime_type.clone());
++                    }
++                }
++                file_idx += 1;
++            }
++        }
++
+         self.local_clipboard = Some(clipboard_data);
+ 
+         trace!("Sending clipboard formats: {:?}", formats);
+@@ -249,6 +409,30 @@ impl WasmClipboard {
+                 let png_data = find_binary_content_by_mime(MIME_PNG)?;
+                 FormatDataResponse::new_data(png_data)
+             }
++            FORMAT_FILE_LIST_ID => {
++                // Build FileGroupDescriptorW from file metadata stored as binary
++                let file_data = find_binary_content_by_mime(MIME_FILE)?;
++                // The binary data is a JSON-encoded array of file descriptors from JS
++                let file_infos: Vec<FileInfo> = serde_json::from_slice(file_data)
++                    .map_err(|e| anyhow::anyhow!("Failed to parse file info: {}", e))?;
++                let file_list = PackedFileList {
++                    files: file_infos
++                        .iter()
++                        .map(|info| {
++                            use ironrdp::cliprdr::pdu::{ClipboardFileAttributes, ClipboardFileFlags};
++                            FileDescriptor {
++                                name: info.name.clone(),
++                                file_size: Some(info.size),
++                                attributes: Some(ClipboardFileAttributes::ARCHIVE),
++                                last_write_time: None,
++                                extra_flags: ClipboardFileFlags::PROGRESS_UI,
++                            }
++                        })
++                        .collect(),
++                };
++                let buf = encode_vec(&file_list).map_err(|e| anyhow::anyhow!("Failed to encode file list: {}", e))?;
++                FormatDataResponse::new_data(buf)
++            }
+             _ => {
+                 anyhow::bail!("Unknown format id requested: {}", format.value());
+             }
+@@ -286,6 +470,7 @@ impl WasmClipboard {
+                         FORMAT_MIME_HTML.name,
+                         FORMAT_PNG.name,
+                         FORMAT_MIME_PNG.name,
++                        FORMAT_NAME_FILE_LIST,
+                     ];
+ 
+                     if !SUPPORTED_FORMATS.iter().any(|supported| *supported == name.value()) {
+@@ -406,6 +591,43 @@ impl WasmClipboard {
+                     Some(FORMAT_MIME_PNG_NAME) | Some(FORMAT_PNG_NAME) => {
+                         Some(ClipboardItem::new_binary(MIME_PNG, response.data().to_owned()))
+                     }
++                    Some(FORMAT_NAME_FILE_LIST) => {
++                        // Decode FileGroupDescriptorW from remote
++                        match ironrdp_core::Decode::decode(&mut ironrdp_core::ReadCursor::new(response.data())) {
++                            Ok(file_list) => {
++                                let file_list: PackedFileList = file_list;
++                                let file_infos: Vec<FileInfo> = file_list
++                                    .files
++                                    .iter()
++                                    .map(|fd| FileInfo {
++                                        name: fd.name.clone(),
++                                        size: fd.file_size.unwrap_or(0),
++                                    })
++                                    .collect();
++
++                                // Store descriptors (download will be triggered separately)
++                                self.remote_file_descriptors = file_infos.clone();
++                                self.pending_chunked_downloads.clear();
++
++                                warn!(
++                                    "Stored {} remote file descriptors (download deferred)",
++                                    file_infos.len()
++                                );
++
++                                match serde_json::to_vec(&file_infos) {
++                                    Ok(json) => Some(ClipboardItem::new_binary(MIME_FILE, json)),
++                                    Err(e) => {
++                                        warn!("FileGroupDescriptorW JSON encode error: {}", e);
++                                        None
++                                    }
++                                }
++                            }
++                            Err(e) => {
++                                warn!("FileGroupDescriptorW decode error: {}", e);
++                                None
++                            }
++                        }
++                    }
+                     _ => {
+                         // Not supported format
+                         None
+@@ -427,9 +649,73 @@ impl WasmClipboard {
+             let clipboard_data = core::mem::take(&mut self.remote_clipboard);
+ 
+             if clipboard_data.is_empty() {
++                // No remote data. Fire deferred update if pending.
++                if self.force_update_pending {
++                    self.fire_deferred_force_update();
++                }
+                 return Ok(());
+             }
+ 
++            // Check if there are file descriptors → need to download before sending our FormatList
++            if !self.remote_file_descriptors.is_empty() {
++                // Dedup: skip if identical to last committed descriptors (feedback loop prevention)
++                if self.remote_file_descriptors == self.last_committed_descriptors {
++                    warn!(
++                        "Skipping download: {} files identical to last committed (feedback loop)",
++                        self.remote_file_descriptors.len()
++                    );
++                    self.remote_file_descriptors.clear();
++                    if self.force_update_pending {
++                        self.fire_deferred_force_update();
++                    }
++                } else {
++                // Increment generation to invalidate any in-flight downloads from previous clipboard
++                self.download_generation += 1;
++                self.total_files_to_download = self.remote_file_descriptors.len();
++                self.files_completed = 0;
++                self.pending_chunked_downloads.clear();
++                let cur_gen = self.download_generation;
++                warn!(
++                    "Remote has {} files, starting direct DATA download (gen={})",
++                    self.remote_file_descriptors.len(), cur_gen
++                );
++                use ironrdp::cliprdr::pdu::FileContentsFlags;
++                // Skip SIZE phase — use fi.size from FileGroupDescriptorW directly
++                for (i, fi) in self.remote_file_descriptors.clone().iter().enumerate() {
++                    let file_size = fi.size;
++                    let chunk_size = std::cmp::min(DOWNLOAD_CHUNK_SIZE, file_size);
++                    let stream_id = self.next_stream_id;
++                    self.next_stream_id += 1;
++
++                    self.pending_chunked_downloads.insert(stream_id, PendingChunkedDownload {
++                        file_index: i,
++                        file_name: fi.name.clone(),
++                        total_size: file_size,
++                        bytes_received: 0,
++                        generation: cur_gen,
++                    });
++
++                    warn!(
++                        "Requesting file DATA chunk: stream_id={}, index={}, name={}, offset=0, chunk_size={}, total={}",
++                        stream_id, i, fi.name, chunk_size, file_size
++                    );
++                    let request = FileContentsRequest {
++                        stream_id,
++                        index: i as u32,
++                        flags: FileContentsFlags::DATA,
++                        position: 0,
++                        requested_size: chunk_size as u32,
++                        data_id: None,
++                    };
++                    self.proxy
++                        .send_cliprdr_message(ClipboardMessage::SendFileContentsRequest(request));
++                }
++                } // end else (not dedup)
++            } else if self.force_update_pending {
++                // No files to download, fire deferred update now
++                self.fire_deferred_force_update();
++            }
++
+             // Set clipboard when all formats were read.
+             self.js_callbacks
+                 .on_remote_clipboard_changed
+@@ -443,17 +729,52 @@ impl WasmClipboard {
+         Ok(())
+     }
+ 
++    /// Fire the deferred ForceClipboardUpdate callback now that file download is complete.
++    fn fire_deferred_force_update(&mut self) {
++        self.force_update_pending = false;
++        warn!("Firing deferred ForceClipboardUpdate → sending local clipboard to server");
++        self.request_local_clipboard_update();
++    }
++
++    fn request_local_clipboard_update(&mut self) {
++        if let Some(callback) = self.js_callbacks.on_force_clipboard_update.as_mut() {
++            callback.call0(&JsValue::NULL).expect("failed to call JS callback");
++        } else {
++            // No callback, send empty format list
++            self.proxy
++                .send_cliprdr_message(ClipboardMessage::SendInitiateCopy(Vec::new()));
++        }
++    }
++
++    fn should_defer_force_update(&self) -> bool {
++        !self.remote_formats_to_read.is_empty()
++            || !self.remote_file_descriptors.is_empty()
++            || !self.pending_chunked_downloads.is_empty()
++    }
++
+     /// Process backend event. This method should be called from the main event loop.
+     pub(crate) fn process_event(&mut self, event: WasmClipboardBackendMessage) -> anyhow::Result<()> {
+         match event {
+             WasmClipboardBackendMessage::LocalClipboardChanged(clipboard_data) => {
++                // Block outgoing FormatList while waiting for remote file download
++                if self.force_update_pending {
++                    if self.should_defer_force_update() {
++                        warn!("Blocking local FormatList (force_update_pending) to preserve remote file data");
++                        return Ok(());
++                    }
++
++                    warn!("Clearing stale force_update_pending before sending local clipboard");
++                    self.force_update_pending = false;
++                }
+                 match self.handle_local_clipboard_changed(clipboard_data) {
+                     Ok(formats) => {
+-                        self.proxy
+-                            .send_cliprdr_message(ClipboardMessage::SendInitiateCopy(formats));
++                        if !formats.is_empty() {
++                            self.proxy
++                                .send_cliprdr_message(ClipboardMessage::SendInitiateCopy(formats));
++                        }
++                        // empty formats = deferred by transfer lock, don't send
+                     }
+                     Err(e) => {
+-                        // Not a critical error, we could skip single clipboard update.
+                         error!(error = format!("{e:#}"), "Failed to handle local clipboard change");
+                     }
+                 }
+@@ -495,16 +816,372 @@ impl WasmClipboard {
+                 }
+             }
+             WasmClipboardBackendMessage::ForceClipboardUpdate => {
+-                if let Some(callback) = self.js_callbacks.on_force_clipboard_update.as_mut() {
+-                    callback.call0(&JsValue::NULL).expect("failed to call JS callback");
++                // Skip clipboard update while we have local files staged for transfer.
++                // local_file_paths is populated when files are prepared and persists
++                // throughout the entire transfer, unlike active_transfer_count which
++                // resets between individual chunk reads.
++                if !self.local_file_paths.is_empty() {
++                    warn!("ForceClipboardUpdate: skipping (file transfer in progress, {} files staged)",
++                        self.local_file_paths.len());
++                    return Ok(());
++                }
++                // Defer only when remote clipboard sync/file download is actually in progress.
++                if self.should_defer_force_update() {
++                    warn!("ForceClipboardUpdate: deferring until remote clipboard processed");
++                    self.force_update_pending = true;
+                 } else {
+-                    // If no initial clipboard callback was set, send empty format list instead
+-                    return self
+-                        .process_event(WasmClipboardBackendMessage::LocalClipboardChanged(ClipboardData::new()));
++                    warn!("ForceClipboardUpdate: no remote clipboard sync in progress, requesting local clipboard now");
++                    self.force_update_pending = false;
++                    self.request_local_clipboard_update();
++                }
++            }
++            WasmClipboardBackendMessage::FileContentsRequest(request) => {
++                // Local → Remote: respond with stored local file data
++                let index = request.index as usize;
++                trace!(
++                    "FileContentsRequest: stream_id={}, index={}, flags={:?}, pos={}, size={}",
++                    request.stream_id, request.index, request.flags, request.position, request.requested_size
++                );
++
++                if let Some(callback) = self.js_callbacks.on_file_contents_request.as_mut() {
++                    let js_request = serde_wasm_bindgen::to_value(&FileContentsRequestJs {
++                        stream_id: request.stream_id,
++                        index: request.index,
++                        flags: request.flags.bits(),
++                        position: request.position,
++                        requested_size: request.requested_size,
++                        data_id: request.data_id,
++                    })
++                    .unwrap_or(JsValue::NULL);
++                    let _ = callback.call1(&JsValue::NULL, &js_request);
++                }
++
++                if index >= self.local_files.len() {
++                    warn!(
++                        "FileContentsRequest index {} out of range (have {} files)",
++                        index,
++                        self.local_files.len()
++                    );
++                } else {
++                    let file_data = &self.local_files[index];
++                    use ironrdp::cliprdr::pdu::FileContentsFlags;
++
++                    if request.flags.contains(FileContentsFlags::SIZE) {
++                        // SIZE request: use stored size (handles lazy files correctly)
++                        let size = self.local_file_sizes.get(index).copied().unwrap_or(file_data.len() as u64);
++                        warn!("FileContentsRequest SIZE response: {} bytes", size);
++                        let response = FileContentsResponse::new_size_response(request.stream_id, size);
++                        self.proxy
++                            .send_cliprdr_message(ClipboardMessage::SendFileContentsResponse(response));
++                    } else if !file_data.is_empty() {
++                        // DATA request: data in memory — respond immediately
++                        let offset = request.position as usize;
++                        let max_len = request.requested_size as usize;
++                        let end = std::cmp::min(offset + max_len, file_data.len());
++                        let chunk = if offset < file_data.len() {
++                            &file_data[offset..end]
++                        } else {
++                            &[] as &[u8]
++                        };
++                        trace!(
++                            "FileContentsRequest DATA response (sync): offset={}, len={}",
++                            offset,
++                            chunk.len()
++                        );
++                        let response = FileContentsResponse::new_data_response(request.stream_id, chunk.to_vec());
++                        self.proxy
++                            .send_cliprdr_message(ClipboardMessage::SendFileContentsResponse(response));
++                    } else if let Some(cb) = &self.file_read_callback {
++                        // DATA request: no data in memory — use async JS read
++                        let path = self.local_file_paths.get(index).cloned().unwrap_or_default();
++                        trace!(
++                            "FileContentsRequest DATA (async): path={}, offset={}, len={}",
++                            path, request.position, request.requested_size
++                        );
++                        let cb = cb.clone();
++                        let proxy = self.proxy.clone();
++                        let stream_id = request.stream_id;
++                        let offset = request.position;
++                        let length = request.requested_size;
++                        let transfer_count = self.active_transfer_count.clone();
++
++                        // Increment transfer count to block clipboard updates
++                        transfer_count.set(transfer_count.get() + 1);
++                        trace!("[cliprdr] active transfers: {}", transfer_count.get());
++
++                        wasm_bindgen_futures::spawn_local(async move {
++                            let cb_ref = cb.borrow();
++                            let js_path = JsValue::from_str(&path);
++                            let js_offset = JsValue::from_f64(offset as f64);
++                            let js_length = JsValue::from_f64(length as f64);
++                            let result = cb_ref.call3(&JsValue::NULL, &js_path, &js_offset, &js_length);
++                            match result {
++                                Ok(promise_val) => {
++                                    let promise = js_sys::Promise::from(promise_val);
++                                    match wasm_bindgen_futures::JsFuture::from(promise).await {
++                                        Ok(js_val) => {
++                                            let data = js_sys::Uint8Array::from(js_val).to_vec();
++                                            trace!("[cliprdr] async read complete: {} bytes", data.len());
++                                            let response = FileContentsResponse::new_data_response(stream_id, data);
++                                            proxy.send_cliprdr_message(
++                                                ClipboardMessage::SendFileContentsResponse(response),
++                                            );
++                                        }
++                                        Err(e) => {
++                                            warn!("[cliprdr] async read failed: {:?}", e);
++                                            let response = FileContentsResponse::new_data_response(stream_id, Vec::new());
++                                            proxy.send_cliprdr_message(
++                                                ClipboardMessage::SendFileContentsResponse(response),
++                                            );
++                                        }
++                                    }
++                                }
++                                Err(e) => {
++                                    warn!("[cliprdr] callback call failed: {:?}", e);
++                                    let response = FileContentsResponse::new_data_response(stream_id, Vec::new());
++                                    proxy.send_cliprdr_message(
++                                        ClipboardMessage::SendFileContentsResponse(response),
++                                    );
++                                }
++                            }
++
++                            // Decrement transfer count
++                            let prev = transfer_count.get();
++                            transfer_count.set(prev.saturating_sub(1));
++                            trace!("[cliprdr] async read done, active transfers: {}", transfer_count.get());
++                        });
++                    } else {
++                        warn!("FileContentsRequest DATA: no data and no callback for index {}", index);
++                    }
+                 }
+             }
++            WasmClipboardBackendMessage::FileContentsResponse(response) => {
++                let stream_id = response.stream_id();
++                let data = response.data();
++                trace!("FileContentsResponse: stream_id={}, data_len={}", stream_id, data.len());
++
++                // DATA chunk response → stream to JS, request next chunk
++                if let Some(mut download) = self.pending_chunked_downloads.remove(&stream_id) {
++                    // Check generation — ignore stale responses from previous clipboard
++                    if download.generation != self.download_generation {
++                        warn!(
++                            "Ignoring stale response: stream_id={}, gen={} (current={})",
++                            stream_id, download.generation, self.download_generation
++                        );
++                        // Don't re-insert, just discard
++                    } else {
++                    let offset = download.bytes_received;
++                    download.bytes_received += data.len() as u64;
++                    let is_last_chunk = download.bytes_received >= download.total_size;
++
++                    let is_last_file = is_last_chunk && {
++                        self.files_completed + 1 >= self.total_files_to_download
++                            && self.pending_chunked_downloads.is_empty()
++                    };
++
++                    trace!(
++                        "DATA chunk: file_index={}, offset={}, chunk_len={}, received={}/{}, last_chunk={}, last_file={}",
++                        download.file_index, offset, data.len(),
++                        download.bytes_received, download.total_size,
++                        is_last_chunk, is_last_file,
++                    );
++
++                    // Pre-extract fields needed by both WS and JS paths (avoids move issues)
++                    let dl_file_name = download.file_name.clone();
++                    let dl_file_index = download.file_index;
++                    let dl_total_size = download.total_size;
++                    let dl_bytes_received = download.bytes_received;
++
++                    // === WS BYPASS: push large file chunks directly to Rust backend ===
++                    let ws_handled = if download.total_size >= 2 * 1024 * 1024
++                        && self.file_transfer_ws.is_some()
++                        && self.file_transfer_ws_ready.get()
++                    {
++                        let ws = self.file_transfer_ws.as_ref().unwrap();
++
++                        // First chunk of this file → send FILE_BEGIN
++                        if offset == 0 {
++                            let name_bytes = download.file_name.as_bytes();
++                            let session_id = format!("{:0>32}", "wasm-cliprdr");
++                            let mut msg: Vec<u8> = Vec::with_capacity(1 + 2 + name_bytes.len() + 8 + 32);
++                            msg.push(0x01); // FILE_BEGIN
++                            msg.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
++                            msg.extend_from_slice(name_bytes);
++                            msg.extend_from_slice(&download.total_size.to_le_bytes());
++                            msg.extend_from_slice(session_id.as_bytes());
++                            let _ = ws.send_with_u8_array(&msg);
++                        }
++
++                        // Send FILE_CHUNK
++                        if !data.is_empty() {
++                            let session_id = format!("{:0>32}", "wasm-cliprdr");
++                            let mut msg: Vec<u8> = Vec::with_capacity(1 + 32 + 4 + data.len());
++                            msg.push(0x02); // FILE_CHUNK
++                            msg.extend_from_slice(session_id.as_bytes());
++                            msg.extend_from_slice(&(data.len() as u32).to_le_bytes());
++                            msg.extend_from_slice(data);
++                            let _ = ws.send_with_u8_array(&msg);
++                        }
++
++                        if is_last_chunk {
++                            let session_id = format!("{:0>32}", "wasm-cliprdr");
++                            // FILE_COMPLETE
++                            let mut msg = vec![0x03u8];
++                            msg.extend_from_slice(session_id.as_bytes());
++                            #[expect(clippy::as_conversions, clippy::cast_possible_truncation)]
++                            {
++                                msg.push(download.file_index as u8);
++                                msg.push(self.total_files_to_download as u8);
++                            }
++                            let _ = ws.send_with_u8_array(&msg);
++
++                            self.files_completed += 1;
++                            warn!(
++                                "File {} complete via WS ({}/{})",
++                                download.file_name, self.files_completed, self.total_files_to_download
++                            );
++
++                            if is_last_file {
++                                // TRANSFER_DONE
++                                let mut done_msg = vec![0x04u8];
++                                done_msg.extend_from_slice(session_id.as_bytes());
++                                let _ = ws.send_with_u8_array(&done_msg);
++
++                                warn!("All files transferred via WS");
++                                self.last_committed_descriptors = self.remote_file_descriptors.clone();
++                                self.remote_file_descriptors.clear();
++                                self.total_files_to_download = 0;
++                                self.files_completed = 0;
++
++                                if self.force_update_pending {
++                                    self.fire_deferred_force_update();
++                                }
++                            }
++                        }
++
++                        // Request next chunk (same logic as existing path)
++                        if !is_last_chunk {
++                            use ironrdp::cliprdr::pdu::FileContentsFlags;
++                            let remaining = download.total_size - download.bytes_received;
++                            let chunk_size = std::cmp::min(DOWNLOAD_CHUNK_SIZE, remaining);
++                            let next_stream_id = self.next_stream_id;
++                            self.next_stream_id += 1;
++
++                            let request = FileContentsRequest {
++                                stream_id: next_stream_id,
++                                index: download.file_index as u32,
++                                flags: FileContentsFlags::DATA,
++                                position: download.bytes_received,
++                                requested_size: chunk_size as u32,
++                                data_id: None,
++                            };
++                            self.pending_chunked_downloads.insert(next_stream_id, download);
++                            self.proxy
++                                .send_cliprdr_message(ClipboardMessage::SendFileContentsRequest(request));
++                        }
++
++                        true // WS handled
++                    } else {
++                        false
++                    };
++                    // === END WS BYPASS ===
++
++                    if !ws_handled {
++                    // Stream chunk to JS immediately (no accumulation!)
++                    if let Some(callback) = self.js_callbacks.on_file_chunk.as_mut() {
++                        let chunk_js = FileChunkJs {
++                            file_index: dl_file_index as u32,
++                            file_name: dl_file_name.clone(),
++                            total_size: dl_total_size,
++                            offset,
++                            data: data.to_vec(),
++                            is_last: is_last_chunk,
++                            is_last_file,
++                        };
++                        let js_val = serde_wasm_bindgen::to_value(&chunk_js).unwrap_or(JsValue::NULL);
++                        let _ = callback.call1(&JsValue::NULL, &js_val);
++                    }
++
++                    if is_last_chunk {
++                        self.files_completed += 1;
++                        warn!(
++                            "File {} complete ({}/{})",
++                            dl_file_name, self.files_completed, self.total_files_to_download
++                        );
++
++                        // All files done?
++                        if is_last_file {
++                            warn!("All {} files downloaded via chunked protocol", self.total_files_to_download);
++                            // Record for dedup (prevent feedback loop re-download)
++                            self.last_committed_descriptors = self.remote_file_descriptors.clone();
++                            self.remote_file_descriptors.clear();
++                            self.total_files_to_download = 0;
++                            self.files_completed = 0;
++
++                            if self.force_update_pending {
++                                self.fire_deferred_force_update();
++                            }
++                        }
++                    } else {
++                        // Request next chunk
++                        use ironrdp::cliprdr::pdu::FileContentsFlags;
++                        let remaining = dl_total_size - dl_bytes_received;
++                        let chunk_size = std::cmp::min(DOWNLOAD_CHUNK_SIZE, remaining);
++                        let next_stream_id = self.next_stream_id;
++                        self.next_stream_id += 1;
++
++                        let request = FileContentsRequest {
++                            stream_id: next_stream_id,
++                            index: dl_file_index as u32,
++                            flags: FileContentsFlags::DATA,
++                            position: dl_bytes_received,
++                            requested_size: chunk_size as u32,
++                            data_id: None,
++                        };
++
++                        // Re-insert with updated bytes_received (use dl_* fields since download may have been moved by WS path)
++                        let reinsert_download = PendingChunkedDownload {
++                            file_index: dl_file_index,
++                            file_name: dl_file_name.clone(),
++                            total_size: dl_total_size,
++                            bytes_received: dl_bytes_received,
++                            generation: self.download_generation,
++                        };
++                        self.pending_chunked_downloads.insert(next_stream_id, reinsert_download);
++
++                        self.proxy
++                            .send_cliprdr_message(ClipboardMessage::SendFileContentsRequest(request));
++                    }
++                    } // end if !ws_handled
++                    } // end generation check
++                } else {
++                    warn!("Unknown stream_id in FileContentsResponse: {}", stream_id);
++                }
++            }
++            WasmClipboardBackendMessage::LockClipboard(data_id) => {
++                warn!("Clipboard lock received, data_id={}", data_id);
++                self.last_lock_data_id = Some(data_id);
++            }
+         };
+ 
++        // --- Replay deferred clipboard update when all async transfers complete ---
++        if self.active_transfer_count.get() == 0 {
++            if let Some(deferred_data) = self.pending_clipboard_update.take() {
++                warn!("Replaying deferred clipboard update (transfer lock released)");
++                match self.handle_local_clipboard_changed(deferred_data) {
++                    Ok(formats) => {
++                        if !formats.is_empty() {
++                            self.proxy
++                                .send_cliprdr_message(ClipboardMessage::SendInitiateCopy(formats));
++                        }
++                    }
++                    Err(e) => {
++                        error!(error = format!("{e:#}"), "Failed to replay deferred clipboard update");
++                    }
++                }
++            }
++        }
++
+         Ok(())
+     }
+ }
+@@ -530,8 +1207,9 @@ impl CliprdrBackend for WasmClipboardBackend {
+     }
+ 
+     fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
+-        // No additional capabilities yet
+-        ClipboardGeneralCapabilityFlags::empty()
++        ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
++            | ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
++            | ClipboardGeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS
+     }
+ 
+     fn on_ready(&mut self) {}
+@@ -559,20 +1237,21 @@ impl CliprdrBackend for WasmClipboardBackend {
+         self.send_event(WasmClipboardBackendMessage::RemoteDataResponse(response.into_owned()));
+     }
+ 
+-    fn on_file_contents_request(&mut self, _request: FileContentsRequest) {
+-        // File transfer not implemented yet
++    fn on_file_contents_request(&mut self, request: FileContentsRequest) {
++        self.send_event(WasmClipboardBackendMessage::FileContentsRequest(request));
+     }
+ 
+-    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {
+-        // File transfer not implemented yet
++    fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
++        self.send_event(WasmClipboardBackendMessage::FileContentsResponse(response.into_owned()));
+     }
+ 
+-    fn on_lock(&mut self, _data_id: LockDataId) {
+-        // File transfer not implemented yet
++    fn on_lock(&mut self, data_id: LockDataId) {
++        warn!("Clipboard lock requested, data_id={}", data_id.0);
++        self.send_event(WasmClipboardBackendMessage::LockClipboard(data_id.0));
+     }
+ 
+-    fn on_unlock(&mut self, _data_id: LockDataId) {
+-        // File transfer not implemented yet
++    fn on_unlock(&mut self, data_id: LockDataId) {
++        warn!("Clipboard unlock requested, data_id={}", data_id.0);
+     }
+ }
+ 
+@@ -672,3 +1351,54 @@ impl iron_remote_desktop::ClipboardItem for ClipboardItem {
+         }
+     }
+ }
++
++/// File metadata passed from JS to Rust for file transfer
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
++pub(crate) struct FileInfo {
++    pub name: String,
++    pub size: u64,
++}
++
++/// Serializable version of FileContentsRequest for JS interop
++#[derive(Debug, Clone, Serialize)]
++pub(crate) struct FileContentsRequestJs {
++    pub stream_id: u32,
++    pub index: u32,
++    pub flags: u32,
++    pub position: u64,
++    pub requested_size: u32,
++    pub data_id: Option<u32>,
++}
++
++/// Serializable version of FileContentsResponse for JS interop.
++#[derive(Debug, Clone, Serialize)]
++pub(crate) struct FileContentsResponseJs {
++    pub name: String,
++    pub size: u64,
++    pub data: Vec<u8>,
++}
++
++/// Protocol-level chunk size for file downloads (2MB)
++const DOWNLOAD_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
++
++/// Tracks the state of a chunked file download
++#[derive(Debug, Clone)]
++struct PendingChunkedDownload {
++    file_index: usize,
++    file_name: String,
++    total_size: u64,
++    bytes_received: u64,
++    generation: u64,
++}
++
++/// Serializable chunk info for JS streaming callback
++#[derive(Debug, Clone, Serialize)]
++pub(crate) struct FileChunkJs {
++    pub file_index: u32,
++    pub file_name: String,
++    pub total_size: u64,
++    pub offset: u64,
++    pub data: Vec<u8>,
++    pub is_last: bool,
++    pub is_last_file: bool,
++}
+diff --git a/crates/ironrdp-web/src/gfx.rs b/crates/ironrdp-web/src/gfx.rs
+new file mode 100644
+index 0000000..f5cc6de
+--- /dev/null
++++ b/crates/ironrdp-web/src/gfx.rs
+@@ -0,0 +1,142 @@
++use ironrdp_egfx::client::GraphicsPipelineHandler;
++use ironrdp_egfx::pdu::{Codec1Type, GfxPdu};
++use tracing::{debug, trace, warn};
++use wasm_bindgen::JsValue;
++
++/// WASM GFX handler: forwards H.264 NAL units and surface management
++/// events to JavaScript via callback functions.
++pub(crate) struct WasmGfxHandler {
++    /// JS callback: (type: string, data: Uint8Array | object) => void
++    callback: js_sys::Function,
++}
++
++impl WasmGfxHandler {
++    pub(crate) fn new(callback: js_sys::Function) -> Self {
++        Self { callback }
++    }
++
++    fn call_js(&self, event_type: &str, data: &JsValue) {
++        let args = js_sys::Array::new();
++        args.push(&JsValue::from_str(event_type));
++        args.push(data);
++        if let Err(e) = self.callback.apply(&JsValue::NULL, &args) {
++            warn!("GFX JS callback failed: {e:?}");
++        }
++    }
++}
++
++// SAFETY: WASM is single-threaded, so Send is safe
++unsafe impl Send for WasmGfxHandler {}
++
++impl GraphicsPipelineHandler for WasmGfxHandler {
++    fn handle_pdu(&mut self, pdu: GfxPdu) -> Option<GfxPdu> {
++        match pdu {
++            GfxPdu::WireToSurface1(w2s) => {
++                let codec_name = match w2s.codec_id {
++                    Codec1Type::Uncompressed => "uncompressed",
++                    Codec1Type::RemoteFx => "remotefx",
++                    Codec1Type::ClearCodec => "clearcodec",
++                    Codec1Type::Planar => "planar",
++                    Codec1Type::Avc420 => "h264",
++                    Codec1Type::Alpha => "alpha",
++                    Codec1Type::Avc444 => "h264",
++                    Codec1Type::Avc444v2 => "h264",
++                    _ => "unknown",
++                };
++
++                debug!(
++                    codec = codec_name,
++                    surface_id = w2s.surface_id,
++                    data_len = w2s.bitmap_data.len(),
++                    "GFX WireToSurface1"
++                );
++
++                // For H.264 codecs, forward NAL data to JS for WebCodecs decoding
++                let is_h264 = matches!(
++                    w2s.codec_id,
++                    Codec1Type::Avc420 | Codec1Type::Avc444 | Codec1Type::Avc444v2
++                );
++
++                if is_h264 {
++                    let data = js_sys::Uint8Array::from(w2s.bitmap_data.as_slice());
++                    let obj = js_sys::Object::new();
++                    let _ = js_sys::Reflect::set(&obj, &"surfaceId".into(), &w2s.surface_id.into());
++                    let _ = js_sys::Reflect::set(&obj, &"codec".into(), &codec_name.into());
++                    let _ = js_sys::Reflect::set(&obj, &"data".into(), &data);
++                    let _ = js_sys::Reflect::set(
++                        &obj,
++                        &"left".into(),
++                        &w2s.destination_rectangle.left.into(),
++                    );
++                    let _ = js_sys::Reflect::set(
++                        &obj,
++                        &"top".into(),
++                        &w2s.destination_rectangle.top.into(),
++                    );
++                    let _ = js_sys::Reflect::set(
++                        &obj,
++                        &"right".into(),
++                        &w2s.destination_rectangle.right.into(),
++                    );
++                    let _ = js_sys::Reflect::set(
++                        &obj,
++                        &"bottom".into(),
++                        &w2s.destination_rectangle.bottom.into(),
++                    );
++                    self.call_js("h264_frame", &obj.into());
++                } else {
++                    trace!(codec = codec_name, "Non-H.264 codec, skipping JS callback");
++                }
++            }
++            GfxPdu::CreateSurface(cs) => {
++                debug!(
++                    surface_id = cs.surface_id,
++                    width = cs.width,
++                    height = cs.height,
++                    "GFX CreateSurface"
++                );
++                let obj = js_sys::Object::new();
++                let _ = js_sys::Reflect::set(&obj, &"surfaceId".into(), &cs.surface_id.into());
++                let _ = js_sys::Reflect::set(&obj, &"width".into(), &cs.width.into());
++                let _ = js_sys::Reflect::set(&obj, &"height".into(), &cs.height.into());
++                self.call_js("create_surface", &obj.into());
++            }
++            GfxPdu::DeleteSurface(ds) => {
++                debug!(surface_id = ds.surface_id, "GFX DeleteSurface");
++                self.call_js("delete_surface", &ds.surface_id.into());
++            }
++            GfxPdu::MapSurfaceToOutput(map) => {
++                debug!(
++                    surface_id = map.surface_id,
++                    x = map.output_origin_x,
++                    y = map.output_origin_y,
++                    "GFX MapSurfaceToOutput"
++                );
++                let obj = js_sys::Object::new();
++                let _ = js_sys::Reflect::set(&obj, &"surfaceId".into(), &map.surface_id.into());
++                let _ = js_sys::Reflect::set(&obj, &"x".into(), &map.output_origin_x.into());
++                let _ = js_sys::Reflect::set(&obj, &"y".into(), &map.output_origin_y.into());
++                self.call_js("map_surface", &obj.into());
++            }
++            GfxPdu::StartFrame(sf) => {
++                trace!(frame_id = sf.frame_id, "GFX StartFrame");
++                self.call_js("start_frame", &sf.frame_id.into());
++            }
++            GfxPdu::EndFrame(ef) => {
++                trace!(frame_id = ef.frame_id, "GFX EndFrame");
++                self.call_js("end_frame", &ef.frame_id.into());
++            }
++            GfxPdu::ResetGraphics(rg) => {
++                debug!(width = rg.width, height = rg.height, "GFX ResetGraphics");
++                let obj = js_sys::Object::new();
++                let _ = js_sys::Reflect::set(&obj, &"width".into(), &rg.width.into());
++                let _ = js_sys::Reflect::set(&obj, &"height".into(), &rg.height.into());
++                self.call_js("reset_graphics", &obj.into());
++            }
++            other => {
++                trace!(?other, "GFX PDU (unhandled)");
++            }
++        }
++        None
++    }
++}
+diff --git a/crates/ironrdp-web/src/image.rs b/crates/ironrdp-web/src/image.rs
+index 13ac3fe..1d2459f 100644
+--- a/crates/ironrdp-web/src/image.rs
++++ b/crates/ironrdp-web/src/image.rs
+@@ -3,6 +3,24 @@
+ use ironrdp::pdu::geometry::{InclusiveRectangle, Rectangle as _};
+ use ironrdp::session::image::DecodedImage;
+ 
++/// Zero-copy: returns a slice into `DecodedImage::data()` covering the full rows
++/// that contain `region`, plus the image stride (bytes per row of the full image).
++/// The caller uses WebGL2 `UNPACK_ROW_LENGTH` to upload only the needed sub-rect.
++pub(crate) fn extract_partial_image_ref<'a>(image: &'a DecodedImage, region: &InclusiveRectangle) -> (&'a [u8], u32) {
++    let pixel_size = usize::from(image.pixel_format().bytes_per_pixel());
++    let image_width = usize::from(image.width());
++    let image_stride = image_width * pixel_size;
++
++    let region_top = usize::from(region.top);
++    let region_bottom = usize::from(region.bottom);
++
++    let src = image.data();
++    let src_begin = region_top * image_stride;
++    let src_end = (region_bottom + 1) * image_stride;
++
++    (&src[src_begin..src_end], image_width as u32)
++}
++
+ pub(crate) fn extract_partial_image(image: &DecodedImage, region: InclusiveRectangle) -> (InclusiveRectangle, Vec<u8>) {
+     // PERF: needs actual benchmark to find a better heuristic
+     if region.height() > 64 || region.width() > 512 {
+diff --git a/crates/ironrdp-web/src/lib.rs b/crates/ironrdp-web/src/lib.rs
+index b98ebb1..2aafbb9 100644
+--- a/crates/ironrdp-web/src/lib.rs
++++ b/crates/ironrdp-web/src/lib.rs
+@@ -17,10 +17,14 @@ extern crate time as _;
+ mod canvas;
+ mod clipboard;
+ mod error;
++mod gfx;
++mod rdpsnd_dvc;
+ mod image;
+ mod input;
+ mod network_client;
+ mod rdp_file;
++mod rdpdr;
++mod rdpsnd;
+ mod session;
+ 
+ mod wasm_bridge {
+diff --git a/crates/ironrdp-web/src/rdpdr.rs b/crates/ironrdp-web/src/rdpdr.rs
+new file mode 100644
+index 0000000..1b26405
+--- /dev/null
++++ b/crates/ironrdp-web/src/rdpdr.rs
+@@ -0,0 +1,610 @@
++//! WASM-compatible RDPDR (Drive Redirection) backend.
++//!
++//! File reads are handled asynchronously: when Windows requests data for
++//! an uncached file, we return no response synchronously and instead
++//! spawn an async task that awaits the JS Promise, then injects the
++//! RDPDR DeviceReadResponse back through the session's input event channel.
++
++use std::cell::RefCell;
++use std::collections::HashMap;
++use std::rc::Rc;
++
++use futures_channel::mpsc;
++use ironrdp::pdu::PduResult;
++use ironrdp::rdpdr::RdpdrBackend;
++use ironrdp::rdpdr::pdu::RdpdrPdu;
++use ironrdp::rdpdr::pdu::efs::*;
++use ironrdp::rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
++use ironrdp::svc::SvcMessage;
++use tracing::{debug, warn, info};
++use wasm_bindgen::prelude::*;
++use wasm_bindgen_futures::JsFuture;
++
++/// A file entry stored in memory.
++#[derive(Debug, Clone)]
++pub(crate) struct MemFileEntry {
++    pub path: String,
++    pub is_dir: bool,
++    pub data: Vec<u8>,
++    pub size: u64,
++    pub creation_time: i64,
++    pub last_access_time: i64,
++    pub last_write_time: i64,
++}
++
++/// Channel message for deferred RDPDR responses.
++#[derive(Debug)]
++pub(crate) enum RdpdrDeferredMessage {
++    /// Deferred SVC messages to be encoded and sent to the server
++    Response(Vec<SvcMessage>),
++}
++
++/// WASM RDPDR backend using in-memory file data + async on-demand reads.
++pub(crate) struct WasmRdpdrBackend {
++    file_id_counter: u32,
++    /// file_id -> MemFileEntry
++    file_map: HashMap<u32, MemFileEntry>,
++    /// All known entries (relative path -> entry)
++    entries: HashMap<String, MemFileEntry>,
++    /// file_id -> relative path
++    id_to_path: HashMap<u32, String>,
++    /// file_id -> read cursor offset
++    read_offsets: HashMap<u32, u64>,
++    /// file_id -> directory listing iterator index
++    dir_iters: HashMap<u32, Vec<String>>,
++    /// JS callback for write operations
++    write_callback: Option<js_sys::Function>,
++    /// JS async callback for on-demand file read: fn(path, offset, length) -> Promise<Uint8Array>
++    read_callback: Option<js_sys::Function>,
++    /// Channel to send deferred responses back to the session event loop
++    deferred_tx: Rc<RefCell<mpsc::UnboundedSender<RdpdrDeferredMessage>>>,
++}
++
++// Manual AsAny implementation for WASM (can't use impl_as_any! macro)
++impl ironrdp::core::AsAny for WasmRdpdrBackend {
++    fn as_any(&self) -> &dyn std::any::Any {
++        self
++    }
++
++    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
++        self
++    }
++}
++
++// SAFETY: WASM is single-threaded, so Send is safe.
++unsafe impl Send for WasmRdpdrBackend {}
++
++// Manual Debug implementation (deferred_tx doesn't implement Debug)
++impl std::fmt::Debug for WasmRdpdrBackend {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("WasmRdpdrBackend")
++            .field("file_id_counter", &self.file_id_counter)
++            .field("entries_count", &self.entries.len())
++            .field("open_files", &self.file_map.len())
++            .finish()
++    }
++}
++
++impl WasmRdpdrBackend {
++    pub(crate) fn new(
++        _file_base: String,
++        write_callback: Option<js_sys::Function>,
++        read_callback: Option<js_sys::Function>,
++        deferred_tx: mpsc::UnboundedSender<RdpdrDeferredMessage>,
++    ) -> Self {
++        Self {
++            file_id_counter: 0,
++            file_map: HashMap::new(),
++            entries: HashMap::new(),
++            id_to_path: HashMap::new(),
++            read_offsets: HashMap::new(),
++            dir_iters: HashMap::new(),
++            write_callback,
++            read_callback,
++            deferred_tx: Rc::new(RefCell::new(deferred_tx)),
++        }
++    }
++
++    /// Add a pre-loaded file entry.
++    pub(crate) fn add_entry(&mut self, entry: MemFileEntry) {
++        self.entries.insert(entry.path.clone(), entry);
++    }
++
++    fn next_file_id(&mut self) -> u32 {
++        let id = self.file_id_counter;
++        self.file_id_counter += 1;
++        id
++    }
++
++    fn get_full_path(&self, rdp_path: &str) -> String {
++        let clean = rdp_path.replace('\\', "/");
++        if clean.starts_with('/') {
++            clean[1..].to_string()
++        } else {
++            clean
++        }
++    }
++
++    fn children_of(&self, dir_path: &str) -> Vec<String> {
++        let prefix = if dir_path.is_empty() {
++            String::new()
++        } else if dir_path.ends_with('/') {
++            dir_path.to_string()
++        } else {
++            format!("{}/", dir_path)
++        };
++        self.entries
++            .keys()
++            .filter(|k| {
++                if prefix.is_empty() {
++                    !k.contains('/')
++                } else {
++                    k.starts_with(&prefix) && !k[prefix.len()..].contains('/')
++                }
++            })
++            .cloned()
++            .collect()
++    }
++
++    /// Spawn an async task to read file data via JS callback (returns Promise).
++    /// The result is sent back through the deferred_tx channel as a DeviceReadResponse.
++    fn spawn_deferred_read(
++        &self,
++        req_header: DeviceIoRequest,
++        path: String,
++        offset: u64,
++        length: u32,
++    ) {
++        let cb = match self.read_callback.as_ref() {
++            Some(cb) => cb.clone(),
++            None => {
++                warn!("[rdpdr-wasm] no read callback, cannot read {}", path);
++                return;
++            }
++        };
++        let tx = self.deferred_tx.clone();
++
++        wasm_bindgen_futures::spawn_local(async move {
++            let promise_result = cb.call3(
++                &JsValue::NULL,
++                &JsValue::from_str(&path),
++                &JsValue::from(offset as f64),
++                &JsValue::from(length as f64),
++            );
++
++            let read_data = match promise_result {
++                Ok(val) => {
++                    // The JS callback returns a Promise<Uint8Array>
++                    let promise = js_sys::Promise::from(val);
++                    match JsFuture::from(promise).await {
++                        Ok(resolved) => {
++                            let arr = js_sys::Uint8Array::from(resolved);
++                            arr.to_vec()
++                        }
++                        Err(e) => {
++                            warn!("[rdpdr-wasm] async read failed for {}: {:?}", path, e);
++                            Vec::new()
++                        }
++                    }
++                }
++                Err(e) => {
++                    warn!("[rdpdr-wasm] read callback call failed for {}: {:?}", path, e);
++                    Vec::new()
++                }
++            };
++
++            info!(
++                "[rdpdr-wasm] async read complete: {} offset={} got {} bytes",
++                path, offset, read_data.len()
++            );
++
++            let response = SvcMessage::from(RdpdrPdu::DeviceReadResponse(
++                DeviceReadResponse {
++                    device_io_reply: DeviceIoResponse::new(req_header, NtStatus::SUCCESS),
++                    read_data,
++                },
++            ));
++
++            let sender = tx.borrow();
++            let _ = sender.unbounded_send(RdpdrDeferredMessage::Response(vec![response]));
++        });
++    }
++}
++
++fn filetime_now() -> i64 {
++    // Approximate: seconds since Unix epoch * 10M + Windows epoch offset
++    let js_ms = js_sys::Date::now() as i64;
++    let secs = js_ms / 1000;
++    secs * 10_000_000 + 116_444_736_000_000_000
++}
++
++impl RdpdrBackend for WasmRdpdrBackend {
++    fn handle_server_device_announce_response(&mut self, _pdu: ServerDeviceAnnounceResponse) -> PduResult<()> {
++        debug!("[rdpdr-wasm] device announce response");
++        Ok(())
++    }
++
++    fn handle_scard_call(&mut self, _req: DeviceControlRequest<ScardIoCtlCode>, _call: ScardCall) -> PduResult<()> {
++        Ok(())
++    }
++
++    fn handle_drive_io_request(&mut self, req: ServerDriveIoRequest) -> PduResult<Vec<SvcMessage>> {
++        debug!("[rdpdr-wasm] drive_io_request: {:?}", req);
++        match req {
++            ServerDriveIoRequest::ServerCreateDriveRequest(r) => self.handle_create(r),
++            ServerDriveIoRequest::DeviceReadRequest(r) => self.handle_read(r),
++            ServerDriveIoRequest::DeviceWriteRequest(r) => self.handle_write(r),
++            ServerDriveIoRequest::DeviceCloseRequest(r) => self.handle_close(r),
++            ServerDriveIoRequest::ServerDriveQueryInformationRequest(r) => self.handle_query_info(r),
++            ServerDriveIoRequest::ServerDriveQueryDirectoryRequest(r) => self.handle_query_dir(r),
++            ServerDriveIoRequest::ServerDriveQueryVolumeInformationRequest(r) => self.handle_query_volume(r),
++            ServerDriveIoRequest::DeviceControlRequest(r) => Ok(vec![SvcMessage::from(
++                RdpdrPdu::DeviceControlResponse(DeviceControlResponse {
++                    device_io_reply: DeviceIoResponse::new(r.header, NtStatus::SUCCESS),
++                    output_buffer: None,
++                }),
++            )]),
++            ServerDriveIoRequest::ServerDriveSetInformationRequest(r) => self.handle_set_info(r),
++            _ => {
++                warn!("[rdpdr-wasm] unhandled io request");
++                Ok(Vec::new())
++            }
++        }
++    }
++}
++
++// ── Individual request handlers ──
++
++impl WasmRdpdrBackend {
++    fn handle_create(&mut self, req: DeviceCreateRequest) -> PduResult<Vec<SvcMessage>> {
++        let file_id = self.next_file_id();
++        let rel_path = self.get_full_path(&req.path);
++
++        if let Some(entry) = self.entries.get(&rel_path).cloned() {
++            // Insert entry as-is; data will be fetched on-demand via async read
++            self.file_map.insert(file_id, entry);
++            self.id_to_path.insert(file_id, rel_path);
++
++            let info = if req.create_disposition == CreateDisposition::FILE_OPEN_IF {
++                Information::FILE_OPENED
++            } else {
++                Information::FILE_SUPERSEDED
++            };
++
++            return Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(
++                DeviceCreateResponse {
++                    device_io_reply: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
++                    file_id,
++                    information: info,
++                },
++            ))]);
++        }
++
++        // Path not found — check if it's a root/empty path
++        if rel_path.is_empty() {
++            let root = MemFileEntry {
++                path: String::new(),
++                is_dir: true,
++                data: Vec::new(),
++                size: 0,
++                creation_time: filetime_now(),
++                last_access_time: filetime_now(),
++                last_write_time: filetime_now(),
++            };
++            self.file_map.insert(file_id, root);
++            self.id_to_path.insert(file_id, rel_path);
++            return Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(
++                DeviceCreateResponse {
++                    device_io_reply: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
++                    file_id,
++                    information: Information::FILE_OPENED,
++                },
++            ))]);
++        }
++
++        // File doesn't exist
++        warn!("[rdpdr-wasm] create: no such path: {}", rel_path);
++        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCreateResponse(
++            DeviceCreateResponse {
++                device_io_reply: DeviceIoResponse::new(req.device_io_request, NtStatus::NO_SUCH_FILE),
++                file_id,
++                information: Information::empty(),
++            },
++        ))])
++    }
++
++    fn handle_read(&mut self, req: DeviceReadRequest) -> PduResult<Vec<SvcMessage>> {
++        let fid = req.device_io_request.file_id;
++        if let Some(entry) = self.file_map.get(&fid) {
++            let offset = req.offset as usize;
++            let len = req.length as usize;
++            let data = &entry.data;
++
++            if !data.is_empty() && offset < data.len() {
++                // Data already in memory — respond immediately
++                let end = std::cmp::min(offset + len, data.len());
++                let read_data = data[offset..end].to_vec();
++                Ok(vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(
++                    DeviceReadResponse {
++                        device_io_reply: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
++                        read_data,
++                    },
++                ))])
++            } else if entry.size > 0 {
++                // No data in memory — spawn async read, response will come later
++                if let Some(path) = self.id_to_path.get(&fid).cloned() {
++                    info!("[rdpdr-wasm] deferred read: {} offset={} len={}", path, req.offset, req.length);
++                    self.spawn_deferred_read(
++                        req.device_io_request,
++                        path,
++                        req.offset,
++                        req.length,
++                    );
++                    // Return empty vec — no synchronous response; async task will send it
++                    Ok(Vec::new())
++                } else {
++                    Ok(vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(
++                        DeviceReadResponse {
++                            device_io_reply: DeviceIoResponse::new(req.device_io_request, NtStatus::NO_SUCH_FILE),
++                            read_data: Vec::new(),
++                        },
++                    ))])
++                }
++            } else {
++                // Zero-size file
++                Ok(vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(
++                    DeviceReadResponse {
++                        device_io_reply: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
++                        read_data: Vec::new(),
++                    },
++                ))])
++            }
++        } else {
++            Ok(vec![SvcMessage::from(RdpdrPdu::DeviceReadResponse(
++                DeviceReadResponse {
++                    device_io_reply: DeviceIoResponse::new(req.device_io_request, NtStatus::NO_SUCH_FILE),
++                    read_data: Vec::new(),
++                },
++            ))])
++        }
++    }
++
++    fn handle_write(&mut self, req: DeviceWriteRequest) -> PduResult<Vec<SvcMessage>> {
++        let len = req.write_data.len() as u32;
++
++        // Notify JS side about the write
++        if let Some(cb) = &self.write_callback {
++            if let Some(path) = self.id_to_path.get(&req.device_io_request.file_id) {
++                let _ = cb.call3(
++                    &JsValue::NULL,
++                    &JsValue::from_str(path),
++                    &JsValue::from(req.offset as f64),
++                    &js_sys::Uint8Array::from(req.write_data.as_slice()).into(),
++                );
++            }
++        }
++
++        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceWriteResponse(
++            DeviceWriteResponse {
++                device_io_reply: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
++                length: len,
++            },
++        ))])
++    }
++
++    fn handle_close(&mut self, req: DeviceCloseRequest) -> PduResult<Vec<SvcMessage>> {
++        let fid = req.device_io_request.file_id;
++        self.file_map.remove(&fid);
++        self.id_to_path.remove(&fid);
++        self.read_offsets.remove(&fid);
++        self.dir_iters.remove(&fid);
++        Ok(vec![SvcMessage::from(RdpdrPdu::DeviceCloseResponse(
++            DeviceCloseResponse {
++                device_io_response: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
++            },
++        ))])
++    }
++
++    fn handle_query_info(&mut self, req: ServerDriveQueryInformationRequest) -> PduResult<Vec<SvcMessage>> {
++        let fid = req.device_io_request.file_id;
++        if let Some(entry) = self.file_map.get(&fid) {
++            let file_attr = if entry.is_dir {
++                FileAttributes::FILE_ATTRIBUTE_DIRECTORY
++            } else {
++                FileAttributes::FILE_ATTRIBUTE_ARCHIVE
++            };
++
++            if req.file_info_class_lvl == FileInformationClassLevel::FILE_BASIC_INFORMATION {
++                let info = FileBasicInformation {
++                    creation_time: entry.creation_time,
++                    last_access_time: entry.last_access_time,
++                    last_write_time: entry.last_write_time,
++                    change_time: entry.last_write_time,
++                    file_attributes: file_attr,
++                };
++                return Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryInformationResponse(
++                    ClientDriveQueryInformationResponse {
++                        device_io_response: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
++                        buffer: Some(FileInformationClass::Basic(info)),
++                    },
++                ))]);
++            }
++
++            if req.file_info_class_lvl == FileInformationClassLevel::FILE_STANDARD_INFORMATION {
++                let dir = if entry.is_dir { Boolean::True } else { Boolean::False };
++                let info = FileStandardInformation {
++                    allocation_size: entry.size as i64,
++                    end_of_file: entry.size as i64,
++                    number_of_links: 1,
++                    delete_pending: Boolean::False,
++                    directory: dir,
++                };
++                return Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryInformationResponse(
++                    ClientDriveQueryInformationResponse {
++                        device_io_response: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
++                        buffer: Some(FileInformationClass::Standard(info)),
++                    },
++                ))]);
++            }
++
++            if req.file_info_class_lvl == FileInformationClassLevel::FILE_ATTRIBUTE_TAG_INFORMATION {
++                let info = FileAttributeTagInformation {
++                    file_attributes: file_attr,
++                    reparse_tag: 0,
++                };
++                return Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryInformationResponse(
++                    ClientDriveQueryInformationResponse {
++                        device_io_response: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
++                        buffer: Some(FileInformationClass::AttributeTag(info)),
++                    },
++                ))]);
++            }
++
++            warn!("[rdpdr-wasm] unsupported info class");
++        }
++
++        Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryInformationResponse(
++            ClientDriveQueryInformationResponse {
++                device_io_response: DeviceIoResponse::new(req.device_io_request, NtStatus::NO_SUCH_FILE),
++                buffer: None,
++            },
++        ))])
++    }
++
++    fn handle_query_dir(&mut self, req: ServerDriveQueryDirectoryRequest) -> PduResult<Vec<SvcMessage>> {
++        let fid = req.device_io_request.file_id;
++
++        if req.initial_query > 0 {
++            // Build directory listing
++            let dir_path = self.id_to_path.get(&fid).cloned().unwrap_or_default();
++            let children = self.children_of(&dir_path);
++            self.dir_iters.insert(fid, children);
++        }
++
++        // Get next entry from iterator
++        if let Some(listing) = self.dir_iters.get_mut(&fid) {
++            if let Some(child_path) = listing.pop() {
++                if let Some(entry) = self.entries.get(&child_path) {
++                    let name = child_path.rsplit('/').next().unwrap_or(&child_path);
++                    let file_attr = if entry.is_dir {
++                        FileAttributes::FILE_ATTRIBUTE_DIRECTORY
++                    } else {
++                        FileAttributes::FILE_ATTRIBUTE_ARCHIVE
++                    };
++                    let info = FileBothDirectoryInformation::new(
++                        entry.creation_time,
++                        entry.last_write_time,
++                        entry.last_access_time,
++                        entry.last_write_time,
++                        entry.size as i64,
++                        file_attr,
++                        name.to_string(),
++                    );
++                    return Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryDirectoryResponse(
++                        ClientDriveQueryDirectoryResponse {
++                            device_io_reply: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
++                            buffer: Some(FileInformationClass::BothDirectory(info)),
++                        },
++                    ))]);
++                }
++            }
++        }
++
++        // No more entries
++        let status = if req.initial_query > 0 {
++            NtStatus::NO_SUCH_FILE
++        } else {
++            NtStatus::NO_MORE_FILES
++        };
++        Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveQueryDirectoryResponse(
++            ClientDriveQueryDirectoryResponse {
++                device_io_reply: DeviceIoResponse::new(req.device_io_request, status),
++                buffer: None,
++            },
++        ))])
++    }
++
++    fn handle_query_volume(&mut self, req: ServerDriveQueryVolumeInformationRequest) -> PduResult<Vec<SvcMessage>> {
++        if req.fs_info_class_lvl == FileSystemInformationClassLevel::FILE_FS_ATTRIBUTE_INFORMATION {
++            return Ok(vec![SvcMessage::from(
++                RdpdrPdu::ClientDriveQueryVolumeInformationResponse(ClientDriveQueryVolumeInformationResponse {
++                    device_io_reply: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
++                    buffer: Some(FileSystemInformationClass::FileFsAttributeInformation(
++                        FileFsAttributeInformation {
++                            file_system_attributes: FileSystemAttributes::FILE_CASE_SENSITIVE_SEARCH
++                                | FileSystemAttributes::FILE_CASE_PRESERVED_NAMES
++                                | FileSystemAttributes::FILE_UNICODE_ON_DISK,
++                            max_component_name_len: 260,
++                            file_system_name: "FAT32".to_owned(),
++                        },
++                    )),
++                }),
++            )]);
++        }
++
++        if req.fs_info_class_lvl == FileSystemInformationClassLevel::FILE_FS_VOLUME_INFORMATION {
++            return Ok(vec![SvcMessage::from(
++                RdpdrPdu::ClientDriveQueryVolumeInformationResponse(ClientDriveQueryVolumeInformationResponse {
++                    device_io_reply: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
++                    buffer: Some(FileSystemInformationClass::FileFsVolumeInformation(
++                        FileFsVolumeInformation {
++                            volume_creation_time: filetime_now(),
++                            volume_serial_number: 0x4E455854, // "NEXT"
++                            supports_objects: Boolean::False,
++                            volume_label: "NEXTDESK".to_owned(),
++                        },
++                    )),
++                }),
++            )]);
++        }
++
++        if req.fs_info_class_lvl == FileSystemInformationClassLevel::FILE_FS_FULL_SIZE_INFORMATION {
++            return Ok(vec![SvcMessage::from(
++                RdpdrPdu::ClientDriveQueryVolumeInformationResponse(ClientDriveQueryVolumeInformationResponse {
++                    device_io_reply: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
++                    buffer: Some(FileSystemInformationClass::FileFsFullSizeInformation(
++                        FileFsFullSizeInformation {
++                            total_alloc_units: 1_000_000,
++                            caller_available_alloc_units: 500_000,
++                            actual_available_alloc_units: 500_000,
++                            sectors_per_alloc_unit: 4096,
++                            bytes_per_sector: 1,
++                        },
++                    )),
++                }),
++            )]);
++        }
++
++        if req.fs_info_class_lvl == FileSystemInformationClassLevel::FILE_FS_SIZE_INFORMATION {
++            return Ok(vec![SvcMessage::from(
++                RdpdrPdu::ClientDriveQueryVolumeInformationResponse(ClientDriveQueryVolumeInformationResponse {
++                    device_io_reply: DeviceIoResponse::new(req.device_io_request, NtStatus::SUCCESS),
++                    buffer: Some(FileSystemInformationClass::FileFsSizeInformation(
++                        FileFsSizeInformation {
++                            total_alloc_units: 1_000_000,
++                            available_alloc_units: 500_000,
++                            sectors_per_alloc_unit: 4096,
++                            bytes_per_sector: 1,
++                        },
++                    )),
++                }),
++            )]);
++        }
++
++        warn!("[rdpdr-wasm] unsupported volume class");
++        Ok(vec![SvcMessage::from(
++            RdpdrPdu::ClientDriveQueryVolumeInformationResponse(ClientDriveQueryVolumeInformationResponse {
++                device_io_reply: DeviceIoResponse::new(req.device_io_request, NtStatus::UNSUCCESSFUL),
++                buffer: None,
++            }),
++        )])
++    }
++
++    fn handle_set_info(&mut self, req: ServerDriveSetInformationRequest) -> PduResult<Vec<SvcMessage>> {
++        // For WASM, we handle set-info minimally
++        use ironrdp::pdu::encode_err;
++        Ok(vec![SvcMessage::from(RdpdrPdu::ClientDriveSetInformationResponse(
++            ClientDriveSetInformationResponse::new(&req, NtStatus::SUCCESS).map_err(|e| encode_err!(e))?,
++        ))])
++    }
++}
+diff --git a/crates/ironrdp-web/src/rdpsnd.rs b/crates/ironrdp-web/src/rdpsnd.rs
+new file mode 100644
+index 0000000..fabb2f0
+--- /dev/null
++++ b/crates/ironrdp-web/src/rdpsnd.rs
+@@ -0,0 +1,210 @@
++use std::borrow::Cow;
++
++use ironrdp_rdpsnd::client::RdpsndClientHandler;
++use ironrdp_rdpsnd::pdu::{AudioFormat, PitchPdu, VolumePdu, WaveFormat};
++use tracing::{debug, info, warn};
++use wasm_bindgen::JsValue;
++
++/// WASM-compatible RDPSND backend that forwards PCM audio data
++/// to JavaScript via a callback function.
++///
++/// The callback signature is:
++///   audioCallback(type: string, data: any)
++///
++/// Events:
++///   - "format": { channels, sampleRate, bitsPerSample }
++///   - "wave":   Uint8Array of PCM data
++///   - "volume": { left, right }  (0-65535)
++///   - "close":  null
++#[derive(Debug)]
++pub struct WasmRdpsndBackend {
++    callback: js_sys::Function,
++    formats: Vec<AudioFormat>,
++    active_format: Option<AudioFormat>,
++}
++
++impl WasmRdpsndBackend {
++    pub fn new(callback: js_sys::Function) -> Self {
++        // Advertise PCM formats the Web Audio API can handle
++        let formats = vec![
++            // 16-bit stereo 44100 Hz (CD quality)
++            AudioFormat {
++                format: WaveFormat::PCM,
++                n_channels: 2,
++                n_samples_per_sec: 44100,
++                n_avg_bytes_per_sec: 44100 * 2 * 2,
++                n_block_align: 4,
++                bits_per_sample: 16,
++                data: None,
++            },
++            // 16-bit stereo 48000 Hz
++            AudioFormat {
++                format: WaveFormat::PCM,
++                n_channels: 2,
++                n_samples_per_sec: 48000,
++                n_avg_bytes_per_sec: 48000 * 2 * 2,
++                n_block_align: 4,
++                bits_per_sample: 16,
++                data: None,
++            },
++            // 16-bit mono 44100 Hz
++            AudioFormat {
++                format: WaveFormat::PCM,
++                n_channels: 1,
++                n_samples_per_sec: 44100,
++                n_avg_bytes_per_sec: 44100 * 2,
++                n_block_align: 2,
++                bits_per_sample: 16,
++                data: None,
++            },
++            // 16-bit stereo 22050 Hz
++            AudioFormat {
++                format: WaveFormat::PCM,
++                n_channels: 2,
++                n_samples_per_sec: 22050,
++                n_avg_bytes_per_sec: 22050 * 2 * 2,
++                n_block_align: 4,
++                bits_per_sample: 16,
++                data: None,
++            },
++            // 8-bit mono 22050 Hz (low quality fallback)
++            AudioFormat {
++                format: WaveFormat::PCM,
++                n_channels: 1,
++                n_samples_per_sec: 22050,
++                n_avg_bytes_per_sec: 22050,
++                n_block_align: 1,
++                bits_per_sample: 8,
++                data: None,
++            },
++            // ALAW 8000 Hz mono (telephony)
++            AudioFormat {
++                format: WaveFormat::ALAW,
++                n_channels: 1,
++                n_samples_per_sec: 8000,
++                n_avg_bytes_per_sec: 8000,
++                n_block_align: 1,
++                bits_per_sample: 8,
++                data: None,
++            },
++            // MULAW 8000 Hz mono (telephony)
++            AudioFormat {
++                format: WaveFormat::MULAW,
++                n_channels: 1,
++                n_samples_per_sec: 8000,
++                n_avg_bytes_per_sec: 8000,
++                n_block_align: 1,
++                bits_per_sample: 8,
++                data: None,
++            },
++        ];
++        Self {
++            callback,
++            formats,
++            active_format: None,
++        }
++    }
++
++    fn invoke(&self, event_type: &str, data: JsValue) {
++        let args = js_sys::Array::from_iter([
++            JsValue::from_str(event_type),
++            data,
++        ]);
++        if let Err(e) = self.callback.apply(&JsValue::NULL, &args) {
++            warn!("rdpsnd callback error: {:?}", e);
++        }
++    }
++}
++
++impl RdpsndClientHandler for WasmRdpsndBackend {
++    fn get_formats(&self) -> &[AudioFormat] {
++        &self.formats
++    }
++
++    fn wave(&mut self, format: &AudioFormat, _ts: u32, data: Cow<'_, [u8]>) {
++        // Check if format changed from the previously active one
++        let format_changed = self.active_format.as_ref().map_or(true, |f| {
++            f.n_channels != format.n_channels
++                || f.n_samples_per_sec != format.n_samples_per_sec
++                || f.bits_per_sample != format.bits_per_sample
++                || f.format != format.format
++        });
++
++        if format_changed {
++            self.active_format = Some(format.clone());
++
++            // Notify JS of format change
++            let format_info = js_sys::Object::new();
++            js_sys::Reflect::set(
++                &format_info,
++                &"channels".into(),
++                &JsValue::from_f64(format.n_channels.into()),
++            ).ok();
++            js_sys::Reflect::set(
++                &format_info,
++                &"sampleRate".into(),
++                &JsValue::from_f64(format.n_samples_per_sec.into()),
++            ).ok();
++            js_sys::Reflect::set(
++                &format_info,
++                &"bitsPerSample".into(),
++                &JsValue::from_f64(format.bits_per_sample.into()),
++            ).ok();
++            let format_tag = format.format;
++            let tag_str = if format_tag == WaveFormat::PCM {
++                "pcm"
++            } else if format_tag == WaveFormat::ALAW {
++                "alaw"
++            } else if format_tag == WaveFormat::MULAW {
++                "mulaw"
++            } else if format_tag == WaveFormat::IEEE_FLOAT {
++                "float"
++            } else {
++                "unknown"
++            };
++            js_sys::Reflect::set(
++                &format_info,
++                &"formatTag".into(),
++                &JsValue::from_str(tag_str),
++            ).ok();
++            info!(
++                "rdpsnd: format changed - {} ch, {} Hz, {} bit, tag={}",
++                format.n_channels,
++                format.n_samples_per_sec,
++                format.bits_per_sample,
++                tag_str
++            );
++            self.invoke("format", format_info.into());
++        }
++
++        // Send PCM data as Uint8Array
++        let js_data = js_sys::Uint8Array::from(data.as_ref());
++        self.invoke("wave", js_data.into());
++    }
++
++    fn set_volume(&mut self, volume: VolumePdu) {
++        debug!("rdpsnd: set_volume {:?}", volume);
++        let vol_obj = js_sys::Object::new();
++        js_sys::Reflect::set(
++            &vol_obj,
++            &"left".into(),
++            &JsValue::from_f64(volume.volume_left.into()),
++        ).ok();
++        js_sys::Reflect::set(
++            &vol_obj,
++            &"right".into(),
++            &JsValue::from_f64(volume.volume_right.into()),
++        ).ok();
++        self.invoke("volume", vol_obj.into());
++    }
++
++    fn set_pitch(&mut self, pitch: PitchPdu) {
++        debug!("rdpsnd: set_pitch {:?}", pitch);
++    }
++
++    fn close(&mut self) {
++        info!("rdpsnd: close");
++        self.active_format = None;
++        self.invoke("close", JsValue::NULL);
++    }
++}
+diff --git a/crates/ironrdp-web/src/rdpsnd_dvc.rs b/crates/ironrdp-web/src/rdpsnd_dvc.rs
+new file mode 100644
+index 0000000..bb4bea5
+--- /dev/null
++++ b/crates/ironrdp-web/src/rdpsnd_dvc.rs
+@@ -0,0 +1,99 @@
++/// RDPSND Dynamic Virtual Channel (DVC) wrapper.
++///
++/// Modern Windows RDP servers (Windows 10+) prefer sending audio over the
++/// `AUDIO_PLAYBACK_DVC` dynamic virtual channel instead of the legacy `rdpsnd`
++/// static virtual channel. This module wraps the existing `Rdpsnd` protocol
++/// state machine so that it can run over DRDYNVC.
++use ironrdp_core::{Encode, EncodeResult, WriteCursor, ensure_size, impl_as_any, AsAny};
++use ironrdp::pdu::PduResult;
++use ironrdp_rdpsnd::client::{Rdpsnd, RdpsndClientHandler};
++use tracing::warn;
++
++use ironrdp::dvc::{DvcProcessor, DvcMessage, DvcEncode};
++use ironrdp::svc::SvcProcessor;
++
++/// The DVC channel name used by Windows 10+ for audio playback
++pub const AUDIO_PLAYBACK_DVC_NAME: &str = "AUDIO_PLAYBACK_DVC";
++
++/// A raw-bytes wrapper that implements `DvcEncode` so we can return
++/// pre-encoded RDPSND PDU bytes as `DvcMessage`.
++struct RawRdpsndDvcMsg(Vec<u8>);
++
++impl Encode for RawRdpsndDvcMsg {
++    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
++        ensure_size!(in: dst, size: self.size());
++        dst.write_slice(&self.0);
++        Ok(())
++    }
++
++    fn name(&self) -> &'static str {
++        "RawRdpsndDvcMsg"
++    }
++
++    fn size(&self) -> usize {
++        self.0.len()
++    }
++}
++
++impl DvcEncode for RawRdpsndDvcMsg {}
++
++/// DVC processor that wraps the RDPSND protocol for `AUDIO_PLAYBACK_DVC`.
++///
++/// Internally delegates to `Rdpsnd` (the SVC processor) for PDU
++/// decoding/encoding, but adapts the I/O to the DVC messaging
++/// interface.
++#[derive(Debug)]
++pub struct RdpsndDvc {
++    inner: Rdpsnd,
++}
++
++impl RdpsndDvc {
++    pub fn new(handler: Box<dyn RdpsndClientHandler>) -> Self {
++        Self {
++            inner: Rdpsnd::new(handler),
++        }
++    }
++}
++
++impl_as_any!(RdpsndDvc);
++
++impl DvcProcessor for RdpsndDvc {
++    fn channel_name(&self) -> &str {
++        AUDIO_PLAYBACK_DVC_NAME
++    }
++
++    fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
++        warn!("RDPSND DVC: channel opened (AUDIO_PLAYBACK_DVC)");
++        // RDPSND is server-initiated; nothing to send on start.
++        Ok(Vec::new())
++    }
++
++    fn process(
++        &mut self,
++        _channel_id: u32,
++        payload: &[u8],
++    ) -> PduResult<Vec<DvcMessage>> {
++        // Delegate to the inner Rdpsnd SvcProcessor.
++        // It returns Vec<SvcMessage> — we need to convert
++        // each to DvcMessage by encoding the inner PDU bytes.
++        let svc_messages = self.inner.process(payload)?;
++
++        let mut dvc_messages: Vec<DvcMessage> = Vec::new();
++        for svc_msg in svc_messages {
++            // SvcMessage::encode_unframed_pdu() gives us the raw
++            // PDU bytes without SVC channel framing headers.
++            let raw_bytes = svc_msg.encode_unframed_pdu()
++                .map_err(|e| ironrdp::pdu::pdu_other_err!(
++                    "RdpsndDvc",
++                    "failed to encode response PDU: {e}"
++                ))?;
++            dvc_messages.push(Box::new(RawRdpsndDvcMsg(raw_bytes)));
++        }
++
++        Ok(dvc_messages)
++    }
++
++    fn close(&mut self, _channel_id: u32) {
++        warn!("RDPSND DVC: channel closed");
++    }
++}
+diff --git a/crates/ironrdp-web/src/session.rs b/crates/ironrdp-web/src/session.rs
+index 13da806..373f6ea 100644
+--- a/crates/ironrdp-web/src/session.rs
++++ b/crates/ironrdp-web/src/session.rs
+@@ -24,6 +24,8 @@ use ironrdp::graphics::image_processing::PixelFormat;
+ use ironrdp::pdu::input::fast_path::FastPathInputEvent;
+ use ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities;
+ use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
++use ironrdp::rdpdr::Rdpdr;
++use ironrdp::rdpsnd::client::Rdpsnd;
+ use ironrdp::session::image::DecodedImage;
+ use ironrdp::session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, fast_path};
+ use ironrdp_core::WriteBuf;
+@@ -32,6 +34,7 @@ use rgb::AsPixels as _;
+ use tap::prelude::*;
+ use tracing::{debug, error, info, trace, warn};
+ use wasm_bindgen::JsValue;
++use wasm_bindgen::JsCast as _;
+ use wasm_bindgen_futures::spawn_local;
+ use web_sys::HtmlCanvasElement;
+ 
+@@ -42,6 +45,19 @@ use crate::error::IronError;
+ use crate::image::extract_partial_image;
+ use crate::input::InputTransaction;
+ use crate::network_client::WasmNetworkClient;
++use crate::rdpdr::{WasmRdpdrBackend, RdpdrDeferredMessage};
++use crate::rdpsnd::WasmRdpsndBackend;
++
++/// JSON representation of a drive entry passed from JS via extension.
++#[derive(serde::Deserialize)]
++struct DriveEntryJson {
++    path: String,
++    is_dir: bool,
++    size: u64,
++    creation_time: i64,
++    last_access_time: i64,
++    last_write_time: i64,
++}
+ 
+ const DEFAULT_WIDTH: u16 = 1280;
+ const DEFAULT_HEIGHT: u16 = 720;
+@@ -66,10 +82,20 @@ struct SessionBuilderInner {
+     set_cursor_style_callback_context: Option<JsValue>,
+     remote_clipboard_changed_callback: Option<js_sys::Function>,
+     force_clipboard_update_callback: Option<js_sys::Function>,
++    file_contents_request_callback: Option<js_sys::Function>,
++    file_contents_response_callback: Option<js_sys::Function>,
++    file_chunk_callback: Option<js_sys::Function>,
++    rdpdr_write_callback: Option<js_sys::Function>,
++    rdpdr_read_callback: Option<js_sys::Function>,
++    cliprdr_read_callback: Option<js_sys::Function>,
++    audio_callback: Option<js_sys::Function>,
++    gfx_callback: Option<js_sys::Function>,
++    file_transfer_port: Option<u16>,
+ 
+     use_display_control: bool,
+     enable_credssp: bool,
+     outbound_message_size_limit: Option<usize>,
++    shared_drives: Vec<(String, Vec<crate::rdpdr::MemFileEntry>)>,
+ }
+ 
+ impl Default for SessionBuilderInner {
+@@ -83,7 +109,7 @@ impl Default for SessionBuilderInner {
+             auth_token: None,
+             pcb: None,
+             kdc_proxy_url: None,
+-            client_name: "ironrdp-web".to_owned(),
++            client_name: "NextDesk".to_owned(),
+             desktop_size: DesktopSize {
+                 width: DEFAULT_WIDTH,
+                 height: DEFAULT_HEIGHT,
+@@ -94,10 +120,20 @@ impl Default for SessionBuilderInner {
+             set_cursor_style_callback_context: None,
+             remote_clipboard_changed_callback: None,
+             force_clipboard_update_callback: None,
++            file_contents_request_callback: None,
++            file_contents_response_callback: None,
++            file_chunk_callback: None,
++            rdpdr_write_callback: None,
++            rdpdr_read_callback: None,
++            cliprdr_read_callback: None,
++            audio_callback: None,
++            gfx_callback: None,
++            file_transfer_port: None,
+ 
+             use_display_control: false,
+             enable_credssp: true,
+             outbound_message_size_limit: None,
++            shared_drives: Vec::new(),
+         }
+     }
+ }
+@@ -207,6 +243,21 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+         self.clone()
+     }
+ 
++    fn file_contents_request_callback(&self, callback: js_sys::Function) -> Self {
++        self.0.borrow_mut().file_contents_request_callback = Some(callback);
++        self.clone()
++    }
++
++    fn file_contents_response_callback(&self, callback: js_sys::Function) -> Self {
++        self.0.borrow_mut().file_contents_response_callback = Some(callback);
++        self.clone()
++    }
++
++    fn file_chunk_callback(&self, callback: js_sys::Function) -> Self {
++        self.0.borrow_mut().file_chunk_callback = Some(callback);
++        self.clone()
++    }
++
+     fn extension(&self, ext: Extension) -> Self {
+         iron_remote_desktop::extension_match! {
+             match ext;
+@@ -224,6 +275,78 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+                 };
+                 self.0.borrow_mut().outbound_message_size_limit = if limit > 0 { Some(limit) } else { None };
+             };
++            |drive_share_name: String| {
++                info!("RDPDR drive share configured: {}", drive_share_name);
++                self.0.borrow_mut().shared_drives.push((drive_share_name, Vec::new()));
++            };
++            |rdpdr_read_callback: JsValue| {
++                if let Ok(func) = rdpdr_read_callback.dyn_into::<js_sys::Function>() {
++                    info!("RDPDR read callback configured");
++                    self.0.borrow_mut().rdpdr_read_callback = Some(func);
++                } else {
++                    warn!("rdpdr_read_callback is not a function");
++                }
++            };
++            |cliprdr_read_callback: JsValue| {
++                if let Ok(func) = cliprdr_read_callback.dyn_into::<js_sys::Function>() {
++                    info!("CLIPRDR read callback configured");
++                    self.0.borrow_mut().cliprdr_read_callback = Some(func);
++                } else {
++                    warn!("cliprdr_read_callback is not a function");
++                }
++            };
++            |drive_entries: String| {
++                // Parse JSON array of {path, is_dir, size, creation_time, last_access_time, last_write_time}
++                if let Ok(parsed) = serde_json::from_str::<Vec<DriveEntryJson>>(&drive_entries) {
++                    let entries: Vec<crate::rdpdr::MemFileEntry> = parsed.into_iter().map(|e| {
++                        crate::rdpdr::MemFileEntry {
++                            path: e.path,
++                            is_dir: e.is_dir,
++                            data: Vec::new(), // Data loaded on-demand via read_callback
++                            size: e.size,
++                            creation_time: e.creation_time,
++                            last_access_time: e.last_access_time,
++                            last_write_time: e.last_write_time,
++                        }
++                    }).collect();
++                    info!("RDPDR drive entries loaded: {} files", entries.len());
++                    // Add entries to the first (or only) shared drive
++                    let mut inner = self.0.borrow_mut();
++                    if let Some(drive) = inner.shared_drives.last_mut() {
++                        drive.1 = entries;
++                    } else {
++                        inner.shared_drives.push(("NextDesk".to_owned(), entries));
++                    }
++                } else {
++                    warn!("Failed to parse drive_entries JSON");
++                }
++            };
++            |audio_callback: JsValue| {
++                if let Ok(func) = audio_callback.dyn_into::<js_sys::Function>() {
++                    info!("Audio callback configured");
++                    self.0.borrow_mut().audio_callback = Some(func);
++                } else {
++                    warn!("audio_callback is not a function");
++                }
++            };
++            |gfx_callback: JsValue| {
++                if let Ok(func) = gfx_callback.dyn_into::<js_sys::Function>() {
++                    info!("GFX callback configured");
++                    self.0.borrow_mut().gfx_callback = Some(func);
++                } else {
++                    warn!("gfx_callback is not a function");
++                }
++            };
++            |file_transfer_port: JsValue| {
++                if let Some(port) = file_transfer_port.as_f64() {
++                    #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
++                    let port_u16 = port as u16;
++                    info!("File transfer WS port configured: {}", port_u16);
++                    self.0.borrow_mut().file_transfer_port = Some(port_u16);
++                } else {
++                    warn!("file_transfer_port is not a number");
++                }
++            };
+         }
+ 
+         self.clone()
+@@ -288,13 +411,25 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+         let (input_events_tx, input_events_rx) = mpsc::unbounded();
+ 
+         let clipboard = remote_clipboard_changed_callback.clone().map(|callback| {
+-            WasmClipboard::new(
++            let mut clip = WasmClipboard::new(
+                 clipboard::WasmClipboardMessageProxy::new(input_events_tx.clone()),
+                 clipboard::JsClipboardCallbacks {
+                     on_remote_clipboard_changed: callback,
+                     on_force_clipboard_update: force_clipboard_update_callback,
++                    on_file_contents_request: self.0.borrow().file_contents_request_callback.clone(),
++                    on_file_contents_response: self.0.borrow().file_contents_response_callback.clone(),
++                    on_file_chunk: self.0.borrow().file_chunk_callback.clone(),
+                 },
+-            )
++            );
++            // Set CLIPRDR file read callback for lazy file loading
++            if let Some(cb) = self.0.borrow().cliprdr_read_callback.clone() {
++                clip.set_file_read_callback(cb);
++            }
++            // Set file transfer WebSocket port for large file bypass
++            if let Some(port) = self.0.borrow().file_transfer_port {
++                clip.set_file_transfer_ws_port(port);
++            }
++            clip
+         });
+ 
+         let ws = WebSocket::open(&proxy_address).context("couldn't open WebSocket")?;
+@@ -325,6 +460,33 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+ 
+         let use_display_control = self.0.borrow().use_display_control;
+ 
++        // Build RDPDR backend if shared drives are configured
++        let (rdpdr_backend, shared_drive_names, rdpdr_deferred_rx) = {
++            let inner = self.0.borrow();
++            if inner.shared_drives.is_empty() {
++                (None, Vec::new(), None)
++            } else {
++                let (deferred_tx, deferred_rx) = mpsc::unbounded();
++                let mut backend = WasmRdpdrBackend::new(
++                    inner.client_name.clone(),
++                    inner.rdpdr_write_callback.clone(),
++                    inner.rdpdr_read_callback.clone(),
++                    deferred_tx,
++                );
++                let mut drive_names = Vec::new();
++                for (idx, (name, entries)) in inner.shared_drives.iter().enumerate() {
++                    drive_names.push((idx as u32, name.clone()));
++                    for entry in entries {
++                        backend.add_entry(entry.clone());
++                    }
++                }
++                (Some(backend), drive_names, Some(deferred_rx))
++            }
++        };
++
++        // Build RDPSND backend if audio callback is configured
++        let audio_callback = self.0.borrow().audio_callback.clone();
++
+         let (connection_result, ws) = connect(ConnectParams {
+             ws,
+             config,
+@@ -334,6 +496,10 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+             kdc_proxy_url,
+             clipboard_backend: clipboard.as_ref().map(|clip| clip.backend()),
+             use_display_control,
++            rdpdr_backend,
++            shared_drive_names,
++            audio_callback,
++            gfx_callback: self.0.borrow().gfx_callback.clone(),
+         })
+         .await?;
+ 
+@@ -359,6 +525,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+             rdp_reader: RefCell::new(Some(rdp_reader)),
+             connection_result: RefCell::new(Some(connection_result)),
+             clipboard: RefCell::new(Some(clipboard)),
++            rdpdr_deferred_rx: RefCell::new(rdpdr_deferred_rx),
+         })
+     }
+ }
+@@ -404,6 +571,7 @@ pub(crate) struct Session {
+     connection_result: RefCell<Option<connector::ConnectionResult>>,
+     rdp_reader: RefCell<Option<ReadHalf<WebSocket>>>,
+     clipboard: RefCell<Option<Option<WasmClipboard>>>,
++    rdpdr_deferred_rx: RefCell<Option<mpsc::UnboundedReceiver<RdpdrDeferredMessage>>>,
+ }
+ 
+ impl Session {
+@@ -473,6 +641,9 @@ impl iron_remote_desktop::Session for Session {
+ 
+         let mut clipboard = self.clipboard.borrow_mut().take().expect("run called only once");
+ 
++        // Take RDPDR deferred response receiver (if drive sharing is active)
++        let mut rdpdr_deferred = self.rdpdr_deferred_rx.borrow_mut().take();
++
+         let mut framed = ironrdp_futures::LocalFuturesFramed::new(rdp_reader);
+ 
+         debug!("Initialize canvas");
+@@ -592,8 +763,33 @@ impl iron_remote_desktop::Session for Session {
+                         }
+                     }
+                 }
++                // ── RDPDR deferred responses (async file reads) ──
++                deferred_msg = async {
++                    if let Some(ref mut rx) = rdpdr_deferred {
++                        use futures_util::StreamExt;
++                        rx.next().await
++                    } else {
++                        // No RDPDR active — never resolves
++                        futures_util::future::pending().await
++                    }
++                }.fuse() => {
++                    if let Some(msg) = deferred_msg {
++                        match msg {
++                            RdpdrDeferredMessage::Response(svc_messages) => {
++                                use ironrdp::svc::SvcProcessorMessages;
++                                let messages = SvcProcessorMessages::<Rdpdr>::new(svc_messages);
++                                let frame = active_stage.process_svc_processor_messages(messages)?;
++                                vec![ActiveStageOutput::ResponseFrame(frame)]
++                            }
++                        }
++                    } else {
++                        Vec::new()
++                    }
++                }
+             };
+ 
++            let mut needs_flush = false;
++
+             for out in outputs {
+                 match out {
+                     ActiveStageOutput::ResponseFrame(frame) => {
+@@ -602,9 +798,11 @@ impl iron_remote_desktop::Session for Session {
+                             .context("Send frame to writer task")?;
+                     }
+                     ActiveStageOutput::GraphicsUpdate(region) => {
+-                        // PERF: some copies and conversion could be optimized
+-                        let (region, buffer) = extract_partial_image(&image, region);
+-                        gui.draw(&buffer, region).context("draw updated region")?;
++                        // Zero-copy: reference image data directly, no Vec allocation
++                        let (data, image_width) = crate::image::extract_partial_image_ref(&image, &region);
++                        gui.draw_strided(data, region, image_width)
++                            .context("draw_strided updated region")?;
++                        needs_flush = true;
+                     }
+                     ActiveStageOutput::PointerDefault => {
+                         self.set_cursor_style(CursorStyle::Default)?;
+@@ -772,6 +970,13 @@ impl iron_remote_desktop::Session for Session {
+                     ActiveStageOutput::Terminate(reason) => break 'outer reason,
+                 }
+             }
++
++            // Batch flush: single drawArrays for all texture uploads this iteration
++            if needs_flush {
++                gui.flush();
++                // Increment global frame counter for FPS tracking
++                let _ = js_sys::eval("globalThis.__nextdesk_fps_count=(globalThis.__nextdesk_fps_count||0)+1");
++            }
+         };
+ 
+         info!(%disconnect_reason, "RDP session terminated");
+@@ -911,13 +1116,13 @@ fn build_config(
+         client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
+         platform: ironrdp::pdu::rdp::capability_sets::MajorPlatformType::UNSPECIFIED,
+         compression_type: None,
+-        enable_server_pointer: false,
++        enable_server_pointer: true,
+         autologon: false,
+-        enable_audio_playback: false,
++        enable_audio_playback: true,
+         request_data: None,
+         pointer_software_rendering: false,
+         multitransport_flags: None,
+-        performance_flags: PerformanceFlags::default(),
++        performance_flags: PerformanceFlags::DISABLE_WALLPAPER,
+         desktop_scale_factor: 0,
+         hardware_id: None,
+         license_cache: None,
+@@ -974,6 +1179,10 @@ struct ConnectParams {
+     kdc_proxy_url: Option<String>,
+     clipboard_backend: Option<WasmClipboardBackend>,
+     use_display_control: bool,
++    rdpdr_backend: Option<WasmRdpdrBackend>,
++    shared_drive_names: Vec<(u32, String)>,
++    audio_callback: Option<js_sys::Function>,
++    gfx_callback: Option<js_sys::Function>,
+ }
+ 
+ async fn connect(
+@@ -986,6 +1195,10 @@ async fn connect(
+         kdc_proxy_url,
+         clipboard_backend,
+         use_display_control,
++        rdpdr_backend,
++        shared_drive_names,
++        audio_callback,
++        gfx_callback,
+     }: ConnectParams,
+ ) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
+     let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
+@@ -993,16 +1206,66 @@ async fn connect(
+     // In web browser environments, we do not have an easy access to the local address of the socket.
+     let dummy_client_addr = core::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 33899));
+ 
++    // Save client_name before config is moved into ClientConnector
++    let client_name_for_rdpdr = config.client_name.clone();
++
+     let mut connector = ClientConnector::new(config, dummy_client_addr);
+ 
+     if let Some(clipboard_backend) = clipboard_backend {
+         connector.attach_static_channel(CliprdrClient::new(Box::new(clipboard_backend)));
+     }
+ 
+-    if use_display_control {
+-        connector.attach_static_channel(
+-            DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new()))),
+-        );
++    if let Some(backend) = rdpdr_backend {
++        let computer_name = client_name_for_rdpdr;
++        let drives = if shared_drive_names.is_empty() {
++            None
++        } else {
++            Some(shared_drive_names)
++        };
++        let rdpdr = Rdpdr::new(Box::new(backend), computer_name).with_drives(drives);
++        connector.attach_static_channel(rdpdr);
++        info!("RDPDR drive redirection channel registered");
++    }
++
++    if let Some(ref cb) = audio_callback {
++        let backend = WasmRdpsndBackend::new(cb.clone());
++        connector.attach_static_channel(Rdpsnd::new(Box::new(backend)));
++        warn!("RDPSND audio redirection channel registered (attached to connector)");
++    } else {
++        warn!("RDPSND: no audio_callback provided, skipping audio channel");
++    }
++
++    // Build dynamic virtual channel client (GFX + DisplayControl + AUDIO_PLAYBACK_DVC)
++    {
++        let mut dvc = DrdynvcClient::new();
++        let mut has_dvc = false;
++
++        if let Some(gfx_cb) = gfx_callback {
++            use ironrdp_egfx::client::GraphicsPipelineClient;
++            let handler = crate::gfx::WasmGfxHandler::new(gfx_cb);
++            dvc = dvc.with_dynamic_channel(GraphicsPipelineClient::new(Box::new(handler)));
++            has_dvc = true;
++            info!("GFX graphics pipeline channel registered");
++        }
++
++        if use_display_control {
++            dvc = dvc.with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
++            has_dvc = true;
++        }
++
++        // Register AUDIO_PLAYBACK_DVC for modern Windows servers (Win10+)
++        // that prefer sending audio over DVC instead of the legacy rdpsnd SVC.
++        if let Some(ref audio_cb) = audio_callback {
++            let dvc_backend = crate::rdpsnd::WasmRdpsndBackend::new(audio_cb.clone());
++            let rdpsnd_dvc = crate::rdpsnd_dvc::RdpsndDvc::new(Box::new(dvc_backend));
++            dvc = dvc.with_dynamic_channel(rdpsnd_dvc);
++            has_dvc = true;
++            warn!("AUDIO_PLAYBACK_DVC registered for modern audio redirection");
++        }
++
++        if has_dvc {
++            connector.attach_static_channel(dvc);
++        }
+     }
+ 
+     let (upgraded, server_public_key) =
+@@ -1028,6 +1291,11 @@ async fn connect(
+ 
+     let ws = framed.into_inner_no_leftover();
+ 
++    // Diagnostic: log which static channels were joined
++    for (_id, ch) in connection_result.static_channels.iter() {
++        warn!("RDPSND diag: joined channel name={:?}", ch.channel_name());
++    }
++
+     Ok((connection_result, ws))
+ }
+ 

@@ -17,6 +17,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout patched IronRDP
+        shell: bash
+        run: |
+          git clone --no-tags https://github.com/Devolutions/IronRDP.git ../IronRDP
+          git -C ../IronRDP checkout bf694c8a239d4cf53e7dd8edbe26f2aeb07bcf26
+          git -C ../IronRDP apply "$PWD/patches/ironrdp-nextdesk.patch"
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -58,6 +65,13 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout patched IronRDP
+        shell: bash
+        run: |
+          git clone --no-tags https://github.com/Devolutions/IronRDP.git ../IronRDP
+          git -C ../IronRDP checkout bf694c8a239d4cf53e7dd8edbe26f2aeb07bcf26
+          git -C ../IronRDP apply "$PWD/patches/ironrdp-nextdesk.patch"
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
