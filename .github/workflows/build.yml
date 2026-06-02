@@ -94,6 +94,17 @@ jobs:
           KEY=$(echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" | tr -d '\n\r')
           echo "TAURI_SIGNING_PRIVATE_KEY=$KEY" >> "$GITHUB_ENV"
 
+      - name: Preflight Windows build log
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npm run tauri build -- --config src-tauri/tauri.windows.conf.json 2>&1 | Tee-Object windows-tauri-build.log
+          if ($LASTEXITCODE -ne 0) {
+            gh release upload "${{ github.ref_name }}" windows-tauri-build.log --clobber
+            exit $LASTEXITCODE
+          }
+
       - name: Build & Release
         uses: tauri-apps/tauri-action@v0
         env:
