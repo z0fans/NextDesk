@@ -99,10 +99,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          npm run tauri build -- --config src-tauri/tauri.windows.conf.json 2>&1 | Tee-Object windows-tauri-build.log
-          if ($LASTEXITCODE -ne 0) {
+          cmd /c "npm run tauri build -- --config src-tauri/tauri.windows.conf.json > windows-tauri-build.log 2>&1"
+          $exitCode = $LASTEXITCODE
+          Get-Content windows-tauri-build.log
+          if ($exitCode -ne 0) {
             gh release upload "${{ github.ref_name }}" windows-tauri-build.log --clobber
-            exit $LASTEXITCODE
+            exit $exitCode
           }
 
       - name: Build & Release

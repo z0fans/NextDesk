@@ -1,6 +1,6 @@
 [package]
 name = "nextdesk"
-version = "1.0.98"
+version = "1.0.99"
 edition = "2021"
 
 [dependencies]
@@ -68,7 +68,6 @@ windows = { version = "0.61.3", features = [
   "Win32_System_Memory",
   "Win32_System_Ole",
   "Win32_UI_Shell",
-  "Win32_UI_Shell_Common",
 ] }
 
 [build-dependencies]

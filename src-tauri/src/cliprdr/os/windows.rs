@@ -16,8 +16,7 @@ use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GHND, GLOBAL_ALLOC_FLAGS,
 };
 use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
-use windows::Win32::UI::Shell::Common::DROPFILES;
-use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+use windows::Win32::UI::Shell::{DragQueryFileW, DROPFILES, HDROP};
 
 /// Windows clipboard backend using Win32 Clipboard APIs.
 pub struct WindowsClipboard;
