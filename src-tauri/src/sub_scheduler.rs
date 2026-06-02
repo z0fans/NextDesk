@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::config;
-use crate::state::{AppState, ProxyGroup, SyncState};
+use crate::state::{AppState, SyncState};
 use crate::subscription;
 
 const SYNC_INTERVAL_SECS: u64 = 24 * 60 * 60;
@@ -54,50 +54,27 @@ async fn run_sync(app: &AppHandle, state: &AppState, allow_retry: bool) {
     *state.sync_state.lock().unwrap() = SyncState::Syncing;
     emit_sync_state(app, state);
 
-    match subscription::load_subscription(&url, None).await {
+    // Use active proxy if Clash engine is running
+    let proxy_port: Option<u16> = {
+        let has_internal = {
+            let proc = state.clash_process.lock().unwrap();
+            proc.as_ref().map_or(false, |c| c.id().is_some())
+        };
+        if has_internal {
+            Some(*state.proxy_port.lock().unwrap())
+        } else {
+            None
+        }
+    };
+
+    match subscription::load_subscription(&url, proxy_port).await {
         Ok(parsed) => {
             let servers = subscription::transform_proxies_to_servers(&parsed.proxies);
             *state.servers.lock().unwrap() = servers.clone();
 
-            let groups: Vec<ProxyGroup> = parsed
-                .proxy_groups
-                .iter()
-                .filter_map(|g| {
-                    let name = g.get("name")?.as_str()?.to_string();
-                    let gtype = g.get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("select")
-                        .to_string();
-                    let proxies: Vec<String> = g
-                        .get("proxies")
-                        .and_then(|v| v.as_sequence())
-                        .map(|seq| seq.iter().filter_map(|p| p.as_str().map(|s| s.to_string())).collect())
-                        .unwrap_or_default();
-                    Some(ProxyGroup { name, group_type: gtype, proxies, now: None })
-                })
-                .collect();
+            let server_names: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+            let groups = config::build_rdp_proxy_groups(&server_names);
             *state.proxy_groups.lock().unwrap() = groups;
-
-            // If no proxy groups from subscription (URI list format),
-            // generate default Server-RDP and Auto-RDP groups
-            if state.proxy_groups.lock().unwrap().is_empty() && !servers.is_empty() {
-                let server_names: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
-                let default_groups = vec![
-                    ProxyGroup {
-                        name: "Server-RDP".to_string(),
-                        group_type: "select".to_string(),
-                        proxies: server_names.clone(),
-                        now: None,
-                    },
-                    ProxyGroup {
-                        name: "Auto-RDP".to_string(),
-                        group_type: "fallback".to_string(),
-                        proxies: server_names,
-                        now: None,
-                    },
-                ];
-                *state.proxy_groups.lock().unwrap() = default_groups;
-            }
 
             if let Some(raw) = &parsed.raw_config {
                 config::generate_clash_config_from_subscription(raw);
@@ -136,7 +113,8 @@ pub async fn trigger_sync(app: &AppHandle) {
 
 fn classify_error(err: &str) -> &'static str {
     let s = err.to_lowercase();
-    if s.contains("timeout") || s.contains("connect") || s.contains("dns") || s.contains("resolve") {
+    if s.contains("timeout") || s.contains("connect") || s.contains("dns") || s.contains("resolve")
+    {
         "network_error"
     } else if s.contains("401") || s.contains("403") || s.contains("unauthorized") {
         "subscription_invalid"

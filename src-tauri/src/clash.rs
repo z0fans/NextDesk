@@ -7,10 +7,16 @@ use tokio::process::{Child, Command};
 
 use crate::config::{get_log_dir, get_user_config_dir};
 
-const CLASH_API_PORTS: &[u16] = &[9090, 9097, 7891, 7890];
-#[allow(dead_code)]
-const DEFAULT_CLASH_API: &str = "http://127.0.0.1:17891";
-const RDP_GROUP_KEYWORDS: &[&str] = &["server-", "auto-"];
+const PROXY_ENV_VARS: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
 
 fn http_client() -> Client {
     Client::builder()
@@ -24,56 +30,58 @@ fn encode_proxy_name(name: &str) -> String {
     urlencoding::encode(name).into_owned()
 }
 
-/// Detect external Clash instance on common ports
-pub async fn detect_external_clash()
-    -> Option<(String, u16)>
-{
-    let client = Client::builder()
-        .timeout(Duration::from_secs(1))
-        .no_proxy() // Bypass system proxy for local detection
-        .build()
-        .ok()?;
-
-    for &port in CLASH_API_PORTS {
-        let url =
-            format!("http://127.0.0.1:{port}/version");
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().is_success() {
-                return Some((
-                    "127.0.0.1".into(),
-                    port,
-                ));
-            }
-        }
+fn normalize_delay(delay: i64) -> i64 {
+    if delay > 0 {
+        delay
+    } else {
+        -1
     }
-    None
 }
 
-/// Get proxy port from external Clash config
-pub async fn get_clash_proxy_port(
-    host: &str,
-    port: u16,
-) -> u16 {
-    let client = http_client();
-    let url = format!("http://{host}:{port}/configs");
-    if let Ok(resp) = client.get(&url).send().await {
-        if let Ok(data) = resp.json::<Value>().await {
-            // mixed-port=0 means disabled; prefer non-zero mixed-port, else socks-port
-            if let Some(p) = data
-                .get("mixed-port")
-                .and_then(|v| v.as_u64())
-                .filter(|&p| p > 0)
-                .or_else(|| {
-                    data.get("socks-port")
-                        .and_then(|v| v.as_u64())
-                        .filter(|&p| p > 0)
-                })
-            {
-                return p as u16;
-            }
+fn extract_delay_from_proxy_info(info: &Value) -> Option<i64> {
+    if let Some(delay) = info
+        .get("history")
+        .and_then(|v| v.as_array())
+        .and_then(|items| items.last())
+        .and_then(|entry| entry.get("delay"))
+        .and_then(|v| v.as_i64())
+    {
+        return Some(normalize_delay(delay));
+    }
+
+    match info.get("alive").and_then(|v| v.as_bool()) {
+        Some(false) => Some(-1),
+        _ => None,
+    }
+}
+
+fn merge_delays_with_snapshot(
+    results: &mut std::collections::HashMap<String, i64>,
+    proxies: &[String],
+    snapshot: &Value,
+) {
+    let Some(proxy_map) = snapshot.get("proxies").and_then(|v| v.as_object()) else {
+        return;
+    };
+
+    for proxy in proxies {
+        if results.contains_key(proxy) {
+            continue;
+        }
+        let Some(info) = proxy_map.get(proxy) else {
+            continue;
+        };
+        if let Some(delay) = extract_delay_from_proxy_info(info) {
+            results.insert(proxy.clone(), delay);
         }
     }
-    7897
+}
+
+async fn fetch_proxies_snapshot(api_base: &str) -> Option<Value> {
+    let client = http_client();
+    let url = format!("{api_base}/proxies");
+    let resp = client.get(&url).send().await.ok()?;
+    resp.json::<Value>().await.ok()
 }
 
 /// Trigger geodata update on external Clash
@@ -88,9 +96,7 @@ pub async fn trigger_geodata_update(api_base: &str) {
 }
 
 /// Start Clash/mihomo process
-pub async fn start_clash_process()
-    -> Result<Child, String>
-{
+pub async fn start_clash_process() -> Result<Child, String> {
     let bin_dir = get_bin_dir();
     eprintln!("[clash] bin_dir: {}", bin_dir.display());
     let binary_name = if cfg!(target_os = "windows") {
@@ -106,8 +112,7 @@ pub async fn start_clash_process()
         ));
     }
 
-    let config_path =
-        get_user_config_dir().join("runtime_clash.yaml");
+    let config_path = get_user_config_dir().join("runtime_clash.yaml");
     if !config_path.exists() {
         return Err("Clash config not found".into());
     }
@@ -115,18 +120,12 @@ pub async fn start_clash_process()
     // Copy bundled geodata files to config dir so mihomo
     // doesn't need to download them on first launch
     let config_dir = get_user_config_dir();
-    for fname in &[
-        "Country.mmdb",
-        "geoip.metadb",
-        "geosite.dat",
-    ] {
+    for fname in &["Country.mmdb", "geoip.metadb", "geosite.dat"] {
         let src = bin_dir.join(fname);
         let dst = config_dir.join(fname);
         if src.exists() && !dst.exists() {
             if let Err(e) = fs::copy(&src, &dst) {
-                eprintln!(
-                    "[clash] Failed to copy {fname}: {e}"
-                );
+                eprintln!("[clash] Failed to copy {fname}: {e}");
             } else {
                 eprintln!("[clash] Copied {fname} to config dir");
             }
@@ -134,8 +133,7 @@ pub async fn start_clash_process()
     }
 
     let log_path = get_log_dir().join("clash.log");
-    let log_file = fs::File::create(&log_path)
-        .map_err(|e| format!("Log create failed: {e}"))?;
+    let log_file = fs::File::create(&log_path).map_err(|e| format!("Log create failed: {e}"))?;
     let stderr_file = log_file
         .try_clone()
         .map_err(|e| format!("Clone failed: {e}"))?;
@@ -143,10 +141,16 @@ pub async fn start_clash_process()
     let mut cmd = Command::new(&mihomo_path);
     cmd.arg("-f")
         .arg(&config_path)
+        .arg("-d")
+        .arg(&config_dir)
         .current_dir(&config_dir)
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(stderr_file))
         .kill_on_drop(true);
+
+    for var in PROXY_ENV_VARS {
+        cmd.env_remove(var);
+    }
 
     // Hide the console window on Windows
     #[cfg(target_os = "windows")]
@@ -156,9 +160,7 @@ pub async fn start_clash_process()
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("Spawn failed: {e}"))?;
+    let child = cmd.spawn().map_err(|e| format!("Spawn failed: {e}"))?;
 
     Ok(child)
 }
@@ -172,8 +174,7 @@ fn get_bin_dir() -> std::path::PathBuf {
                 return bin;
             }
             // macOS: Contents/MacOS/../Resources/bin
-            let resources = parent
-                .join("../Resources/bin");
+            let resources = parent.join("../Resources/bin");
             if resources.exists() {
                 return resources;
             }
@@ -199,57 +200,8 @@ fn get_bin_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(".backend/bin")
 }
 
-/// Fetch proxy groups filtered by RDP keywords
-pub async fn fetch_proxy_groups(
-    api_base: &str,
-) -> Vec<Value> {
-    let client = http_client();
-    let url = format!("{api_base}/proxies");
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(_) => return vec![],
-    };
-    let data: Value = match resp.json().await {
-        Ok(d) => d,
-        Err(_) => return vec![],
-    };
-    let proxies = match data.get("proxies") {
-        Some(Value::Object(m)) => m,
-        _ => return vec![],
-    };
-
-    let mut groups = vec![];
-    for (name, info) in proxies {
-        let ptype = info
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if ptype != "Selector" {
-            continue;
-        }
-        let lower = name.to_lowercase();
-        if !RDP_GROUP_KEYWORDS
-            .iter()
-            .any(|kw| lower.contains(kw))
-        {
-            continue;
-        }
-        groups.push(serde_json::json!({
-            "name": name,
-            "type": "select",
-            "proxies": info.get("all")
-                .unwrap_or(&Value::Array(vec![])),
-            "now": info.get("now"),
-        }));
-    }
-    groups
-}
-
 /// Get the currently active proxy in a group
-pub async fn get_active_proxy(
-    api_base: &str,
-    group_name: &str,
-) -> Option<String> {
+pub async fn get_active_proxy(api_base: &str, group_name: &str) -> Option<String> {
     let client = http_client();
     let encoded = encode_proxy_name(group_name);
     let url = format!("{api_base}/proxies/{encoded}");
@@ -261,18 +213,77 @@ pub async fn get_active_proxy(
 }
 
 /// Switch proxy in a group
-pub async fn switch_proxy(
-    api_base: &str,
-    group_name: &str,
-    proxy_name: &str,
-) -> bool {
+pub async fn switch_proxy(api_base: &str, group_name: &str, proxy_name: &str) -> bool {
     let client = http_client();
     let encoded = encode_proxy_name(group_name);
     let url = format!("{api_base}/proxies/{encoded}");
     let body = serde_json::json!({"name": proxy_name});
     match client.put(&url).json(&body).send().await {
-        Ok(resp) => resp.status().as_u16() == 204,
+        Ok(resp) => {
+            let success = resp.status().as_u16() == 204;
+            if success {
+                // Close existing RDP connections (port 3389/22) that were routed
+                // through this group, so they reconnect via the new node
+                close_rdp_connections(api_base, group_name).await;
+            }
+            success
+        }
         Err(_) => false,
+    }
+}
+
+/// Close active RDP/SSH connections routed through a specific proxy group.
+/// This forces reconnection through the newly selected node after a switch.
+async fn close_rdp_connections(api_base: &str, group_name: &str) {
+    let client = http_client();
+    let url = format!("{api_base}/connections");
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let data: Value = match resp.json().await {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    let Some(conns) = data.get("connections").and_then(|v| v.as_array()) else {
+        return;
+    };
+
+    let rdp_ports: &[u16] = &[3389, 22];
+
+    for conn in conns {
+        // Parse destination port
+        let dest_port: u16 = conn
+            .get("metadata")
+            .and_then(|m| m.get("destinationPort"))
+            .and_then(|p| {
+                p.as_u64()
+                    .or_else(|| p.as_str().and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(0) as u16;
+
+        if !rdp_ports.contains(&dest_port) {
+            continue;
+        }
+
+        // Check if this connection goes through the switched group
+        let goes_through_group = conn
+            .get("chains")
+            .and_then(|c| c.as_array())
+            .map(|arr| arr.iter().any(|c| c.as_str() == Some(group_name)))
+            .unwrap_or(false);
+
+        if !goes_through_group {
+            continue;
+        }
+
+        // Close this connection
+        if let Some(id) = conn.get("id").and_then(|v| v.as_str()) {
+            let close_url = format!("{api_base}/connections/{id}");
+            let _ = client.delete(&close_url).send().await;
+            eprintln!("[clash] Closed RDP connection {id} (port {dest_port}) after node switch in {group_name}");
+        }
     }
 }
 
@@ -282,17 +293,14 @@ pub async fn test_group_delays(
     group_name: &str,
     proxies: &[String],
 ) -> std::collections::HashMap<String, i64> {
-    use std::collections::HashMap;
+    let snapshot = fetch_proxies_snapshot(api_base).await;
+    let mut results = std::collections::HashMap::new();
 
     // Try group delay endpoint first (mihomo)
     let client = http_client();
     let encoded_group = encode_proxy_name(group_name);
-    let group_url = format!(
-        "{api_base}/group/{encoded_group}/delay"
-    );
-    eprintln!(
-        "[delay] Testing group: {group_name}, url: {group_url}"
-    );
+    let group_url = format!("{api_base}/group/{encoded_group}/delay");
+    eprintln!("[delay] Testing group: {group_name}, url: {group_url}");
     let group_resp = client
         .get(&group_url)
         .query(&[
@@ -303,46 +311,52 @@ pub async fn test_group_delays(
         .await;
 
     if let Ok(resp) = group_resp {
-        eprintln!(
-            "[delay] Group response status: {}",
-            resp.status()
-        );
+        eprintln!("[delay] Group response status: {}", resp.status());
         if resp.status().is_success() {
-            if let Ok(data) =
-                resp.json::<HashMap<String, Value>>().await
+            if let Ok(data) = resp
+                .json::<std::collections::HashMap<String, Value>>()
+                .await
             {
-                let mut results = HashMap::new();
                 for (name, val) in &data {
                     let delay = val
                         .as_i64()
-                        .or_else(|| {
-                            val.get("delay")
-                                .and_then(|d| d.as_i64())
-                        })
+                        .or_else(|| val.get("delay").and_then(|d| d.as_i64()))
+                        .map(normalize_delay)
                         .unwrap_or(-1);
                     results.insert(name.clone(), delay);
-                }
-                eprintln!(
-                    "[delay] Group results: {} nodes",
-                    results.len()
-                );
-                if !results.is_empty() {
-                    return results;
                 }
             }
         }
     }
 
-    // Fallback: test each proxy individually
+    if let Some(snapshot) = snapshot.as_ref() {
+        merge_delays_with_snapshot(&mut results, proxies, snapshot);
+    }
+
     eprintln!(
-        "[delay] Fallback: testing {} proxies individually",
+        "[delay] Merged results: {}/{} nodes",
+        results.len(),
         proxies.len()
     );
-    let mut results = HashMap::new();
+    if results.len() == proxies.len() {
+        return results;
+    }
+
+    let missing: Vec<String> = proxies
+        .iter()
+        .filter(|proxy| !results.contains_key(*proxy))
+        .cloned()
+        .collect();
+
+    // Fallback: test unresolved proxies individually
+    eprintln!(
+        "[delay] Fallback: testing {} unresolved proxies individually",
+        missing.len()
+    );
     let mut handles = vec![];
-    for proxy in proxies {
+    for proxy in missing {
         let base = api_base.to_string();
-        let name = proxy.clone();
+        let name = proxy;
         handles.push(tokio::spawn(async move {
             let client = Client::builder()
                 .timeout(Duration::from_secs(10))
@@ -350,9 +364,7 @@ pub async fn test_group_delays(
                 .build()
                 .unwrap_or_default();
             let encoded = encode_proxy_name(&name);
-            let url = format!(
-                "{base}/proxies/{encoded}/delay"
-            );
+            let url = format!("{base}/proxies/{encoded}/delay");
             let resp = client
                 .get(&url)
                 .query(&[
@@ -362,29 +374,19 @@ pub async fn test_group_delays(
                 .send()
                 .await;
             let delay = match resp {
-                Ok(r) if r.status().is_success() => {
-                    r.json::<Value>()
-                        .await
-                        .ok()
-                        .and_then(|d| {
-                            d.get("delay")
-                                .and_then(|v| v.as_i64())
-                        })
-                        .unwrap_or(-1)
-                }
+                Ok(r) if r.status().is_success() => r
+                    .json::<Value>()
+                    .await
+                    .ok()
+                    .and_then(|d| d.get("delay").and_then(|v| v.as_i64()))
+                    .map(normalize_delay)
+                    .unwrap_or(-1),
                 Ok(r) => {
-                    eprintln!(
-                        "[delay] {} => HTTP {}",
-                        name,
-                        r.status()
-                    );
+                    eprintln!("[delay] {} => HTTP {}", name, r.status());
                     -1
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[delay] {} => error: {}",
-                        name, e
-                    );
+                    eprintln!("[delay] {} => error: {}", name, e);
                     -1
                 }
             };
@@ -401,9 +403,7 @@ pub async fn test_group_delays(
 }
 
 /// Get current connections
-pub async fn get_connections(
-    api_base: &str,
-) -> Value {
+pub async fn get_connections(api_base: &str) -> Value {
     let client = http_client();
     let url = format!("{api_base}/connections");
     match client.get(&url).send().await {
@@ -438,3 +438,59 @@ pub fn get_clash_log() -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
+    use super::{extract_delay_from_proxy_info, merge_delays_with_snapshot};
+
+    #[test]
+    fn merges_partial_group_results_with_snapshot_failures() {
+        let proxies = vec!["US".to_string(), "HK".to_string(), "JP".to_string()];
+        let mut results = HashMap::from([("HK".to_string(), 91)]);
+        let snapshot = json!({
+            "proxies": {
+                "US": {
+                    "alive": false,
+                    "history": [{"delay": 0}]
+                },
+                "HK": {
+                    "alive": true,
+                    "history": [{"delay": 91}]
+                },
+                "JP": {
+                    "alive": true,
+                    "history": []
+                }
+            }
+        });
+
+        merge_delays_with_snapshot(&mut results, &proxies, &snapshot);
+
+        assert_eq!(results.get("US"), Some(&-1));
+        assert_eq!(results.get("HK"), Some(&91));
+        assert_eq!(results.get("JP"), None);
+    }
+
+    #[test]
+    fn extracts_delay_from_proxy_snapshot_history() {
+        let success = json!({
+            "alive": true,
+            "history": [{"delay": 42}]
+        });
+        let failed = json!({
+            "alive": false,
+            "history": [{"delay": 0}]
+        });
+        let pending = json!({
+            "alive": true,
+            "history": []
+        });
+
+        assert_eq!(extract_delay_from_proxy_info(&success), Some(42));
+        assert_eq!(extract_delay_from_proxy_info(&failed), Some(-1));
+        assert_eq!(extract_delay_from_proxy_info(&pending), None);
+    }
+}

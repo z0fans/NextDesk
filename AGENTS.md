@@ -7,8 +7,74 @@
 NextDesk 是一款 **跨平台加速远程桌面客户端**，集成了 RDP 远程桌面（IronRDP WASM）与 Clash 网络加速引擎，基于 **Tauri 2 + React 19** 构建。
 
 - **仓库**: `z0fans/NextDesk`
-- **当前版本**: `1.0.69`
+- **当前版本**: `1.0.95`
 - **目标平台**: macOS (主要), Windows
+
+---
+
+## ⚠️ 关键前置依赖：IronRDP 仓库
+
+NextDesk **必须配合一个修改过的 IronRDP 仓库**才能编译。Cargo.toml 通过相对路径 `../../IronRDP/crates/*` 引用 90+ 个 ironrdp-* crate。
+
+### 目录结构要求
+
+```
+<父目录>/
+├── IronRDP/        ← 必须存在！与 NextDesk 同级
+│   └── crates/
+│       ├── ironrdp/
+│       ├── ironrdp-cliprdr/
+│       ├── ironrdp-web/
+│       └── ...
+└── NextDesk/       ← 主项目（本仓库）
+```
+
+### IronRDP 来源
+
+- **上游**: `https://github.com/Devolutions/IronRDP.git`
+- **基础 commit**: `bf694c8a23` 或更新
+- **本地修改**: 包含 NextDesk 专用补丁（见下文），不能直接用上游 master
+
+### 本地修改的 crate（不可删除/不可被上游覆盖）
+
+以下 crate 包含 NextDesk 必需的本地修改：
+
+| Crate | 修改内容 | 用途 |
+|:---|:---|:---|
+| `ironrdp-cliprdr` | `pdu/format_data/file_list.rs` | CLIPRDR 文件列表 PDU 解析增强 |
+| `ironrdp-connector` | `connection.rs` / `connection_activation.rs` | 连接握手补丁 |
+| `ironrdp-dvc` | `client.rs` | DVC 客户端 |
+| `ironrdp-rdpsnd-native` | `cpal.rs` | macOS 音频后端适配 |
+| `ironrdp-rdpsnd` | `client.rs` | 音频客户端 |
+| `iron-remote-desktop` | `lib.rs` / `session.rs` | WASM 高层 session API |
+| `ironrdp-web` | `Cargo.toml` + `canvas.rs` / `clipboard.rs` / `image.rs` / `lib.rs` / `session.rs` + 新增 `gfx.rs` / `rdpdr.rs` / `rdpsnd.rs` | WASM 模式核心 |
+
+### 升级上游的注意事项
+
+如果将来要升级到上游 IronRDP 新版本：
+1. 在 IronRDP 工作目录创建保护 branch：`git checkout -b nextdesk-patches`
+2. 拉上游：`git fetch upstream && git checkout master && git merge upstream/master`
+3. 把 `nextdesk-patches` 的修改 cherry-pick 或 rebase 到新 master
+4. 重新编译 NextDesk + WASM 验证
+
+### 新机器初次 setup
+
+```bash
+# 在父目录
+cd ~/your-projects-dir/
+
+# 1. clone 上游 IronRDP（或从你的 fork 拉取已含补丁的版本）
+git clone https://github.com/Devolutions/IronRDP.git
+
+# 2. clone NextDesk
+git clone https://github.com/z0fans/NextDesk.git
+
+# 3. 应用 NextDesk 的 IronRDP 补丁（如果有 patch 文件）
+#    或直接 clone 你 fork 的 IronRDP（含补丁）
+
+# 4. 编译
+cd NextDesk && npx tauri dev
+```
 
 ---
 
@@ -33,17 +99,15 @@ NextDesk 是一款 **跨平台加速远程桌面客户端**，集成了 RDP 远�
 NextDesk/
 ├── frontend/                    # React 前端 (Vite SPA)
 │   ├── src/
-│   │   ├── App.tsx              # 主界面 SPA (997行, 6 个 Tab)
+│   │   ├── App.tsx              # 主界面 SPA (1342行, 6 个 Tab)
 │   │   ├── api.ts               # Tauri invoke 桥接层
 │   │   ├── main.tsx             # React 入口
 │   │   ├── index.css            # 全局样式 (Tailwind v4)
 │   │   ├── components/
-│   │   │   ├── RdpManager.tsx   # RDP 核心组件 (86KB, 会话/输入/渲染)
+│   │   │   ├── RdpManager.tsx   # RDP 核心组件 (107KB, 会话/输入/渲染)
 │   │   │   ├── RdpSidebar.tsx   # RDP 侧边栏 (服务器列表/分组)
 │   │   │   ├── RdpTabBar.tsx    # RDP 多标签栏
-│   │   │   ├── RdpViewer.tsx    # RDP 画布查看器
 │   │   │   ├── RdpGridView.tsx  # RDP 网格视图
-│   │   │   ├── RdpConnectDialog.tsx
 │   │   │   ├── NewConnectionDialog.tsx
 │   │   │   ├── Logo.tsx
 │   │   │   ├── ThemeToggle.tsx
@@ -53,10 +117,12 @@ NextDesk/
 │   │   │   ├── translations.ts
 │   │   │   ├── LanguageProvider.tsx
 │   │   │   └── useTranslation.ts
-│   │   ├── wasm/                # IronRDP WASM 产物
+│   │   ├── wasm/                # IronRDP WASM 产物 (wasm-pack 输出)
 │   │   │   ├── ironrdp_web.js
+│   │   │   ├── ironrdp_web.d.ts
+│   │   │   ├── ironrdp_web_bg.js
 │   │   │   ├── ironrdp_web_bg.wasm  # ~4.2MB
-│   │   │   └── ironrdp_web.d.ts
+│   │   │   └── ironrdp_web_bg.wasm.d.ts
 │   │   └── lib/
 │   │       └── utils.ts         # cn() 等工具函数
 │   ├── vite.config.ts
@@ -68,22 +134,34 @@ NextDesk/
 │       ├── main.rs              # Tauri 入口
 │       ├── lib.rs               # 命令注册 + Tauri setup
 │       ├── rdp_proxy.rs         # RDCleanPath WebSocket 代理 (WS↔TCP)
+│       ├── rdp_session.rs       # RDP 原生会话管理 (IronRDP native)
+│       ├── rdp_audio.rs         # RDP 音频重定向 (RDPSND + cpal)
+│       ├── frame_ws.rs          # 帧数据 WebSocket 传输
+│       ├── relay.rs             # 连接中继
+│       ├── tube.rs              # Tube 通道 (aggligator 多路复用)
 │       ├── clash.rs             # Clash 引擎管理
 │       ├── config.rs            # 配置持久化
 │       ├── state.rs             # 全局状态
 │       ├── subscription.rs      # 订阅解析 (多格式)
 │       ├── updater.rs           # GitHub Release 自动更新
 │       ├── rdpdr_backend.rs     # RDP 驱动重定向后端
+│       ├── cliprdr_backend.rs   # 剪贴板重定向后端 (CLIPRDR)
 │       ├── virtual_file_clipboard.rs
 │       ├── virtual_clipboard_registry.rs
 │       ├── windows_virtual_files.rs
 │       ├── macos_file_promise.rs
 │       ├── macos_item_provider.rs
-│       └── macos_pasteboard_promise.rs
+│       ├── macos_pasteboard_promise.rs
+│       └── macos_cursor_fix.rs  # macOS 光标显示修复
 │
+├── tube-server/                 # Tube 中继服务端
+│
+├── scripts/                     # 构建/部署脚本
 ├── .backend/                    # 旧版 Python 后端 (已废弃, 保留参考)
 ├── .assets/                     # 静态资源
+├── .github/                     # GitHub Actions CI/CD
 ├── doc/                         # 文档
+├── docs/                        # 额外文档
 ├── AGENTS.md                    # ← 本文件
 └── RELEASE.md                   # 发布说明
 ```
@@ -96,11 +174,17 @@ NextDesk/
 
 ```
 用户操作 → React UI (App.tsx)
-  ├─ RDP 连接 → RdpManager.tsx → IronRDP WASM → WebSocket
-  │              ↕                                  ↕
-  │         Canvas (WebGL2)              rdp_proxy.rs (Tauri)
-  │                                          ↕
-  │                                   TCP → RDP Server
+  ├─ RDP 连接 (原生模式) → Tauri invoke → rdp_session.rs → IronRDP native
+  │                          ↕                                    ↕
+  │                    frame_ws.rs (LZ4帧)              TCP → RDP Server
+  │                          ↕                          (可选 Tube 聚合)
+  │                    Canvas (WebGL2)
+  │
+  ├─ RDP 连接 (WASM模式) → RdpManager.tsx → IronRDP WASM → WebSocket
+  │                          ↕                                  ↕
+  │                    Canvas (WebGL2)              rdp_proxy.rs (Tauri)
+  │                                                      ↕
+  │                                               TCP → RDP Server
   │
   └─ 网络加速 → Tauri invoke → clash.rs → Clash Meta 进程
                                   ↕
@@ -109,10 +193,10 @@ NextDesk/
 
 ### RDP 渲染管线
 
-1. **WebGL2 GPU 纹理渲染** — `canvas.rs` (替代 softbuffer CPU 渲染)
-2. **零拷贝帧合并** — `image.rs` strided buffer + `requestAnimationFrame`
-3. **H.264 硬件解码** — `gfx.rs` (WASM) + `h264-decoder.ts` (WebCodecs)
-4. **Worker 解码卸载** — `decode-worker.ts` (OffscreenCanvas)
+1. **原生 RDP 会话** — `rdp_session.rs` (IronRDP native, Rust 侧完整会话)
+2. **帧传输** — `frame_ws.rs` (RGBA/LZ4 帧 → WebSocket → 前端)
+3. **前端渲染** — Canvas WebGL2 纹理渲染 + `requestAnimationFrame`
+4. **音频重定向** — `rdp_audio.rs` (RDPSND → cpal 本地播放)
 
 ### RDCleanPath 代理
 
@@ -120,6 +204,13 @@ NextDesk/
 - WASM WebSocket 请求 → 解码 RDCleanPath → TCP 连接 RDP 服务器
 - X.224 握手 → TLS 握手获取证书 → 构建响应 → 原始双向转发
 - 支持 SOCKS5 代理上游 (`tokio-socks`)
+
+### Tube 多路复用
+
+`tube.rs` + `tube-server/` 实现基于 `aggligator` 的连接聚合：
+- 多条 TCP/WebSocket 链路聚合为单一逻辑连接
+- 提升弱网环境下的 RDP 连接稳定性
+- `tube-server/` 为独立部署的中继服务端
 
 ---
 
@@ -172,7 +263,7 @@ wasm-pack build --target web crates/ironrdp-web
 - **组件库**: ShadcnUI 组件位于 `frontend/src/components/ui/`
 - **工具函数**: `cn()` 函数 (`frontend/src/lib/utils.ts`) 封装 `clsx` + `tailwind-merge`
 - **路径别名**: `@/` → `frontend/src/` (在 `vite.config.ts` 和 `tsconfig.app.json` 中配置)
-- **WASM 支持**: 使用 `vite-plugin-wasm` + `vite-plugin-top-level-await` 插件
+- **WASM 支持**: `vite-plugin-wasm` + `vite-plugin-top-level-await` (devDependencies 中可用，按需在 vite.config.ts 中启用)
 - **国际化**: 所有用户可见文本必须走 `t('key')` (`useTranslation` hook)
   - 翻译文件: `frontend/src/i18n/translations.ts` (中/英双语)
   - 新增 UI 文本时必须同时添加中英两种翻译

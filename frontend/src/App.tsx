@@ -71,13 +71,10 @@ function AppContent() {
   const [connections, setConnections] = useState<Connection[]>([]);
   const [runMode, setRunMode] = useState<RunMode>({ reuse_mode: false, clash_api: '', proxy_port: 17897, cloud_mode: false, dashboard_url: '' });
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [folderSharingLocal, setFolderSharingLocal] = useState(() => { try { return JSON.parse(localStorage.getItem('nextdesk_folder_sharing') || 'false'); } catch { return false; } });
   const [showUpToDateToast, setShowUpToDateToast] = useState(false);
   const [cloudEnabled, setCloudEnabled] = useState(false);
-  const [dashboardUrl, setDashboardUrl] = useState('');
-  const [relayApiKey, setRelayApiKey] = useState('');
+  const [, setDashboardUrl] = useState('');
   const [relayEndpoints, setRelayEndpoints] = useState<RelayEndpoint[]>([]);
-  const [cloudSaving, setCloudSaving] = useState(false);
   const [autoUpdateStatus, setAutoUpdateStatus] = useState<AutoUpdateStatus>({
     enabled: true,
     last_sync_ts: 0,
@@ -135,6 +132,24 @@ function AppContent() {
     }
   };
 
+  const ensureEngineRunningForDelayTest = async () => {
+    const currentStatus = await api.getStatus();
+    if (currentStatus.clash) {
+      setStatus(currentStatus);
+      return;
+    }
+
+    await api.startEngine();
+    const [newStatus, newProxyGroups, newRunMode] = await Promise.all([
+      api.getStatus(),
+      api.getProxyGroups(),
+      api.getRunMode()
+    ]);
+    setStatus(newStatus);
+    setProxyGroups(newProxyGroups);
+    setRunMode(newRunMode);
+  };
+
   const handleTestConnectivity = async () => {
     const expandedGroupNames = Array.from(expandedGroups);
     if (expandedGroupNames.length === 0) {
@@ -143,6 +158,7 @@ function AppContent() {
     
     setTestingConnectivity(true);
     try {
+      await ensureEngineRunningForDelayTest();
       for (const groupName of expandedGroupNames) {
         const delays = await api.testGroupDelays(groupName);
         setNodeDelays(prev => ({ ...prev, ...delays }));
@@ -950,14 +966,9 @@ function AppContent() {
                           </span>
                         </div>
                         <div className="flex items-center gap-3">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={handleRetrySync}
-                            className="text-orange-400 hover:text-orange-300 text-xs"
-                          >
+                          <span className="text-xs text-orange-400/60 cursor-pointer hover:text-orange-400/80" onClick={handleRetrySync}>
                             {t('syncRetryNow')}
-                          </Button>
+                          </span>
                           <Switch
                             checked={autoUpdateStatus.enabled}
                             onCheckedChange={handleAutoUpdateToggle}
@@ -978,30 +989,27 @@ function AppContent() {
                             "h-5 w-5 shrink-0",
                             autoUpdateStatus.enabled ? "text-blue-500" : "text-muted-foreground"
                           )} />
-                          <div>
-                            <h4 className={cn(
-                              "text-sm font-medium mb-0.5",
-                              autoUpdateStatus.enabled ? "text-blue-400" : "text-muted-foreground"
-                            )}>
-                              {autoUpdateStatus.enabled ? t('autoUpdateEnabled') : t('autoUpdateDisabled')}
-                            </h4>
-                            {autoUpdateStatus.enabled && (
-                              <p className="text-xs text-blue-400/60">
-                                {autoUpdateStatus.last_sync_ts > 0
-                                  ? t('lastSyncedAgo').replace('{time}', (() => {
-                                      const { key, n } = getTimeAgo(autoUpdateStatus.last_sync_ts);
-                                      return t(key).replace('{n}', String(n));
-                                    })())
-                                  : t('serverListSync')
-                                }
-                              </p>
-                            )}
-                          </div>
+                          <span className={cn(
+                            "text-sm font-medium",
+                            autoUpdateStatus.enabled ? "text-blue-400" : "text-muted-foreground"
+                          )}>
+                            {autoUpdateStatus.enabled ? t('autoUpdateEnabled') : t('autoUpdateDisabled')}
+                          </span>
                         </div>
-                        <Switch
-                          checked={autoUpdateStatus.enabled}
-                          onCheckedChange={handleAutoUpdateToggle}
-                        />
+                        <div className="flex items-center gap-3">
+                          {autoUpdateStatus.enabled && autoUpdateStatus.last_sync_ts > 0 && (
+                            <span className="text-xs text-blue-400/60">
+                              {t('lastSyncedAgo').replace('{time}', (() => {
+                                const { key, n } = getTimeAgo(autoUpdateStatus.last_sync_ts);
+                                return t(key as any).replace('{n}', String(n));
+                              })())}
+                            </span>
+                          )}
+                          <Switch
+                            checked={autoUpdateStatus.enabled}
+                            onCheckedChange={handleAutoUpdateToggle}
+                          />
+                        </div>
                       </div>
                     </div>
                   )}
@@ -1200,114 +1208,23 @@ function AppContent() {
                       <span className="inline-block h-4 w-4 rounded-full bg-white shadow-sm translate-x-1" />
                     </div>
                   </div>
-                  {/* Cloud Mode */}
-                  <div className="flex flex-col gap-3 py-2">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className="h-9 w-9 rounded-lg bg-violet-500/10 flex items-center justify-center">
-                          <Cloud className="h-4 w-4 text-violet-500" />
-                        </div>
-                        <div>
-                          <div className="text-sm font-medium text-foreground">{t('cloudMode')}</div>
-                          <div className="text-xs text-muted-foreground">{t('cloudModeDesc')}</div>
-                        </div>
-                      </div>
-                      <button
-                        onClick={async () => {
-                          const next = !cloudEnabled;
-                          setCloudEnabled(next);
-                          if (!next) {
-                            await api.setCloudMode(false, '', '');
-                            setRelayEndpoints([]);
-                          }
-                        }}
-                        className={cn(
-                          "relative inline-flex h-6 w-11 items-center rounded-full transition-colors",
-                          cloudEnabled ? "bg-violet-500" : "bg-zinc-600"
-                        )}
-                      >
-                        <span className={cn(
-                          "inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform",
-                          cloudEnabled ? "translate-x-6" : "translate-x-1"
-                        )} />
-                      </button>
-                    </div>
-                    {cloudEnabled && (
-                      <div className="ml-12 space-y-2">
-                        <Input
-                          placeholder={t('dashboardUrl')}
-                          value={dashboardUrl}
-                          onChange={(e) => setDashboardUrl(e.target.value)}
-                          className="h-8 text-xs"
-                        />
-                        <Input
-                          type="password"
-                          placeholder={t('relayApiKey')}
-                          value={relayApiKey}
-                          onChange={(e) => setRelayApiKey(e.target.value)}
-                          className="h-8 text-xs"
-                        />
-                        <div className="flex items-center gap-2">
-                          <Button
-                            size="sm"
-                            className="h-7 text-xs bg-violet-600 hover:bg-violet-700"
-                            disabled={cloudSaving || !dashboardUrl || !relayApiKey}
-                            onClick={async () => {
-                              setCloudSaving(true);
-                              try {
-                                await api.setCloudMode(true, dashboardUrl, relayApiKey);
-                                const eps = await api.refreshRelayEndpoints();
-                                setRelayEndpoints(eps);
-                              } catch (e) {
-                                console.error('Cloud mode save failed', e);
-                              } finally {
-                                setCloudSaving(false);
-                              }
-                            }}
-                          >
-                            {cloudSaving ? <RefreshCw className="h-3 w-3 animate-spin" /> : t('saveAndSync')}
-                          </Button>
-                          {relayEndpoints.length > 0 && (
-                            <span className="text-xs text-emerald-500">
-                              {relayEndpoints.length} {t('endpointsSynced')}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                  {/* Folder Sharing */}
-                  <div className="flex items-center justify-between py-2">
+                  {/* Cloud Mode — coming soon */}
+                  <div className="flex items-center justify-between py-2 opacity-50 cursor-not-allowed">
                     <div className="flex items-center gap-3">
-                      <div className="h-9 w-9 rounded-lg bg-emerald-500/10 flex items-center justify-center">
-                        <Monitor className="h-4 w-4 text-emerald-500" />
+                      <div className="h-9 w-9 rounded-lg bg-violet-500/10 flex items-center justify-center">
+                        <Cloud className="h-4 w-4 text-violet-500" />
                       </div>
                       <div>
-                        <div className="text-sm font-medium text-foreground">{t('folderSharing')}</div>
-                        <div className="text-xs text-muted-foreground">{t('folderSharingDesc')}</div>
+                        <div className="text-sm font-medium text-foreground flex items-center gap-2">
+                          {t('cloudMode')}
+                          <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/25">Soon</span>
+                        </div>
+                        <div className="text-xs text-muted-foreground">{t('cloudModeDesc')}</div>
                       </div>
                     </div>
-                    <button
-                      onClick={() => {
-                        const key = 'nextdesk_folder_sharing';
-                        const current = (() => { try { return JSON.parse(localStorage.getItem(key) || 'false'); } catch { return false; } })();
-                        const next = !current;
-                        localStorage.setItem(key, JSON.stringify(next));
-                        window.dispatchEvent(new StorageEvent('storage', { key }));
-                        setFolderSharingLocal(next);
-                      }}
-                      className={cn(
-                        "relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                        folderSharingLocal ? "bg-emerald-500" : "bg-zinc-600"
-                      )}
-                    >
-                      <span
-                        className={cn(
-                          "inline-block h-4 w-4 rounded-full bg-white shadow-sm transition-transform",
-                          folderSharingLocal ? "translate-x-6" : "translate-x-1"
-                        )}
-                      />
-                    </button>
+                    <div className="relative inline-flex h-6 w-11 items-center rounded-full bg-zinc-600 pointer-events-none">
+                      <span className="inline-block h-4 w-4 rounded-full bg-white shadow-sm translate-x-1" />
+                    </div>
                   </div>
                 </CardContent>
               </Card>

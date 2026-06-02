@@ -11,16 +11,24 @@ import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useTranslation } from '@/i18n/useTranslation';
 import type { TranslationKey } from '@/i18n/translations';
-import { codeToScancode, macRemapCode } from '@/lib/scancodeMap';
-import { RdpAudioPlayer } from '@/lib/rdp-audio';
-import { H264Decoder } from '@/lib/h264-decoder';
-import DecodeWorkerUrl from '@/lib/decode-worker.ts?worker&url';
+import { codeToScancode } from '@/lib/scancodeMap';
 
-// Debug logger: writes clipboard logs to /tmp/nextdesk_clipboard.log
+import DecodeWorkerUrl from '@/lib/decode-worker.ts?worker&url';
+import { rdpLog } from '@/lib/rdp-logger';
+import { api } from '@/api';
+import { useNativeRdp, connectFrameWebSocket } from '@/hooks/useNativeRdp';
+
+/**
+ * Native RDP mode flag.
+ * When true, uses the Rust backend for RDP sessions (direct TCP/TLS).
+ * When false, uses the WASM-based IronRDP via WebSocket proxy (legacy).
+ */
+const USE_NATIVE_RDP = true;
+
+// Clipboard debug helper — delegates to rdpLog
 function cblog(...args: any[]) {
   const msg = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
-  console.log(msg);
-  invoke('frontend_log', { msg }).catch(() => {});
+  rdpLog.info('clipboard', msg);
 }
 
 function installRdpConsoleBridge() {
@@ -33,6 +41,13 @@ function installRdpConsoleBridge() {
     'FileContentsRequest DATA (async)',
     'Requesting file DATA',
     '[rdpdr-wasm] async read complete',
+    'FileContentsRequest: stream_id=',
+    'FileContentsRequest DATA response (sync)',
+    'FileContentsRequest SIZE response',
+    '[cliprdr] active transfers:',
+    '[cliprdr] async read done',
+    'async read complete:',
+    'DATA chunk: file_index=',
   ];
 
   const shouldForward = (msg: string) => {
@@ -46,17 +61,27 @@ function installRdpConsoleBridge() {
       || msg.includes('[rdpdr-wasm]');
   };
 
-  const bridge = (level: 'info' | 'warn' | 'error') => {
+  // Re-entrancy guard: prevent bridge → rdpLog → console → bridge recursion
+  let bridgeActive = false;
+
+  const bridge = (level: 'debug' | 'info' | 'warn' | 'error') => {
     const original = console[level].bind(console);
     console[level] = (...args: any[]) => {
       original(...args);
+      if (bridgeActive) return; // skip re-entrant calls from rdpLog
       const msg = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' ');
       if (shouldForward(msg)) {
-        invoke('frontend_log', { msg: `[console.${level}] ${msg}` }).catch(() => {});
+        bridgeActive = true;
+        try {
+          rdpLog[level]('wasm', msg);
+        } finally {
+          bridgeActive = false;
+        }
       }
     };
   };
 
+  bridge('debug');
   bridge('info');
   bridge('warn');
   bridge('error');
@@ -347,7 +372,9 @@ async function loadWasm(): Promise<IronRdpWasm> {
   // @ts-ignore
   const url = new URL('../wasm/ironrdp_web_bg.wasm', import.meta.url).href;
   await mod.default(url);
-  mod.setup('info');
+  // Diagnostic mode: keep WASM tracing at debug so RDPSND/DRDYNVC
+  // initialization details are visible while investigating audio redirection.
+  mod.setup('debug');
   wasmModule = mod as unknown as IronRdpWasm;
   wasmReady = true;
   return wasmModule;
@@ -382,9 +409,12 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
 
   const canvasRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const sessionRefs = useRef<Map<string, WasmSession>>(new Map());
-  const audioPlayersRef = useRef<Map<string, RdpAudioPlayer>>(new Map());
-  const h264DecoderRef = useRef<H264Decoder | null>(null);
+
+  // H.264 GFX path: Worker-based VideoDecoder + per-tab overlay canvas.
+  // The overlay canvas uses a 2D context (separate from the WASM WebGL2 canvas)
+  // to display decoded VideoFrames without context-type conflicts.
   const decodeWorkerRef = useRef<Worker | null>(null);
+  const h264OverlayRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasWrapRef = useRef<HTMLDivElement>(null);
   const activeTabIdRef = useRef<string | null>(null);
@@ -411,10 +441,56 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
   // Track file keys received from remote to prevent feedback loop:
   // remote download → write to clipboard → Poll/Focus detects → sends FormatList back
   const remoteClipboardFileKeyRef = useRef<Map<string, string>>(new Map());
+  const sendWinKeyRef = useRef<(() => void) | null>(null);
+  const sendCtrlAltDelRef = useRef<(() => void) | null>(null);
   const prevSidebarOpenRef = useRef(store.sidebarOpen);
   activeTabIdRef.current = store.activeTabId;
 
+  // Ref to track which tabs are connected via native backend
+  const nativeTabsRef = useRef<Set<string>>(new Set());
 
+  // ── Native RDP event rendering hook ──
+  // Only active when USE_NATIVE_RDP is enabled
+  const activeCanvas = store.activeTabId
+    ? canvasRefs.current.get(store.activeTabId) ?? null
+    : null;
+
+  const handleNativeStatus = useCallback((tabId: string, status: string, message?: string) => {
+    rdpLog.info('native', `status event: ${status}`, { tabId, message });
+    if (status === 'connected') {
+      store.updateTabStatus(tabId, 'connected');
+      setRdpStats(prev => ({ ...prev, status: 'connected' }));
+      nativeTabsRef.current.add(tabId);
+    } else if (status === 'disconnected') {
+      nativeTabsRef.current.delete(tabId);
+      if (userDisconnectedRef.current.has(tabId)) {
+        store.updateTabStatus(tabId, 'disconnected');
+      } else {
+        // Auto-reconnect
+        store.updateTabStatus(tabId, 'reconnecting');
+        const count = reconnectCountRef.current.get(tabId) ?? 0;
+        if (count < MAX_RECONNECT_ATTEMPTS) {
+          reconnectCountRef.current.set(tabId, count + 1);
+          const delay = Math.min(1000 * (count + 1), 5000);
+          const timer = setTimeout(() => {
+            reconnectTimerRef.current.delete(tabId);
+            connectSessionRef.current?.(tabId);
+          }, delay);
+          reconnectTimerRef.current.set(tabId, timer);
+        }
+      }
+    } else if (status === 'error') {
+      nativeTabsRef.current.delete(tabId);
+      store.updateTabStatus(tabId, 'error');
+      rdpLog.error('native', `session error: ${message}`, { tabId });
+    }
+  }, [store]);
+
+  useNativeRdp({
+    tabId: USE_NATIVE_RDP ? store.activeTabId : null,
+    canvas: USE_NATIVE_RDP ? activeCanvas : null,
+    onStatus: handleNativeStatus,
+  });
   useEffect(() => {
     installRdpConsoleBridge();
     invoke<number>('get_rdp_proxy_port').then(setProxyPort).catch(() => { });
@@ -427,20 +503,20 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
   // ── Network change detection: trigger reconnect when browser comes back online ──
   useEffect(() => {
     const handleOnline = () => {
-      console.log('[rdp] network: online — checking for disconnected tabs');
+      rdpLog.info('network', 'online — checking for disconnected tabs');
       for (const tab of store.tabs) {
         if ((tab.status === 'reconnecting' || tab.status === 'disconnected') && !userDisconnectedRef.current.has(tab.id)) {
           // Cancel existing timer and try immediately
           const existing = reconnectTimerRef.current.get(tab.id);
           if (existing) { clearTimeout(existing); reconnectTimerRef.current.delete(tab.id); }
           reconnectCountRef.current.set(tab.id, 0); // Reset count
-          console.log('[rdp] network restored, reconnecting tab:', tab.id);
+          rdpLog.info('network', 'restored, reconnecting tab', { tabId: tab.id });
           if (connectSessionRef.current) connectSessionRef.current(tab.id);
         }
       }
     };
     const handleOffline = () => {
-      console.log('[rdp] network: offline');
+      rdpLog.warn('network', 'offline');
     };
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
@@ -472,7 +548,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
     if (!wrap) return { w: 1280, h: 720 };
     const w = Math.floor(wrap.clientWidth);
     const h = Math.floor(wrap.clientHeight);
-    console.log('[rdp] getCanvasSize:', w, 'x', h);
+    rdpLog.debug('render', `getCanvasSize: ${w} x ${h}`);
     return { w: Math.max(w, 320), h: Math.max(h, 240) };
   }, []);
 
@@ -530,18 +606,18 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
   // ── Connect to server ──
   const connectSession = useCallback(async (tabId: string) => {
     if (connectingTabsRef.current.has(tabId)) {
-      console.log('[rdp] connectSession skipped: local connect lock active for', tabId);
+      rdpLog.warn('connection', 'connectSession skipped: local connect lock active', { tabId });
       return;
     }
     const tab = store.tabs.find(t => t.id === tabId);
     if (!tab) return;
     // Guard: prevent double-connection
     if (tab.status === 'connecting' || tab.status === 'connected') {
-      console.log('[rdp] connectSession skipped: already', tab.status, tabId);
+      rdpLog.warn('connection', `connectSession skipped: already ${tab.status}`, { tabId });
       return;
     }
     if (sessionRefs.current.has(tabId)) {
-      console.log('[rdp] connectSession skipped: session already exists for', tabId);
+      rdpLog.warn('connection', 'connectSession skipped: session already exists', { tabId });
       return;
     }
     const server = store.getServerById(tab.serverId);
@@ -553,8 +629,6 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       store.updateTabStatus(tabId, 'connecting');
     }
     try {
-      const wasm = await loadWasm();
-
       // Wait for 2 animation frames to ensure the wrapper div is in the DOM and laid out
       await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
 
@@ -566,11 +640,11 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       if (desiredSizeRef.current) {
         w = desiredSizeRef.current.w;
         h = desiredSizeRef.current.h;
-        console.log('[rdp] using desired size:', w, 'x', h);
+        rdpLog.info('connection', `using desired size: ${w} x ${h}`);
       } else {
         const cs = getCanvasSize();
         w = cs.w; h = cs.h;
-        console.log('[rdp] using wrapper size:', w, 'x', h);
+        rdpLog.info('connection', `using wrapper size: ${w} x ${h}`);
       }
       canvas.width = w;
       canvas.height = h;
@@ -582,6 +656,51 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         if (cur.w > 0 && cur.h > 0) lastSizeRef.current = { w: cur.w, h: cur.h };
         resizeCooldownRef.current = false;
       }, 1000);
+
+      // ── Native RDP mode: connect via Rust backend ──
+      if (USE_NATIVE_RDP) {
+        rdpLog.info('native', `connecting natively: ${server.host}:${server.port} @ ${w}x${h}`);
+
+        // Connect via Rust backend — returns WS port for frame streaming
+        const wsPort = await api.rdpNativeConnect({
+          tabId,
+          host: server.host,
+          port: server.port,
+          username: server.username,
+          password: server.password,
+          domain: server.domain || undefined,
+          width: w,
+          height: h,
+        });
+        rdpLog.info('native', `rdp_native_connect returned ws_port=${wsPort}`);
+
+        // Connect WebSocket for zero-overhead frame streaming
+        const cleanupWs = connectFrameWebSocket(wsPort, canvas, () => {
+          fpsCountRef.current++;
+        });
+        // Store cleanup for later disconnection
+        (window as any).__rdp_ws_cleanup__ = cleanupWs;
+
+        // Suppress adaptive resize after connect
+        resizeCooldownRef.current = true;
+        setTimeout(() => {
+          const cur = getCanvasSize();
+          if (cur.w > 0 && cur.h > 0) lastSizeRef.current = { w: cur.w, h: cur.h };
+          resizeCooldownRef.current = false;
+        }, 1500);
+
+        // Set up FPS counter
+        fpsIntervalRef.current = setInterval(() => {
+          setRdpStats(prev => ({ ...prev, fps: fpsCountRef.current }));
+          fpsCountRef.current = 0;
+        }, 1000);
+
+        connectingTabsRef.current.delete(tabId);
+        return; // Skip WASM path below
+      }
+
+      // ── WASM mode: connect via WebSocket proxy (legacy) ──
+      const wasm = await loadWasm();
 
       const size = new wasm.DesktopSize(w, h);
       const builder = new wasm.SessionBuilder()
@@ -609,7 +728,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         .canvasResizedCallback(() => {
           // WASM renderer sets canvas.width/height internally when server responds
           const cw = canvas.width, ch = canvas.height;
-          console.log('[rdp] canvasResizedCallback → canvas:', cw, 'x', ch);
+          rdpLog.info('render', `canvasResizedCallback → canvas: ${cw} x ${ch}`);
           if (cw > 0 && ch > 0) {
             lastSizeRef.current = { w: cw, h: ch };
             fpsCountRef.current++;
@@ -630,6 +749,11 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
               cblog('[clipboard] Remote item MIME:', mime);
               if (mime.startsWith('text/') && !textHandled) {
                 const text = item.value() as string;
+                // Skip empty text — some servers send empty text/plain before real data
+                if (!text) {
+                  cblog('[clipboard] Remote text is empty, skipping write');
+                  continue;
+                }
                 // Remote sent text, not files — clear file key ref
                 remoteClipboardFileKeyRef.current.delete(tabId);
                 tauriWriteClipboard(text).then(() => {
@@ -802,8 +926,18 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
           if (normalized.flags === 1 || normalized.position === 0) {
             cblog('[file-transfer] ▶ FileContentsRequest:', normalized);
           }
-          // Lock: suppress clipboard polling during active file transfer
+          // Lock: suppress clipboard polling during active file transfer (local→remote).
+          // Use a timeout-based auto-release: each new request resets the timer.
+          // When no new requests arrive for 5s, the transfer is considered complete.
           fileTransferInProgressRef.current.add(tabId);
+          const timerKey = `__ft_release_timer_${tabId}`;
+          const g = globalThis as any;
+          if (g[timerKey]) clearTimeout(g[timerKey]);
+          g[timerKey] = setTimeout(() => {
+            fileTransferInProgressRef.current.delete(tabId);
+            delete g[timerKey];
+            cblog('[file-transfer] Local→Remote transfer lock auto-released (no requests for 5s)');
+          }, 5000);
         })
         .fileContentsResponseCallback((filesData: any) => {
           try {
@@ -972,7 +1106,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
           }
         });
 
-      // Use global counter injected in WASM bindings (__wbg_putImageData)
+      // FPS counter: init counter (monkey-patch applied after connect when WebGL2 ctx exists)
       (globalThis as any).__nextdesk_fps_count = 0;
       if (fpsIntervalRef.current) clearInterval(fpsIntervalRef.current);
 
@@ -1039,7 +1173,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
             return inFlight.then(windowData => sliceWindow(windowData));
           }
           const readLength = Math.max(length, RDPDR_PREFETCH_WINDOW);
-          const readPromise = invoke<number[]>('rdpdr_read_file_chunk', {
+          const readPromise = invoke<ArrayBuffer>('rdpdr_read_file_chunk', {
             baseFolder: capturedFolder,
             relativePath: path,
             offset: windowStart,
@@ -1092,7 +1226,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         const currentMB = Math.floor(offset / (10 * 1024 * 1024));
         if (currentMB !== cliprdrLastLoggedMB) {
           cliprdrLastLoggedMB = currentMB;
-          console.log(`[cliprdr] Transfer progress: ${path.split('/').pop()} offset=${(offset / 1024 / 1024).toFixed(1)}MB`);
+          rdpLog.debug('file', `Transfer progress: ${path.split('/').pop()} offset=${(offset / 1024 / 1024).toFixed(1)}MB`);
         }
         const windowStart = Math.floor(offset / CLIPRDR_PREFETCH_WINDOW) * CLIPRDR_PREFETCH_WINDOW;
         const windowKey = `${path}:${windowStart}`;
@@ -1110,7 +1244,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
           return inFlight.then(windowData => sliceWindow(windowData));
         }
         const readLength = Math.max(length, CLIPRDR_PREFETCH_WINDOW);
-        const readPromise = invoke<number[]>('rdpdr_read_file_chunk', {
+        const readPromise = invoke<ArrayBuffer>('rdpdr_read_file_chunk', {
           baseFolder: '',
           relativePath: path,
           offset: windowStart,
@@ -1134,11 +1268,35 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       };
       builder.extension(new wasm.Extension('cliprdr_read_callback', cliprdrReadCallback));
 
-      // Enable audio redirection via RDPSND
-      const audioPlayer = new RdpAudioPlayer();
-      audioPlayersRef.current.set(tabId, audioPlayer);
-      builder.extension(new wasm.Extension('audio_callback', audioPlayer.createCallback()));
-      console.log('[rdp] RDPSND audio redirection enabled');
+      // Enable audio redirection via RDPSND → native cpal backend
+      const audioCallback = (type: string, data: any) => {
+        switch (type) {
+          case 'format':
+            rdpLog.info('audio', `RDPSND format: ${data.channels}ch ${data.sampleRate}Hz ${data.bitsPerSample}bit ${data.formatTag}`);
+            invoke('rdp_audio_set_format', {
+              tabId,
+              channels: data.channels,
+              sampleRate: data.sampleRate,
+              bitsPerSample: data.bitsPerSample,
+              formatTag: data.formatTag,
+            }).catch(e => rdpLog.error('audio', 'set_format failed', e));
+            break;
+          case 'wave':
+            // Send PCM as raw binary via InvokeBody::Raw (6× less IPC overhead)
+            invoke('rdp_audio_push_raw', data as Uint8Array, {
+              headers: { 'X-Tab-Id': tabId },
+            }).catch(() => {}); // fire-and-forget for low latency
+            break;
+          case 'volume':
+            rdpLog.debug('audio', `RDPSND volume: L=${data.left} R=${data.right}`);
+            break;
+          case 'close':
+            invoke('rdp_audio_close', { tabId }).catch(() => {});
+            break;
+        }
+      };
+      builder.extension(new wasm.Extension('audio_callback', audioCallback));
+      rdpLog.info('audio', 'RDPSND audio redirection enabled (native cpal backend)');
 
       // Enable GFX pipeline (H.264 hardware decoding)
       if (typeof VideoDecoder !== 'undefined') {
@@ -1152,44 +1310,61 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
             const msg = e.data;
             if (msg.type === 'frame') {
               const frame = msg.frame as VideoFrame;
-              // Draw decoded VideoFrame onto canvas via 2D fallback
-              const c = canvasRefs.current.get(tabId);
-              if (c) {
-                const ctx2d = c.getContext('2d');
-                if (ctx2d) {
-                  ctx2d.drawImage(frame, 0, 0, c.width, c.height);
+              // Draw decoded VideoFrame onto the H.264 overlay canvas (2D context).
+              // The WASM canvas is locked to WebGL2 — using getContext('2d') on it
+              // returns null. The overlay canvas is a separate element with its own 2D ctx.
+              const overlay = h264OverlayRefs.current.get(tabId);
+              if (overlay) {
+                // Resize overlay to match frame if needed
+                if (overlay.width !== frame.displayWidth || overlay.height !== frame.displayHeight) {
+                  overlay.width = frame.displayWidth;
+                  overlay.height = frame.displayHeight;
                 }
+                const ctx2d = overlay.getContext('2d');
+                if (ctx2d) {
+                  ctx2d.drawImage(frame, 0, 0, overlay.width, overlay.height);
+                }
+                // Make overlay visible on first H.264 frame
+                overlay.style.opacity = '1';
               }
               frame.close();
             } else if (msg.type === 'error') {
-              console.warn('[h264-worker] error:', msg.message);
+              rdpLog.warn('render', 'h264 worker error', { message: msg.message });
             }
           };
         } catch (e) {
-          console.warn('[h264] Worker creation failed, using main-thread fallback');
+          rdpLog.warn('render', 'Worker creation failed, using main-thread fallback');
         }
 
-        // Phase 3: create main-thread decoder as fallback
-        const decoder = new H264Decoder(canvas);
-        h264DecoderRef.current = decoder;
-
+        // Phase 4: H.264 GFX callback — forward NAL to worker only.
+        // No main-thread fallback: if worker is unavailable, H.264 frames are dropped
+        // (server will still send bitmap fallback via FastPath).
         const gfxCallback = (type: string, data: any) => {
           if (type === 'h264_frame' && decodeWorkerRef.current) {
-            // Phase 4: offload to worker
             const buf = data.data.buffer.slice(0);
             decodeWorkerRef.current.postMessage(
               { type: 'decode', data: buf, timestamp: performance.now() * 1000 },
               [buf],
             );
-          } else {
-            // Phase 3 fallback: decode on main thread
-            decoder.handleGfxEvent(type, data);
           }
+          // Other GFX events (create_surface, reset_graphics, etc.) are informational
+          // and don't need rendering action in the current architecture.
         };
         builder.extension(new wasm.Extension('gfx_callback', gfxCallback));
-        console.log('[rdp] GFX H.264 pipeline enabled (WebCodecs + Worker)');
+        rdpLog.info('render', 'GFX H.264 pipeline enabled (WebCodecs Worker)');
       } else {
-        console.log('[rdp] WebCodecs not available, GFX H.264 disabled');
+        rdpLog.warn('render', 'WebCodecs not available, GFX H.264 disabled');
+      }
+
+      // Enable DisplayControl DVC for dynamic resolution updates (no reconnect needed)
+      builder.extension(new wasm.Extension('display_control', true));
+      rdpLog.info('render', 'DisplayControl DVC enabled for dynamic resolution');
+
+      // Enable file transfer WS bypass for large CLIPRDR files (≥2MB)
+      const ftPort = await invoke<number>('get_file_transfer_ws_port').catch(() => 0);
+      if (ftPort > 0) {
+        builder.extension(new wasm.Extension('file_transfer_port', ftPort));
+        rdpLog.info('file', `File transfer WS port: ${ftPort} (large file bypass enabled)`);
       }
 
       const session = await builder.connect();
@@ -1208,8 +1383,24 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
 
       // Check what resolution the server actually gave us
       const negotiated = session.desktopSize();
-      console.log('[rdp] negotiated resolution:', negotiated.width, 'x', negotiated.height, '(requested', w, 'x', h, ')');
+      rdpLog.info('connection', `negotiated resolution: ${negotiated.width} x ${negotiated.height} (requested ${w} x ${h})`);
       setRdpStats(prev => ({ ...prev, resolution: `${negotiated.width}×${negotiated.height}`, status: 'connected' }));
+
+      // FPS counter: monkey-patch WebGL2 texSubImage2D to count frame uploads.
+      // Must happen AFTER connect() since WASM creates the WebGL2 context during connect.
+      const fpsCanvas2 = canvasRefs.current.get(tabId);
+      if (fpsCanvas2) {
+        const gl = fpsCanvas2.getContext('webgl2');
+        if (gl && !(gl as any).__nextdesk_patched) {
+          const origTexSubImage2D = gl.texSubImage2D.bind(gl);
+          gl.texSubImage2D = function (...args: any[]) {
+            (globalThis as any).__nextdesk_fps_count = ((globalThis as any).__nextdesk_fps_count || 0) + 1;
+            return (origTexSubImage2D as any)(...args);
+          } as any;
+          (gl as any).__nextdesk_patched = true;
+        }
+      }
+
       fpsIntervalRef.current = setInterval(() => {
         const fps = (globalThis as any).__nextdesk_fps_count || 0;
         (globalThis as any).__nextdesk_fps_count = 0;
@@ -1225,14 +1416,14 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         const cur = session.desktopSize();
         const dpr = window.devicePixelRatio || 1;
         if (curW > 0 && curH > 0 && (cur.width !== curW || cur.height !== curH)) {
-          console.log('[rdp] delayed resize attempt:', curW, 'x', curH, 'DPR:', dpr);
-          try { session.resize(curW, curH, dpr > 1 ? dpr : null); } catch (e) { console.warn('[rdp] resize failed:', e); }
+          rdpLog.info('render', `delayed resize attempt: ${curW} x ${curH} DPR: ${dpr}`);
+          try { session.resize(curW, curH); } catch (e) { rdpLog.warn('render', 'resize failed', { error: e }); }
         }
       }, 2000);
 
       const info = await session.run();
       const reason = info?.reason?.() || 'unknown';
-      console.log('[rdp] session ended:', tabId, reason);
+      rdpLog.info('connection', `session ended: ${tabId}`, { reason });
       connectingTabsRef.current.delete(tabId);
       sessionRefs.current.delete(tabId);
       advertisedClipboardRef.current.delete(tabId);
@@ -1243,9 +1434,11 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       fileTransferInProgressRef.current.delete(tabId);
       clipboardPollInFlightRef.current.delete(tabId);
       if (fpsIntervalRef.current) { clearInterval(fpsIntervalRef.current); fpsIntervalRef.current = null; }
-      // Cleanup H.264 decoder and worker
-      if (h264DecoderRef.current) { h264DecoderRef.current.close(); h264DecoderRef.current = null; }
+      // Cleanup H.264 worker
       if (decodeWorkerRef.current) { decodeWorkerRef.current.postMessage({ type: 'close' }); decodeWorkerRef.current.terminate(); decodeWorkerRef.current = null; }
+      // Hide H.264 overlay for this tab
+      const overlay = h264OverlayRefs.current.get(tabId);
+      if (overlay) overlay.style.opacity = '0';
       delete (globalThis as any).__nextdesk_fps_count;
       setRdpStats({ resolution: '', fps: 0, status: 'disconnected' });
 
@@ -1263,14 +1456,14 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         ];
         const lowerReason = reason.toLowerCase();
         if (nonRecoverableReasons.some(kw => lowerReason.includes(kw))) {
-          console.log('[rdp] non-recoverable disconnect:', reason);
+          rdpLog.warn('connection', 'non-recoverable disconnect', { reason });
           store.updateTabStatus(tabId, 'error', friendlyRdpError(reason, t));
         } else {
           scheduleReconnect(tabId, reason);
         }
       }
     } catch (err: any) {
-      console.error('[rdp] error:', err);
+      rdpLog.error('connection', 'error', { error: err?.backtrace?.() || err?.message || String(err) });
       const raw = err?.backtrace?.() || err?.message || String(err);
       connectingTabsRef.current.delete(tabId);
       sessionRefs.current.delete(tabId);
@@ -1307,7 +1500,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
   const scheduleReconnect = useCallback((tabId: string, _reason: string) => {
     const count = (reconnectCountRef.current.get(tabId) || 0) + 1;
     if (count > MAX_RECONNECT_ATTEMPTS) {
-      console.log(`[rdp] reconnect: gave up after ${MAX_RECONNECT_ATTEMPTS} attempts for`, tabId);
+      rdpLog.warn('connection', `reconnect: gave up after ${MAX_RECONNECT_ATTEMPTS} attempts`, { tabId });
       reconnectCountRef.current.delete(tabId);
       store.updateTabStatus(tabId, 'error', t('rdpReconnectFailed', { max: String(MAX_RECONNECT_ATTEMPTS) }));
       return;
@@ -1315,7 +1508,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
     reconnectCountRef.current.set(tabId, count);
     // Exponential backoff: 1s, 2s, 4s, 8s, 16s
     const delay = Math.min(1000 * Math.pow(2, count - 1), 16000);
-    console.log(`[rdp] reconnect #${count}/${MAX_RECONNECT_ATTEMPTS} for ${tabId} in ${delay}ms`);
+    rdpLog.info('connection', `reconnect #${count}/${MAX_RECONNECT_ATTEMPTS} for ${tabId} in ${delay}ms`);
     store.updateTabStatus(tabId, 'reconnecting', t('rdpReconnectingCount', { count: String(count), max: String(MAX_RECONNECT_ATTEMPTS) }));
 
     const timer = setTimeout(() => {
@@ -1345,18 +1538,22 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
     store.setSidebarOpen(false);
     onMainSidebarCollapse?.();
     const tabId = store.openSession(server);
-    const tab = store.tabs.find(t => t.id === tabId);
-    if (tab && tab.status === 'idle') {
-      setTimeout(() => connectSession(tabId), 150);
+    // Only skip if already connected/connecting/reconnecting.
+    // For idle, error, disconnected, or newly created (not yet in state) → connect.
+    const existingTab = store.tabs.find(t => t.id === tabId);
+    const skipStatuses = ['connected', 'connecting', 'reconnecting'];
+    if (!existingTab || !skipStatuses.includes(existingTab.status)) {
+      // Use ref to get the LATEST connectSession (avoids stale closure where
+      // store.tabs doesn't include the newly created tab yet)
+      setTimeout(() => connectSessionRef.current?.(tabId), 150);
     }
-  }, [store, connectSession, onMainSidebarCollapse]);
+  }, [store, onMainSidebarCollapse]);
 
-  // Single-click: just select/open the tab without hiding sidebar or auto-connecting
+  // Single-click: just highlight the server in sidebar, no tab/RDP page opened
+  const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
   const handleSelectServer = useCallback((serverId: string) => {
-    const server = store.getServerById(serverId);
-    if (!server) return;
-    store.openSession(server);
-  }, [store]);
+    setSelectedServerId(prev => prev === serverId ? null : serverId);
+  }, []);
 
   const handleCloseTab = useCallback((tabId: string) => {
     // Mark as user-initiated to prevent auto-reconnect
@@ -1365,6 +1562,12 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
     const timer = reconnectTimerRef.current.get(tabId);
     if (timer) { clearTimeout(timer); reconnectTimerRef.current.delete(tabId); }
     reconnectCountRef.current.delete(tabId);
+    // Disconnect native session if any
+    if (nativeTabsRef.current.has(tabId)) {
+      api.rdpNativeDisconnect(tabId).catch(() => {});
+      nativeTabsRef.current.delete(tabId);
+    }
+    // Shutdown WASM session if any
     const session = sessionRefs.current.get(tabId);
     if (session) {
       try { session.shutdown(); } catch { }
@@ -1376,13 +1579,13 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
     rdpdrEnabledRef.current.delete(tabId);
     pasteShortcutInFlightRef.current.delete(tabId);
     keepCursorVisibleUntilRef.current.delete(tabId);
-    // Cleanup audio player
-    const audioPlayer = audioPlayersRef.current.get(tabId);
-    if (audioPlayer) {
-      audioPlayer.destroy();
-      audioPlayersRef.current.delete(tabId);
-    }
+    // Cleanup native audio player
+    invoke('rdp_audio_close', { tabId }).catch(() => {});
     store.closeTab(tabId);
+    // Auto-open sidebar when closing the last tab
+    if (store.tabs.length <= 1) {
+      store.setSidebarOpen(true);
+    }
   }, [store]);
 
   const handleNewSaved = useCallback((serverId: string, connect: boolean) => {
@@ -1399,6 +1602,11 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
     }
     // Mark as user-initiated so session end handler won't trigger yellow reconnect UI
     userDisconnectedRef.current.add(tabId);
+    // Disconnect native session if any
+    if (nativeTabsRef.current.has(tabId)) {
+      api.rdpNativeDisconnect(tabId).catch(() => {});
+      nativeTabsRef.current.delete(tabId);
+    }
     const session = sessionRefs.current.get(tabId);
     if (session) {
       try { session.shutdown(); } catch { /* ignore */ }
@@ -1421,20 +1629,67 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
 
   // ── Switch resolution mode ──
   const applyResolution = useCallback((mode: string) => {
-    console.log('[rdp] applyResolution called:', mode);
+    rdpLog.info('render', `applyResolution called: ${mode}`);
     setResMode(mode);
     const tabId = store.activeTabId;
     if (!tabId) return;
 
     if (mode === 'adaptive') {
-      // Reconnect using wrapper size
       const { w, h } = getCanvasSize();
-      console.log('[rdp] switching to adaptive, reconnect with wrapper:', w, 'x', h);
-      reconnectWithSize(tabId); // null desired → uses wrapper
+      rdpLog.info('render', `switching to adaptive: ${w} x ${h}`);
+      // Try native resize first
+      if (USE_NATIVE_RDP && nativeTabsRef.current.has(tabId)) {
+        api.rdpNativeResize(tabId, w, h).then(() => {
+          desiredSizeRef.current = null;
+          lastSizeRef.current = { w, h };
+          rdpLog.info('render', 'native resize sent (adaptive)');
+        }).catch(() => {
+          rdpLog.warn('render', 'native resize failed, falling back to reconnect');
+          reconnectWithSize(tabId);
+        });
+        return;
+      }
+      const session = sessionRefs.current.get(tabId);
+      if (session) {
+        try {
+          session.resize(w, h);
+          desiredSizeRef.current = null;
+          lastSizeRef.current = { w, h };
+          rdpLog.info('render', 'dynamic resize PDU sent (adaptive)');
+          return;
+        } catch (e) {
+          rdpLog.warn('render', 'dynamic resize failed, falling back to reconnect', { error: e });
+        }
+      }
+      reconnectWithSize(tabId);
     } else {
       const [ws, hs] = mode.split('x').map(Number);
       if (!ws || !hs) return;
-      console.log('[rdp] reconnecting with fixed resolution:', ws, 'x', hs);
+      rdpLog.info('render', `switching to fixed resolution: ${ws} x ${hs}`);
+      // Try native resize first
+      if (USE_NATIVE_RDP && nativeTabsRef.current.has(tabId)) {
+        api.rdpNativeResize(tabId, ws, hs).then(() => {
+          desiredSizeRef.current = { w: ws, h: hs };
+          lastSizeRef.current = { w: ws, h: hs };
+          rdpLog.info('render', 'native resize sent (fixed)');
+        }).catch(() => {
+          rdpLog.warn('render', 'native resize failed, falling back to reconnect');
+          reconnectWithSize(tabId, ws, hs);
+        });
+        return;
+      }
+      const session = sessionRefs.current.get(tabId);
+      if (session) {
+        try {
+          session.resize(ws, hs);
+          desiredSizeRef.current = { w: ws, h: hs };
+          lastSizeRef.current = { w: ws, h: hs };
+          rdpLog.info('render', 'dynamic resize PDU sent (fixed)');
+          return;
+        } catch (e) {
+          rdpLog.warn('render', 'dynamic resize failed, falling back to reconnect', { error: e });
+        }
+      }
       reconnectWithSize(tabId, ws, hs);
     }
   }, [store.activeTabId, getCanvasSize, reconnectWithSize]);
@@ -1458,8 +1713,11 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       }
 
       const isMac = navigator.userAgent.includes('Mac');
+      const isNative = USE_NATIVE_RDP && nativeTabsRef.current.has(tabId);
 
+      // ── Input dispatch: WASM vs Native ──
       const sendInput = (event: any) => {
+        if (isNative) return; // Native mode uses specific send* functions below
         const session = sessionRefs.current.get(tabId);
         if (!session || !wasmModule) return;
         const tx = new wasmModule.InputTransaction();
@@ -1468,6 +1726,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       };
 
       const sendInputBatch = (events: any[]) => {
+        if (isNative) return; // Native mode uses specific send* functions below
         const session = sessionRefs.current.get(tabId);
         if (!session || !wasmModule) return;
         const tx = new wasmModule.InputTransaction();
@@ -1477,7 +1736,76 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         session.applyInputs(tx);
       };
 
+      // Native mode: send key scancode directly to Rust backend
+      const nativeSendKey = (scancode: number, isPressed: boolean) => {
+        if (!isNative) return;
+        api.rdpNativeInput(tabId, scancode, isPressed).catch(() => {});
+      };
+
+      // Native mode: send key batch (press+release pairs)
+      const nativeSendKeyBatch = (scancodes: { sc: number; pressed: boolean }[]) => {
+        if (!isNative) return;
+        for (const { sc, pressed } of scancodes) {
+          api.rdpNativeInput(tabId, sc, pressed).catch(() => {});
+        }
+      };
+
+      // Send Win key tap (LWin press + release)
+      const sendWinKey = () => {
+        if (isNative) {
+          nativeSendKeyBatch([
+            { sc: 0xE05B, pressed: true },
+            { sc: 0xE05B, pressed: false },
+          ]);
+          return;
+        }
+        const wm = wasmModule;
+        if (!wm) return;
+        sendInputBatch([
+          wm.DeviceEvent.keyPressed(0xE05B),
+          wm.DeviceEvent.keyReleased(0xE05B),
+        ]);
+      };
+
+      // Send Ctrl+Alt+Delete sequence
+      const sendCtrlAltDel = () => {
+        if (isNative) {
+          nativeSendKeyBatch([
+            { sc: 0x1D, pressed: true },
+            { sc: 0x38, pressed: true },
+            { sc: 0xE053, pressed: true },
+            { sc: 0xE053, pressed: false },
+            { sc: 0x38, pressed: false },
+            { sc: 0x1D, pressed: false },
+          ]);
+          return;
+        }
+        const wm = wasmModule;
+        if (!wm) return;
+        sendInputBatch([
+          wm.DeviceEvent.keyPressed(0x1D),
+          wm.DeviceEvent.keyPressed(0x38),
+          wm.DeviceEvent.keyPressed(0xE053),
+          wm.DeviceEvent.keyReleased(0xE053),
+          wm.DeviceEvent.keyReleased(0x38),
+          wm.DeviceEvent.keyReleased(0x1D),
+        ]);
+      };
+
+      // Expose virtual key functions via refs for toolbar buttons
+      sendWinKeyRef.current = sendWinKey;
+      sendCtrlAltDelRef.current = sendCtrlAltDel;
+
       const sendCtrlShortcut = (keyScancode: number) => {
+        if (isNative) {
+          nativeSendKeyBatch([
+            { sc: 0x1D, pressed: true },
+            { sc: keyScancode, pressed: true },
+            { sc: keyScancode, pressed: false },
+            { sc: 0x1D, pressed: false },
+          ]);
+          return;
+        }
         const wm = wasmModule;
         if (!wm) return;
         sendInputBatch([
@@ -1485,6 +1813,27 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
           wm.DeviceEvent.keyPressed(keyScancode),
           wm.DeviceEvent.keyReleased(keyScancode),
           wm.DeviceEvent.keyReleased(0x1D),
+        ]);
+      };
+
+      // Send Win+key combo (e.g. Win+R → Run dialog)
+      const sendWinShortcut = (keyScancode: number) => {
+        if (isNative) {
+          nativeSendKeyBatch([
+            { sc: 0xE05B, pressed: true },
+            { sc: keyScancode, pressed: true },
+            { sc: keyScancode, pressed: false },
+            { sc: 0xE05B, pressed: false },
+          ]);
+          return;
+        }
+        const wm = wasmModule;
+        if (!wm) return;
+        sendInputBatch([
+          wm.DeviceEvent.keyPressed(0xE05B),
+          wm.DeviceEvent.keyPressed(keyScancode),
+          wm.DeviceEvent.keyReleased(keyScancode),
+          wm.DeviceEvent.keyReleased(0xE05B),   // LWin up
         ]);
       };
 
@@ -1569,119 +1918,208 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       const suppressedShortcutKeyups = new Set<string>();
 
 
+      // Track whether Cmd was pressed without a combo, for deferred Win tap
+      let cmdPendingWinTap = false;
+
       const onKeyDown = (e: KeyboardEvent) => {
-        e.preventDefault();
-        if (!wasmModule) return;
-
-        // Detect Ctrl (or Cmd on macOS) modifier
-        const isCtrl = isMac ? e.metaKey : e.ctrlKey;
-
-        if (isMac && (e.code === 'MetaLeft' || e.code === 'MetaRight')) {
+        // Let host shortcuts (Cmd+W close tab, Cmd+Q quit) pass through without interception
+        if (isMac && e.metaKey && (e.code === 'KeyW' || e.code === 'KeyQ')) {
           return;
         }
+        e.preventDefault();
+        if (!isNative && !wasmModule) return;
 
-        // Ctrl+V / Cmd+V → ONLY send scancodes.
-        // Per MS-RDPECLIP protocol, FormatList must be sent on clipboard CHANGE,
-        // NOT on paste. Calling onClipboardPaste here would send a FormatList PDU,
-        // telling the server "client has new data", causing it to discard its own
-        // clipboard (breaking RDP-internal copy/paste).
-        // Cross-machine clipboard sync is handled by focus-based detection below.
-        if (isCtrl && e.code === 'KeyV') {
-          if (pasteShortcutInFlightRef.current.has(tabId)) {
-            cblog('[clipboard] paste-shortcut already in flight, skip repeated shortcut');
+        // ── macOS: Cmd key handling (Jump Desktop compatible) ──
+        // Cmd → Win key (deferred), editing shortcuts → Ctrl
+        if (isMac && e.metaKey) {
+          // Cmd key itself pressed — defer Win key, don't send yet
+          if (e.code === 'MetaLeft' || e.code === 'MetaRight') {
+            cmdPendingWinTap = true;
             return;
           }
-          suppressedShortcutKeyups.add('KeyV');
-          if (isMac) {
+
+          // A combo key was pressed → Cmd was used in a shortcut
+          cmdPendingWinTap = false;
+
+          // Editing shortcuts: Cmd+C/V/X/A/Z → Ctrl+C/V/X/A/Z
+          if (e.code === 'KeyV') {
+            if (pasteShortcutInFlightRef.current.has(tabId)) {
+              cblog('[clipboard] paste-shortcut already in flight, skip');
+              return;
+            }
+            suppressedShortcutKeyups.add('KeyV');
             suppressedShortcutKeyups.add('MetaLeft');
             suppressedShortcutKeyups.add('MetaRight');
+            void syncLocalClipboardForPasteShortcut()
+              .catch(err => cblog('[clipboard] paste-shortcut injection error:', err))
+              .finally(() => sendCtrlShortcut(0x2F));
+            return;
           }
-          // Always sync clipboard before sending Ctrl+V scancode.
-          // This eliminates the race condition where Focus sync hasn't
-          // finished reading the new clipboard yet when user presses paste.
-          // syncLocalClipboardForPasteShortcut has change detection to
-          // avoid redundant FormatList (which would break RDP-internal paste).
-          void syncLocalClipboardForPasteShortcut()
-            .catch(err => cblog('[clipboard] paste-shortcut injection error:', err))
-            .finally(() => sendCtrlShortcut(0x2F));
+          if (e.code === 'KeyC') {
+            suppressedShortcutKeyups.add('KeyC');
+            suppressedShortcutKeyups.add('MetaLeft');
+            suppressedShortcutKeyups.add('MetaRight');
+            sendCtrlShortcut(0x2E);
+            return;
+          }
+          if (e.code === 'KeyX') {
+            suppressedShortcutKeyups.add('KeyX');
+            suppressedShortcutKeyups.add('MetaLeft');
+            suppressedShortcutKeyups.add('MetaRight');
+            sendCtrlShortcut(0x2D);
+            return;
+          }
+          if (e.code === 'KeyA') {
+            suppressedShortcutKeyups.add('KeyA');
+            suppressedShortcutKeyups.add('MetaLeft');
+            suppressedShortcutKeyups.add('MetaRight');
+            sendCtrlShortcut(0x1E);
+            return;
+          }
+          if (e.code === 'KeyZ') {
+            suppressedShortcutKeyups.add('KeyZ');
+            suppressedShortcutKeyups.add('MetaLeft');
+            suppressedShortcutKeyups.add('MetaRight');
+            sendCtrlShortcut(0x2C);
+            return;
+          }
+
+          // Host shortcuts: let Cmd+W (close tab) and Cmd+Q (quit) pass through to Tauri
+          if (e.code === 'KeyW' || e.code === 'KeyQ') {
+            return; // Don't preventDefault, don't send to remote
+          }
+
+          // All other Cmd+key → Win+key (system shortcuts)
+          const sc = codeToScancode(e.code);
+          if (sc !== undefined) {
+            suppressedShortcutKeyups.add(e.code);
+            suppressedShortcutKeyups.add('MetaLeft');
+            suppressedShortcutKeyups.add('MetaRight');
+            sendWinShortcut(sc);
+          }
           return;
         }
 
-        // Ctrl+C / Cmd+C → just send scancodes (same principle)
-        if (isCtrl && e.code === 'KeyC') {
-          suppressedShortcutKeyups.add('KeyC');
-          if (isMac) {
-            suppressedShortcutKeyups.add('MetaLeft');
-            suppressedShortcutKeyups.add('MetaRight');
-          }
-          sendCtrlShortcut(0x2E);
-          return;
-        }
-
-        const code = isMac ? macRemapCode(e.code) : e.code;
-        const sc = codeToScancode(code);
+        // ── Generic path: send scancode directly ──
+        const sc = codeToScancode(e.code);
         if (sc !== undefined) {
-          sendInput(wasmModule.DeviceEvent.keyPressed(sc));
-        } else if (e.key.length === 1) {
-          sendInput(wasmModule.DeviceEvent.unicodePressed(e.key));
+          if (isNative) {
+            nativeSendKey(sc, true);
+          } else {
+            sendInput(wasmModule!.DeviceEvent.keyPressed(sc));
+          }
+        } else if (e.key.length === 1 && !isNative) {
+          sendInput(wasmModule!.DeviceEvent.unicodePressed(e.key));
         }
       };
       const onKeyUp = (e: KeyboardEvent) => {
         e.preventDefault();
-        if (!wasmModule) return;
+        if (!isNative && !wasmModule) return;
         if (suppressedShortcutKeyups.has(e.code)) {
           suppressedShortcutKeyups.delete(e.code);
           return;
         }
+        // Mac: Cmd release
         if (isMac && (e.code === 'MetaLeft' || e.code === 'MetaRight')) {
+          if (cmdPendingWinTap) {
+            cmdPendingWinTap = false;
+            sendWinKey();
+          }
           return;
         }
-        const code = isMac ? macRemapCode(e.code) : e.code;
-        const sc = codeToScancode(code);
+        const sc = codeToScancode(e.code);
         if (sc !== undefined) {
-          sendInput(wasmModule.DeviceEvent.keyReleased(sc));
-        } else if (e.key.length === 1) {
-          sendInput(wasmModule.DeviceEvent.unicodeReleased(e.key));
+          if (isNative) {
+            nativeSendKey(sc, false);
+          } else {
+            sendInput(wasmModule!.DeviceEvent.keyReleased(sc));
+          }
+        } else if (e.key.length === 1 && !isNative) {
+          sendInput(wasmModule!.DeviceEvent.unicodeReleased(e.key));
         }
       };
       const onMouseMove = (e: MouseEvent) => {
-        if (!wasmModule) return;
         const r = canvas.getBoundingClientRect();
         const sx = canvas.width / r.width;
         const sy = canvas.height / r.height;
-        sendInput(wasmModule.DeviceEvent.mouseMove(
-          (e.clientX - r.left) * sx,
-          (e.clientY - r.top) * sy,
-        ));
+        const mx = (e.clientX - r.left) * sx;
+        const my = (e.clientY - r.top) * sy;
+        if (isNative) {
+          // -1 = no button (pure move)
+          api.rdpNativeMouse(tabId, mx, my, -1, false).catch(() => {});
+        } else {
+          if (!wasmModule) return;
+          sendInput(wasmModule.DeviceEvent.mouseMove(mx, my));
+        }
       };
       const pressedButtons = new Set<number>();
       const onMouseDown = (e: MouseEvent) => {
         e.preventDefault();
-        if (!wasmModule) return;
-        canvas.focus();
         pressedButtons.add(e.button);
-        sendInput(wasmModule.DeviceEvent.mouseButtonPressed(e.button));
+        const r = canvas.getBoundingClientRect();
+        const sx = canvas.width / r.width;
+        const sy = canvas.height / r.height;
+        const mx = (e.clientX - r.left) * sx;
+        const my = (e.clientY - r.top) * sy;
+        rdpLog.info('input', `mouse DOWN btn=${e.button}`, {
+          x: Math.round(mx),
+          y: Math.round(my),
+          pressed: [...pressedButtons],
+          target: (e.target as HTMLElement)?.tagName,
+        });
+        if (isNative) {
+          api.rdpNativeMouse(tabId, mx, my, e.button, true)
+            .catch(error => rdpLog.warn('input', 'native mouse down send failed', { error: String(error) }));
+        } else {
+          if (!wasmModule) return;
+          sendInput(wasmModule.DeviceEvent.mouseButtonPressed(e.button));
+        }
+        if (document.activeElement !== canvas) {
+          canvas.focus();
+        }
       };
       const onMouseUp = (e: MouseEvent) => {
-        if (!wasmModule) return;
-        if (!pressedButtons.has(e.button)) return; // only release if pressed on canvas
+        if (!pressedButtons.has(e.button)) {
+          rdpLog.debug('input', `mouse UP btn=${e.button} SKIPPED (not in pressed)`, { pressed: [...pressedButtons] });
+          return;
+        }
         pressedButtons.delete(e.button);
-        sendInput(wasmModule.DeviceEvent.mouseButtonReleased(e.button));
+        const r = canvas.getBoundingClientRect();
+        const sx = canvas.width / r.width;
+        const sy = canvas.height / r.height;
+        const mx = (e.clientX - r.left) * sx;
+        const my = (e.clientY - r.top) * sy;
+        rdpLog.info('input', `mouse UP btn=${e.button} SENT`, {
+          x: Math.round(mx),
+          y: Math.round(my),
+          remaining: [...pressedButtons],
+        });
+        if (isNative) {
+          api.rdpNativeMouse(tabId, mx, my, e.button, false)
+            .catch(error => rdpLog.warn('input', 'native mouse up send failed', { error: String(error) }));
+        } else {
+          if (!wasmModule) return;
+          sendInput(wasmModule.DeviceEvent.mouseButtonReleased(e.button));
+        }
       };
       const onCtxMenu = (e: Event) => e.preventDefault();
       const onWheel = (e: WheelEvent) => {
         e.preventDefault();
-        if (!wasmModule) return;
         const vertical = Math.abs(e.deltaY) >= Math.abs(e.deltaX);
         const delta = vertical ? e.deltaY : e.deltaX;
         if (delta === 0) return;
-        // DOM deltaY > 0 = scroll down, RDP positive = scroll up → invert
-        // deltaMode: 0=pixels, 1=lines, 2=pages → maps to RotationUnit enum
-        const unit = e.deltaMode; // 0=Pixel, 1=Line, 2=Page
-        // Clamp to i16 range and invert direction
         const amount = Math.round(Math.max(-32767, Math.min(32767, -delta)));
         if (amount === 0) return;
-        sendInput(wasmModule.DeviceEvent.wheelRotations(vertical, amount, unit));
+        if (isNative) {
+          const r = canvas.getBoundingClientRect();
+          const sx = canvas.width / r.width;
+          const sy = canvas.height / r.height;
+          api.rdpNativeWheel(tabId, (e.clientX - r.left) * sx, (e.clientY - r.top) * sy, amount, !vertical).catch(() => {});
+        } else {
+          if (!wasmModule) return;
+          const unit = e.deltaMode;
+          sendInput(wasmModule.DeviceEvent.wheelRotations(vertical, amount, unit));
+        }
       };
 
       // ── Release all keys/buttons when focus is lost ──
@@ -1690,6 +2128,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       // clicks outside canvas, etc.), because the browser never fires
       // keyUp events for keys held when focus leaves.
       const releaseAllKeys = () => {
+        rdpLog.debug('input', 'releaseAllKeys called', { pressedButtons: [...pressedButtons] });
         const session = sessionRefs.current.get(tabId);
         if (session) {
           try { session.releaseAllInputs(); } catch { /* ignore */ }
@@ -1697,7 +2136,16 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         pressedButtons.clear();
         suppressedShortcutKeyups.clear();
       };
-      const onCanvasBlur = () => releaseAllKeys();
+      const onCanvasBlur = () => {
+        // Skip release if mouse buttons are still pressed (user is dragging).
+        // Releasing during drag sends unexpected mouse-up to the RDP server,
+        // which breaks slider/scrollbar drag operations (stutter on re-drag).
+        if (pressedButtons.size > 0) {
+          rdpLog.debug('input', 'blur during drag, deferring release', { pressedButtons: [...pressedButtons] });
+          return;
+        }
+        releaseAllKeys();
+      };
       const onWindowBlur = () => releaseAllKeys();
 
       canvas.addEventListener('keydown', onKeyDown);
@@ -1717,9 +2165,27 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       let lastSyncedText: string | null = null;
       let lastSyncedFileKey: string | null = null;
       let clipboardPollTimer: ReturnType<typeof setInterval> | null = null;
+      // Throttle FormatList sends: minimum 5s between sends to prevent server rejection.
+      // Some Windows RDP servers reject rapid FormatList PDUs, causing CLIPRDR to enter
+      // permanent "Failed" state (ironrdp_cliprdr state machine never recovers).
+      let lastFormatListSentAt = 0;
+      const FORMAT_LIST_MIN_INTERVAL_MS = 5000;
+      // Cooldown after connection: don't send FormatList for 10s after CLIPRDR init
+      const cliprdrConnectedAt = Date.now();
+      const CLIPRDR_INIT_COOLDOWN_MS = 10000;
       const syncClipboard = async (reason: 'Focus' | 'Poll') => {
         if (reason === 'Focus') {
           cblog('[clipboard] ▶ Focus event fired');
+        }
+        // Cooldown: skip all FormatList sends for 10s after connection
+        if (Date.now() - cliprdrConnectedAt < CLIPRDR_INIT_COOLDOWN_MS) {
+          if (reason === 'Focus') cblog('[clipboard] Focus: skipped — init cooldown');
+          return;
+        }
+        // Throttle: minimum 5s between FormatList sends
+        if (Date.now() - lastFormatListSentAt < FORMAT_LIST_MIN_INTERVAL_MS) {
+          if (reason === 'Focus') cblog('[clipboard] Focus: skipped — throttle (last sent <5s ago)');
+          return;
         }
         // Skip poll if file transfer is in progress (CLIPRDR state machine busy)
         if (fileTransferInProgressRef.current.has(tabId)) {
@@ -1758,6 +2224,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
               const cd = new wasmModule.ClipboardData();
               cd.addText('text/plain', text);
               await sess.onClipboardPaste(cd);
+              lastFormatListSentAt = Date.now();
               advertisedClipboardRef.current.set(tabId, {
                 kind: 'text',
                 text,
@@ -1811,6 +2278,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
               }
               addClipboardFiles(cd, payloads);
               await sess.onClipboardPaste(cd);
+              lastFormatListSentAt = Date.now();
               advertisedClipboardRef.current.set(tabId, {
                 kind: 'files',
                 fileKey,
@@ -1833,6 +2301,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
             const cd = new wasmModule.ClipboardData();
             cd.addText('text/plain', text);
             await sess.onClipboardPaste(cd);
+            lastFormatListSentAt = Date.now();
             advertisedClipboardRef.current.set(tabId, {
               kind: 'text',
               text,
@@ -1852,7 +2321,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       window.addEventListener('focus', onFocusSync);
       clipboardPollTimer = setInterval(() => {
         void syncClipboard('Poll');
-      }, 3000);
+      }, 6000);
 
       cleanupFn = () => {
         canvas.removeEventListener('keydown', onKeyDown);
@@ -1894,25 +2363,49 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       if (!wrap.offsetParent) return;
       const tabId = activeTabIdRef.current;
       if (!tabId) return;
-      if (!sessionRefs.current.has(tabId)) return;
       // Skip resize during active file transfer — reconnect would kill the transfer
       if (fileTransferInProgressRef.current.has(tabId)) return;
 
       const { w, h } = getCanvasSize();
       if (w <= 0 || h <= 0) return;
-      // Skip if size change is too small (< 20px in either dimension)
+      // Skip if size change is too small (< 10px in either dimension)
       const dw = Math.abs(w - lastSizeRef.current.w);
       const dh = Math.abs(h - lastSizeRef.current.h);
-      if (dw < 20 && dh < 20) return;
+      if (dw < 10 && dh < 10) return;
 
-      console.log('[rdp] adaptive resize → reconnect:', w, 'x', h);
       lastSizeRef.current = { w, h };
-      reconnectWithSize(tabId); // null desired → uses wrapper
+
+      // ── Native mode: use Rust backend DVC resize with reconnect fallback ──
+      if (USE_NATIVE_RDP && nativeTabsRef.current.has(tabId)) {
+        rdpLog.info('render', `adaptive resize (native) → trying DVC: ${w} x ${h}`);
+        api.rdpNativeResize(tabId, w, h)
+          .then(() => {
+            rdpLog.info('render', `adaptive resize (native) → DVC success: ${w} x ${h}`);
+          })
+          .catch(() => {
+            rdpLog.warn('render', 'adaptive resize (native) → DVC failed, reconnecting');
+            reconnectWithSize(tabId);
+          });
+        return;
+      }
+
+      // ── WASM mode: try DisplayControl DVC first, then reconnect ──
+      const session = sessionRefs.current.get(tabId);
+      if (!session) return;
+      try {
+        session.resize(w, h);
+        rdpLog.info('render', `adaptive resize → dynamic PDU sent: ${w} x ${h}`);
+        return;
+      } catch (e) {
+        rdpLog.warn('render', 'dynamic resize failed, falling back to reconnect', { error: e });
+      }
+      rdpLog.info('render', `adaptive resize → reconnect fallback: ${w} x ${h}`);
+      reconnectWithSize(tabId);
     };
 
     const scheduleResize = () => {
       if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
-      resizeTimerRef.current = setTimeout(doResize, 200);
+      resizeTimerRef.current = setTimeout(doResize, 300);
     };
 
     // ResizeObserver for wrapper layout changes
@@ -1978,6 +2471,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
     <div className="flex h-full overflow-hidden">
       <RdpSidebar
         store={store}
+        selectedServerId={selectedServerId}
         onConnectServer={handleConnectServer}
         onSelectServer={handleSelectServer}
         onNewServer={() => { setEditServerId(null); setShowNewConn(true); }}
@@ -1985,7 +2479,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         onDeleteServer={(id) => { store.removeServer(id); }}
       />
 
-      <div ref={containerRef} className="flex-1 flex flex-col min-w-0 relative">
+      <div ref={containerRef} className="flex-1 flex flex-col min-w-0 relative transition-all duration-300">
         {/* TabBar — data-bar for height calculation */}
         <div data-bar>
           <RdpTabBar
@@ -2009,6 +2503,8 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
               onApplyResolution: applyResolution,
               onToggleClipboardStrategy: toggleMacClipboardStrategy,
               onOpenClipboardFolder: openClipboardFolder,
+              onSendWinKey: () => sendWinKeyRef.current?.(),
+              onSendCtrlAltDel: () => sendCtrlAltDelRef.current?.(),
               onDisconnect: () => handleCloseTab(activeTab.id),
             } : null}
           />
@@ -2032,7 +2528,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         {hasActiveTabs && (
           <div className={store.viewMode !== 'tab' ? 'hidden' : 'contents'}>
             {/* Canvas wrapper — fills remaining flex space */}
-            <div ref={canvasWrapRef} className="flex-1 relative min-h-0 min-w-0 bg-[#0a0e1a] overflow-hidden">
+            <div ref={canvasWrapRef} className="flex-1 relative min-h-0 min-w-0 bg-zinc-100 dark:bg-[#0a0e1a] overflow-hidden">
               {/* Canvas layers: one per tab, absolutely positioned */}
               {store.tabs.map(tab => (
                 <canvas
@@ -2048,6 +2544,23 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
                     (tab.id !== activeTab?.id || (tab.status !== 'connected' && tab.status !== 'connecting')) && "hidden"
                   )}
                   tabIndex={0}
+                />
+              ))}
+              {/* H.264 overlay canvases — separate 2D context per tab, layered on top.
+                  pointer-events-none so clicks pass through to the WASM canvas below. */}
+              {store.tabs.map(tab => (
+                <canvas
+                  key={`h264-${tab.id}`}
+                  ref={el => {
+                    if (el) h264OverlayRefs.current.set(tab.id, el);
+                    else h264OverlayRefs.current.delete(tab.id);
+                  }}
+                  className={cn(
+                    "pointer-events-none",
+                    tab.id === activeTab?.id && tab.status === 'connected' && "absolute inset-0 w-full h-full",
+                    (tab.id !== activeTab?.id || tab.status !== 'connected') && "hidden"
+                  )}
+                  style={{ opacity: 0, transition: 'opacity 0.1s' }}
                 />
               ))}
 
@@ -2067,7 +2580,10 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
                   <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/20 text-sm text-destructive max-w-md whitespace-pre-wrap text-center">
                     {activeTab.errorMsg}
                   </div>
-                  <Button variant="outline" size="sm" onClick={() => connectSession(activeTab.id)}>{t('rdpRetry')}</Button>
+                  <div className="flex items-center gap-2">
+                    <Button variant="outline" size="sm" onClick={() => connectSession(activeTab.id)}>{t('rdpRetry')}</Button>
+                    <Button variant="outline" size="sm" onClick={() => { setEditServerId(activeTab.serverId); setShowNewConn(true); }}>{t('rdpEdit')}</Button>
+                  </div>
                 </div>
               )}
 

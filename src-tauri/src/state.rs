@@ -8,7 +8,10 @@ use tokio::process::Child;
 pub enum SyncState {
     Idle,
     Syncing,
-    Failed { error_category: String, error_detail: String },
+    Failed {
+        error_category: String,
+        error_detail: String,
+    },
 }
 
 impl Default for SyncState {
@@ -86,6 +89,7 @@ pub struct AppState {
     pub sync_state: Arc<Mutex<SyncState>>,
     pub audio_manager: Arc<Mutex<crate::rdp_audio::AudioManager>>,
     pub native_sessions: Arc<Mutex<crate::rdp_session::SessionManager>>,
+    pub file_transfer_ws_port: Arc<Mutex<u16>>,
 }
 
 impl Default for AppState {
@@ -95,9 +99,7 @@ impl Default for AppState {
             proxy_groups: Arc::new(Mutex::new(Vec::new())),
             subscription_url: Arc::new(Mutex::new(String::new())),
             clash_process: Arc::new(Mutex::new(None)),
-            clash_api_base: Arc::new(Mutex::new(
-                "http://127.0.0.1:17891".to_string(),
-            )),
+            clash_api_base: Arc::new(Mutex::new("http://127.0.0.1:17891".to_string())),
             proxy_port: Arc::new(Mutex::new(17897)),
             reuse_mode: Arc::new(Mutex::new(false)),
             rdp_proxy_port: Arc::new(Mutex::new(18765)),
@@ -113,7 +115,7 @@ impl Default for AppState {
             sync_state: Arc::new(Mutex::new(SyncState::default())),
             audio_manager: Arc::new(Mutex::new(crate::rdp_audio::AudioManager::default())),
             native_sessions: Arc::new(Mutex::new(crate::rdp_session::SessionManager::default())),
+            file_transfer_ws_port: Arc::new(Mutex::new(0)),
         }
     }
 }
-

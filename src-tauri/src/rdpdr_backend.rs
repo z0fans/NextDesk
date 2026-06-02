@@ -2,26 +2,21 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
-use std::path::Path;
-use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+use std::path::Path;
+use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 use tauri::{AppHandle, State};
 
 use crate::state::{AppState, ClipboardSessionState};
 use crate::virtual_file_clipboard::{
-    write_virtual_files_to_local_clipboard,
-    write_staged_paths_to_clipboard,
-    session_stage_root,
-    unique_path_in_dir,
-    VirtualClipboardFile,
-    VirtualClipboardWriteResult,
+    session_stage_root, unique_path_in_dir, write_staged_paths_to_clipboard,
+    write_virtual_files_to_local_clipboard, VirtualClipboardFile, VirtualClipboardWriteResult,
 };
 
-static RDPDR_FILE_HANDLE_CACHE: OnceLock<Mutex<HashMap<String, File>>> =
-    OnceLock::new();
+static RDPDR_FILE_HANDLE_CACHE: OnceLock<Mutex<HashMap<String, File>>> = OnceLock::new();
 
 /// File entry for RDPDR drive sharing.
 #[derive(Debug, Clone, Serialize)]
@@ -35,9 +30,7 @@ pub struct DriveFileEntry {
     pub last_write_time: i64,
 }
 
-fn system_time_to_filetime(
-    t: SystemTime,
-) -> i64 {
+fn system_time_to_filetime(t: SystemTime) -> i64 {
     // Windows FILETIME: 100ns since Jan 1, 1601
     // Unix epoch (Jan 1, 1970) - FILETIME epoch = 11644473600s
     let unix_secs = t
@@ -76,18 +69,9 @@ fn scan_folder(
             format!("{}/{}", rel_prefix, name_str)
         };
 
-        let ctime =
-            system_time_to_filetime(
-                meta.created().unwrap_or(SystemTime::UNIX_EPOCH),
-            );
-        let atime =
-            system_time_to_filetime(
-                meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH),
-            );
-        let mtime =
-            system_time_to_filetime(
-                meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-            );
+        let ctime = system_time_to_filetime(meta.created().unwrap_or(SystemTime::UNIX_EPOCH));
+        let atime = system_time_to_filetime(meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH));
+        let mtime = system_time_to_filetime(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
 
         if meta.is_dir() {
             entries.push(DriveFileEntry {
@@ -99,12 +83,7 @@ fn scan_folder(
                 last_access_time: atime,
                 last_write_time: mtime,
             });
-            scan_folder(
-                &entry.path(),
-                &rel_path,
-                entries,
-                max_file_size,
-            );
+            scan_folder(&entry.path(), &rel_path, entries, max_file_size);
         } else if meta.is_file() {
             let size = meta.len();
             let data = if size <= max_file_size {
@@ -130,9 +109,7 @@ fn scan_folder(
 /// Returns a list of file entries with metadata and
 /// content (for files under 10MB).
 #[tauri::command]
-pub async fn rdpdr_scan_folder(
-    folder_path: String,
-) -> Result<Vec<DriveFileEntry>, String> {
+pub async fn rdpdr_scan_folder(folder_path: String) -> Result<Vec<DriveFileEntry>, String> {
     let path = Path::new(&folder_path);
     if !path.exists() || !path.is_dir() {
         return Err(format!(
@@ -204,15 +181,9 @@ fn scan_folder_metadata(
             format!("{}/{}", rel_prefix, name_str)
         };
 
-        let ctime = system_time_to_filetime(
-            meta.created().unwrap_or(SystemTime::UNIX_EPOCH),
-        );
-        let atime = system_time_to_filetime(
-            meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH),
-        );
-        let mtime = system_time_to_filetime(
-            meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-        );
+        let ctime = system_time_to_filetime(meta.created().unwrap_or(SystemTime::UNIX_EPOCH));
+        let atime = system_time_to_filetime(meta.accessed().unwrap_or(SystemTime::UNIX_EPOCH));
+        let mtime = system_time_to_filetime(meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
 
         if meta.is_dir() {
             entries.push(DriveMetadataEntry {
@@ -261,9 +232,7 @@ pub async fn rdpdr_scan_folder_metadata(
     let mut entries = Vec::new();
     let max_depth = 3;
     let max_entries = 5000;
-    scan_folder_metadata(
-        path, "", &mut entries, 0, max_depth, max_entries,
-    );
+    scan_folder_metadata(path, "", &mut entries, 0, max_depth, max_entries);
 
     if entries.len() >= max_entries {
         log::warn!(
@@ -283,13 +252,16 @@ pub async fn rdpdr_scan_folder_metadata(
 }
 
 /// Tauri command: read a chunk of a file on-demand.
+///
+/// Returns raw binary via `tauri::ipc::Response` to avoid JSON serialization
+/// of large byte arrays (2MB chunk → ~10MB JSON text otherwise).
 #[tauri::command]
 pub async fn rdpdr_read_file_chunk(
     base_folder: String,
     relative_path: String,
     offset: u64,
     length: u32,
-) -> Result<Vec<u8>, String> {
+) -> Result<tauri::ipc::Response, String> {
     #[cfg(not(target_family = "unix"))]
     use std::io::{Read, Seek, SeekFrom};
     #[cfg(target_family = "unix")]
@@ -297,22 +269,17 @@ pub async fn rdpdr_read_file_chunk(
 
     let full_path = Path::new(&base_folder).join(&relative_path);
     if !full_path.exists() || !full_path.is_file() {
-        return Err(format!(
-            "File does not exist: {}",
-            full_path.display()
-        ));
+        return Err(format!("File does not exist: {}", full_path.display()));
     }
 
     let mut buf = vec![0u8; length as usize];
-    let cache = RDPDR_FILE_HANDLE_CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = RDPDR_FILE_HANDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = full_path.to_string_lossy().to_string();
     let mut handles = cache
         .lock()
         .map_err(|_| "RDPDR file handle cache lock poisoned".to_string())?;
     if !handles.contains_key(&key) {
-        let opened = File::open(&full_path)
-            .map_err(|e| format!("Failed to open file: {}", e))?;
+        let opened = File::open(&full_path).map_err(|e| format!("Failed to open file: {}", e))?;
         handles.insert(key.clone(), opened);
     }
     let file = handles
@@ -332,26 +299,20 @@ pub async fn rdpdr_read_file_chunk(
             .map_err(|e| format!("Failed to read: {}", e))?
     };
     buf.truncate(bytes_read);
-    Ok(buf)
+    Ok(tauri::ipc::Response::new(buf))
 }
 
 /// Tauri command: read a local file for clipboard file transfer.
 ///
 /// Returns the file contents as raw bytes (Vec<u8>).
 #[tauri::command]
-pub async fn clipboard_read_file(
-    file_path: String,
-) -> Result<Vec<u8>, String> {
+pub async fn clipboard_read_file(file_path: String) -> Result<Vec<u8>, String> {
     let path = Path::new(&file_path);
     if !path.exists() || !path.is_file() {
-        return Err(format!(
-            "File does not exist: {}",
-            file_path
-        ));
+        return Err(format!("File does not exist: {}", file_path));
     }
 
-    let data = fs::read(path)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
+    let data = fs::read(path).map_err(|e| format!("Failed to read file: {}", e))?;
 
     log::info!(
         "[clipboard] Read file: {} ({} bytes)",
@@ -365,38 +326,33 @@ pub async fn clipboard_read_file(
 ///
 /// Saves the file to the user's Downloads directory.
 #[tauri::command]
-pub async fn clipboard_write_file(
-    file_name: String,
-    data: Vec<u8>,
-) -> Result<String, String> {
-    let downloads = dirs::download_dir()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| Path::new("/tmp").to_path_buf())
-                .join("Downloads")
-        });
+pub async fn clipboard_write_file(file_name: String, data: Vec<u8>) -> Result<String, String> {
+    let downloads = dirs::download_dir().unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| Path::new("/tmp").to_path_buf())
+            .join("Downloads")
+    });
 
     // Ensure directory exists
-    fs::create_dir_all(&downloads)
-        .map_err(|e| format!("Failed to create Downloads dir: {}", e))?;
+    fs::create_dir_all(&downloads).map_err(|e| format!("Failed to create Downloads dir: {}", e))?;
 
     let dest = downloads.join(&file_name);
 
     // Handle duplicate filenames
     let final_path = if dest.exists() {
-        let stem = dest.file_stem()
+        let stem = dest
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or(&file_name);
-        let ext = dest.extension()
+        let ext = dest
+            .extension()
             .and_then(|s| s.to_str())
             .map(|e| format!(".{}", e))
             .unwrap_or_default();
 
         let mut counter = 1u32;
         loop {
-            let candidate = downloads.join(
-                format!("{} ({}){}", stem, counter, ext),
-            );
+            let candidate = downloads.join(format!("{} ({}){}", stem, counter, ext));
             if !candidate.exists() {
                 break candidate;
             }
@@ -406,8 +362,7 @@ pub async fn clipboard_write_file(
         dest
     };
 
-    fs::write(&final_path, &data)
-        .map_err(|e| format!("Failed to write file: {}", e))?;
+    fs::write(&final_path, &data).map_err(|e| format!("Failed to write file: {}", e))?;
 
     let path_str = final_path.to_string_lossy().to_string();
     log::info!(
@@ -587,20 +542,19 @@ pub async fn clipboard_read_files_data() -> Result<Vec<ClipboardFileInfo>, Strin
         if !p.is_file() {
             continue;
         }
-        let name = p.file_name()
+        let name = p
+            .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
 
-        let meta = fs::metadata(p)
-            .map_err(|e| format!("metadata: {}", e))?;
+        let meta = fs::metadata(p).map_err(|e| format!("metadata: {}", e))?;
         let size = meta.len();
 
         // Small files (< 2MB): read data inline
         // Large files: send only metadata, data will be read on-demand via async callback
         if size <= 2 * 1024 * 1024 {
-            let data = fs::read(p)
-                .map_err(|e| format!("read: {}", e))?;
+            let data = fs::read(p).map_err(|e| format!("read: {}", e))?;
             files.push(ClipboardFileInfo {
                 name,
                 path: path_str.clone(),
@@ -608,7 +562,11 @@ pub async fn clipboard_read_files_data() -> Result<Vec<ClipboardFileInfo>, Strin
                 data,
             });
         } else {
-            log::info!("[clipboard] Large file (lazy): {} ({}MB)", name, size / 1024 / 1024);
+            log::info!(
+                "[clipboard] Large file (lazy): {} ({}MB)",
+                name,
+                size / 1024 / 1024
+            );
             files.push(ClipboardFileInfo {
                 name,
                 path: path_str.clone(),
@@ -623,14 +581,18 @@ pub async fn clipboard_read_files_data() -> Result<Vec<ClipboardFileInfo>, Strin
 /// Save a file downloaded from remote RDP session to the user's Downloads directory.
 #[tauri::command]
 pub async fn save_downloaded_file(name: String, data: Vec<u8>) -> Result<String, String> {
-    let downloads = dirs::download_dir()
-        .ok_or_else(|| "Cannot find Downloads directory".to_string())?;
+    let downloads =
+        dirs::download_dir().ok_or_else(|| "Cannot find Downloads directory".to_string())?;
 
     let dest = downloads.join(&name);
-    log::info!("[file-transfer] Saving {} ({} bytes) to {:?}", name, data.len(), dest);
+    log::info!(
+        "[file-transfer] Saving {} ({} bytes) to {:?}",
+        name,
+        data.len(),
+        dest
+    );
 
-    fs::write(&dest, &data)
-        .map_err(|e| format!("Failed to write file: {}", e))?;
+    fs::write(&dest, &data).map_err(|e| format!("Failed to write file: {}", e))?;
 
     let path_str = dest.to_string_lossy().to_string();
     log::info!("[file-transfer] ✅ Saved: {}", path_str);
@@ -683,22 +645,23 @@ pub async fn stage_downloaded_files_for_paste(
         );
     }
 
-    if let Some(session_id) = session_id
-        .filter(|id| !id.trim().is_empty())
-    {
+    if let Some(session_id) = session_id.filter(|id| !id.trim().is_empty()) {
         let mut sessions = app_state
             .clipboard_sessions
             .lock()
             .map_err(|_| "Clipboard session state lock poisoned".to_string())?;
-        sessions.insert(session_id.clone(), ClipboardSessionState {
-            session_id,
-            strategy: result.strategy.clone(),
-            staged_paths: result.staged_paths.clone(),
-            updated_at_ms: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        });
+        sessions.insert(
+            session_id.clone(),
+            ClipboardSessionState {
+                session_id,
+                strategy: result.strategy.clone(),
+                staged_paths: result.staged_paths.clone(),
+                updated_at_ms: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            },
+        );
     }
 
     Ok(result)
@@ -771,12 +734,10 @@ pub async fn clipboard_stage_begin(
     file_name: String,
 ) -> Result<String, String> {
     let stage_root = session_stage_root(Some(&session_id));
-    fs::create_dir_all(&stage_root)
-        .map_err(|e| format!("Failed to create staging dir: {}", e))?;
+    fs::create_dir_all(&stage_root).map_err(|e| format!("Failed to create staging dir: {}", e))?;
     let dest = unique_path_in_dir(&stage_root, &file_name);
     // Create empty file
-    File::create(&dest)
-        .map_err(|e| format!("Failed to create staged file: {}", e))?;
+    File::create(&dest).map_err(|e| format!("Failed to create staged file: {}", e))?;
     log::info!(
         "[file-transfer] Stage begin: {} ({})",
         file_name,
@@ -787,10 +748,7 @@ pub async fn clipboard_stage_begin(
 
 /// Append a data chunk to a staged file.
 #[tauri::command]
-pub async fn clipboard_stage_chunk(
-    path: String,
-    data: Vec<u8>,
-) -> Result<(), String> {
+pub async fn clipboard_stage_chunk(path: String, data: Vec<u8>) -> Result<(), String> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .append(true)
@@ -817,9 +775,7 @@ pub async fn clipboard_stage_commit(
     })
     .map_err(|e| format!("Failed to dispatch: {}", e))?;
 
-    let strategy = rx
-        .recv()
-        .map_err(|e| format!("Channel error: {}", e))??;
+    let strategy = rx.recv().map_err(|e| format!("Channel error: {}", e))??;
 
     let result = VirtualClipboardWriteResult {
         strategy: strategy.clone(),
@@ -841,15 +797,18 @@ pub async fn clipboard_stage_commit(
             .clipboard_sessions
             .lock()
             .map_err(|_| "Clipboard session lock poisoned".to_string())?;
-        sessions.insert(session_id.clone(), ClipboardSessionState {
-            session_id,
-            strategy: result.strategy.clone(),
-            staged_paths: result.staged_paths.clone(),
-            updated_at_ms: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        });
+        sessions.insert(
+            session_id.clone(),
+            ClipboardSessionState {
+                session_id,
+                strategy: result.strategy.clone(),
+                staged_paths: result.staged_paths.clone(),
+                updated_at_ms: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            },
+        );
     }
 
     Ok(result)

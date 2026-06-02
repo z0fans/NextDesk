@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NextDesk Dashboard - 方案B 用户友好化</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', sans-serif;
+    background: #0a0e1a;
+    color: #e2e8f0;
+    display: flex;
+    min-height: 100vh;
+  }
+
+  /* Sidebar */
+  .sidebar {
+    width: 56px;
+    background: #0f1424;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding-top: 16px;
+    gap: 8px;
+    border-right: 1px solid #1e293b;
+  }
+  .sidebar-logo {
+    width: 36px;
+    height: 36px;
+    background: linear-gradient(135deg, #3b82f6, #6366f1);
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 16px;
+    font-weight: bold;
+    font-size: 14px;
+  }
+  .sidebar-icon {
+    width: 40px;
+    height: 40px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #64748b;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .sidebar-icon.active {
+    background: #1e293b;
+    color: #3b82f6;
+  }
+  .sidebar-icon:hover {
+    background: #1e293b;
+    color: #e2e8f0;
+  }
+
+  /* Main content */
+  .main {
+    flex: 1;
+    padding: 40px 48px;
+    overflow-y: auto;
+  }
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: 32px;
+  }
+  .header h1 {
+    font-size: 28px;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+  .header p {
+    color: #64748b;
+    font-size: 14px;
+  }
+  .refresh-btn {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    border: 1px solid #1e293b;
+    background: transparent;
+    color: #64748b;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+  }
+
+  /* Engine card */
+  .engine-card {
+    background: linear-gradient(135deg, #111827, #1a1f35);
+    border: 1px solid #1e293b;
+    border-radius: 16px;
+    padding: 20px 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 24px;
+  }
+  .engine-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  .engine-icon {
+    width: 44px;
+    height: 44px;
+    background: linear-gradient(135deg, #1e3a5f, #1a2744);
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+  .engine-icon svg {
+    width: 24px;
+    height: 24px;
+    color: #3b82f6;
+  }
+  .engine-icon::after {
+    content: '';
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 8px;
+    height: 8px;
+    background: #22c55e;
+    border-radius: 50%;
+    border: 2px solid #111827;
+  }
+  .engine-title {
+    font-size: 16px;
+    font-weight: 600;
+  }
+  .engine-status {
+    font-size: 13px;
+    color: #22c55e;
+  }
+  .stop-btn {
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #ef4444;
+    padding: 8px 16px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  /* Cards row */
+  .cards-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+  .card {
+    background: #111827;
+    border: 1px solid #1e293b;
+    border-radius: 16px;
+    padding: 24px;
+  }
+  .card-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .card-header-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+  }
+  .card-header-icon.blue { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+  .card-header-icon.purple { background: rgba(139, 92, 246, 0.15); color: #8b5cf6; }
+  .card-header-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: #94a3b8;
+  }
+  .card-arrow {
+    margin-left: auto;
+    color: #475569;
+    font-size: 18px;
+  }
+
+  /* Left card - RDP */
+  .rdp-title {
+    font-size: 18px;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .rdp-desc {
+    font-size: 13px;
+    color: #64748b;
+    margin-bottom: 14px;
+  }
+  .version-badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    color: #3b82f6;
+    font-size: 12px;
+    font-weight: 500;
+  }
+
+  /* Right card - Network status (方案B) */
+  .status-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 0;
+    border-bottom: 1px solid #1e293b;
+  }
+  .status-row:last-child {
+    border-bottom: none;
+  }
+  .status-label {
+    font-size: 14px;
+    color: #94a3b8;
+  }
+  .status-value {
+    font-size: 14px;
+    font-weight: 500;
+    color: #e2e8f0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    position: relative;
+    cursor: default;
+  }
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #22c55e;
+  }
+  .status-dot.blue {
+    background: #3b82f6;
+  }
+
+  /* Tooltip on hover */
+  .tooltip {
+    position: absolute;
+    bottom: calc(100% + 8px);
+    right: 0;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    color: #94a3b8;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  }
+  .tooltip::after {
+    content: '';
+    position: absolute;
+    top: 100%;
+    right: 12px;
+    border: 5px solid transparent;
+    border-top-color: #334155;
+  }
+  .status-value:hover .tooltip {
+    opacity: 1;
+  }
+
+  /* Comparison label */
+  .comparison {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    background: rgba(59, 130, 246, 0.1);
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    color: #3b82f6;
+    padding: 6px 12px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 500;
+  }
+</style>
+</head>
+<body>
+
+<div class="comparison">方案B: 用户友好化</div>
+
+<!-- Sidebar -->
+<div class="sidebar">
+  <div class="sidebar-logo">N</div>
+  <div class="sidebar-icon active">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+  </div>
+  <div class="sidebar-icon">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+  </div>
+  <div class="sidebar-icon">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+  </div>
+  <div class="sidebar-icon">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+  </div>
+</div>
+
+<!-- Main -->
+<div class="main">
+  <div class="header">
+    <div>
+      <h1>仪表盘</h1>
+      <p>网络状态概览</p>
+    </div>
+    <button class="refresh-btn">↻</button>
+  </div>
+
+  <!-- Engine card -->
+  <div class="engine-card">
+    <div class="engine-left">
+      <div class="engine-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      </div>
+      <div>
+        <div class="engine-title">核心引擎</div>
+        <div class="engine-status">运行中</div>
+      </div>
+    </div>
+    <button class="stop-btn">□ 停止</button>
+  </div>
+
+  <!-- Cards -->
+  <div class="cards-row">
+    <!-- Left: RDP -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon blue">🖥</div>
+        <span class="card-header-title">远程桌面</span>
+        <span class="card-arrow">›</span>
+      </div>
+      <div class="rdp-title">RDP 加速服务</div>
+      <div class="rdp-desc">高性能远程桌面连接</div>
+      <span class="version-badge">v1.0.95</span>
+    </div>
+
+    <!-- Right: Network status (方案B - 用户友好化) -->
+    <div class="card">
+      <div class="card-header">
+        <div class="card-header-icon purple">⊕</div>
+        <span class="card-header-title">网络状态</span>
+      </div>
+
+      <div class="status-row">
+        <span class="status-label">运行模式</span>
+        <span class="status-value">内置</span>
+      </div>
+      <div class="status-row">
+        <span class="status-label">加速通道</span>
+        <span class="status-value">
+          <span class="status-dot"></span>已就绪
+          <span class="tooltip">端口 17897</span>
+        </span>
+      </div>
+      <div class="status-row">
+        <span class="status-label">连接中继</span>
+        <span class="status-value">
+          <span class="status-dot blue"></span>正常
+          <span class="tooltip">端口 18765</span>
+        </span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// No JS needed - pure CSS hover tooltips
+</script>
+</body>
+</html>

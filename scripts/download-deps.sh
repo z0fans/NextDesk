@@ -52,20 +52,7 @@ download_mihomo() {
 }
 
 download_geodata() {
-  local base_url="https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download"
-
-  if [ ! -f "$BIN_DIR/Country.mmdb" ]; then
-    echo "Downloading Country.mmdb..."
-    curl -fSL "$base_url/country-lite.mmdb" -o "$BIN_DIR/Country.mmdb"
-  fi
-  if [ ! -f "$BIN_DIR/geoip.metadb" ]; then
-    echo "Downloading geoip.metadb..."
-    curl -fSL "$base_url/geoip-lite.metadb" -o "$BIN_DIR/geoip.metadb"
-  fi
-  if [ ! -f "$BIN_DIR/geosite.dat" ]; then
-    echo "Downloading geosite.dat..."
-    curl -fSL "$base_url/geosite.dat" -o "$BIN_DIR/geosite.dat"
-  fi
+  bash "$SCRIPT_DIR/download-geodata.sh"
 }
 
 TARGET="${1:-}"

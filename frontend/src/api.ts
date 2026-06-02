@@ -210,6 +210,13 @@ export const api = {
 
   rdpNativeResize: (tabId: string, width: number, height: number) =>
     invoke<void>('rdp_native_resize', { tabId, width, height }),
+
+  // ── Diagnostic Logs ──────────────────────────────────
+  logShowInFinder: () => invoke<void>('log_show_in_finder'),
+  logCopyToDesktop: () => invoke<string>('log_copy_to_desktop'),
+  logClear: () => invoke<void>('log_clear'),
+  logFilePath: () => invoke<string>('log_file_path_str'),
+  logFileSize: () => invoke<number>('log_file_size'),
 };
 
 // ── Tauri Event Types (small, via emit) ─────────────

@@ -1,5 +1,5 @@
 import { useRef, useCallback, useEffect, useState } from 'react';
-import { X, LayoutGrid, LayoutList, RefreshCw, MoreHorizontal, ChevronDown, FolderOpen, Monitor, ClipboardCopy, PanelLeftOpen } from 'lucide-react';
+import { X, LayoutGrid, LayoutList, RefreshCw, MoreHorizontal, ChevronDown, FolderOpen, Monitor, ClipboardCopy, PanelLeftOpen, Keyboard, ShieldAlert } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import type { SessionTab, ViewMode } from '@/lib/rdp-types';
@@ -15,6 +15,8 @@ export interface SessionControls {
   onApplyResolution: (mode: string) => void;
   onToggleClipboardStrategy: () => void;
   onOpenClipboardFolder: () => void;
+  onSendWinKey: () => void;
+  onSendCtrlAltDel: () => void;
   onDisconnect: () => void;
 }
 
@@ -35,6 +37,7 @@ interface Props {
 const STATUS_COLOR: Record<string, string> = {
   connected: 'bg-emerald-500',
   connecting: 'bg-amber-500 animate-pulse',
+  reconnecting: 'bg-cyan-500 animate-pulse',
   error: 'bg-red-500',
   idle: 'bg-slate-500',
   disconnected: 'bg-slate-600',
@@ -147,13 +150,13 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
                 onViewModeChange('tab');
               }}
             >
-              <span className={cn("h-1.5 w-1.5 rounded-full shrink-0", STATUS_COLOR[tab.status])} />
+              <span className={cn("h-1.5 w-1.5 rounded-full shrink-0", STATUS_COLOR[tab.status])} title={tab.status} />
               <span className="truncate">{tab.name}</span>
             </button>
             <button
               type="button"
               aria-label={`Close ${tab.name}`}
-              className="opacity-0 group-hover:opacity-100 hover:text-destructive transition-opacity ml-1 mr-2 shrink-0 cursor-pointer"
+              className="opacity-40 group-hover:opacity-100 hover:text-destructive transition-opacity ml-1 mr-2 shrink-0 cursor-pointer"
               onClick={() => onCloseTab(tab.id)}
             >
               <X className="h-3 w-3" />
@@ -264,7 +267,7 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
                   onClick={() => { sessionControls.onToggleClipboardStrategy(); }}
                 >
                   <ClipboardCopy className="h-3.5 w-3.5 shrink-0" />
-                  {t('rdpClipboard')} {sessionControls.macClipboardStrategy === 'session-file-url' ? 'Std' : 'Exp'}
+                  {t('rdpClipboard')} {sessionControls.macClipboardStrategy === 'session-file-url' ? t('rdpClipboardStandard') : t('rdpClipboardExperimental')}
                 </button>
 
                 {/* Open clipboard folder */}
@@ -278,6 +281,26 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
                 >
                   <FolderOpen className="h-3.5 w-3.5" />
                   {t('rdpFiles')}
+                </button>
+
+                <div className="h-px bg-border/60 my-0.5" />
+
+                {/* Virtual keys: Win key & Ctrl+Alt+Del */}
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground cursor-pointer"
+                  onClick={() => { sessionControls.onSendWinKey(); setShowControlsMenu(false); }}
+                >
+                  <Keyboard className="h-3.5 w-3.5" />
+                  {t('rdpSendWinKey')}
+                </button>
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground cursor-pointer"
+                  onClick={() => { sessionControls.onSendCtrlAltDel(); setShowControlsMenu(false); }}
+                >
+                  <ShieldAlert className="h-3.5 w-3.5" />
+                  {t('rdpSendCtrlAltDel')}
                 </button>
 
                 <div className="h-px bg-border/60 my-0.5" />

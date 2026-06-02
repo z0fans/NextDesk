@@ -1,40 +1,21 @@
-use crate::virtual_file_clipboard::{
-    VirtualClipboardFile,
-    VirtualClipboardWriteResult,
-};
+use crate::virtual_file_clipboard::{VirtualClipboardFile, VirtualClipboardWriteResult};
 
 #[cfg(target_os = "macos")]
-use std::{
-    cell::RefCell,
-    env,
-    fs,
-    path::Path,
-    path::PathBuf,
-    time::SystemTime,
-};
+use std::{cell::RefCell, env, fs, path::Path, path::PathBuf, time::SystemTime};
 
 #[cfg(target_os = "macos")]
 use objc2::{
-    define_class,
-    msg_send,
+    define_class, msg_send,
     rc::Retained,
     runtime::{NSObject, NSObjectProtocol, ProtocolObject},
-    DefinedClass,
-    MainThreadMarker,
-    MainThreadOnly,
+    DefinedClass, MainThreadMarker, MainThreadOnly,
 };
 #[cfg(target_os = "macos")]
 #[allow(deprecated)]
 use objc2_app_kit::{
-    NSCreateFilenamePboardType,
-    NSCreateFileContentsPboardType,
-    NSFileContentsPboardType,
-    NSFilesPromisePboardType,
-    NSPasteboard,
-    NSPasteboardItem,
-    NSPasteboardItemDataProvider,
-    NSPasteboardType,
-    NSPasteboardTypeFileURL,
+    NSCreateFileContentsPboardType, NSCreateFilenamePboardType, NSFileContentsPboardType,
+    NSFilesPromisePboardType, NSPasteboard, NSPasteboardItem, NSPasteboardItemDataProvider,
+    NSPasteboardType, NSPasteboardTypeFileURL,
 };
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSArray, NSData, NSString, NSURL};
@@ -175,11 +156,13 @@ define_class!(
                 PromiseProviderRequestedType::FileUrlProbe => {
                     if let Some(file_url_payload) = self.ivars().file_url_payload.as_deref() {
                         let success = item.setString_forType(file_url_payload, r#type);
-                        let source_path = self.ivars()
+                        let source_path = self
+                            .ivars()
                             .file_url_source_path
                             .as_deref()
                             .unwrap_or("<unavailable>");
-                        let source_exists = self.ivars()
+                        let source_exists = self
+                            .ivars()
                             .file_url_source_path
                             .as_deref()
                             .map(|path| Path::new(path).exists())
@@ -305,10 +288,7 @@ impl NextDeskPasteboardPromiseProvider {
 }
 
 #[cfg(target_os = "macos")]
-fn type_eq(
-    lhs: &NSPasteboardType,
-    rhs: &NSPasteboardType,
-) -> bool {
+fn type_eq(lhs: &NSPasteboardType, rhs: &NSPasteboardType) -> bool {
     if std::ptr::eq(lhs, rhs) {
         return true;
     }
@@ -380,16 +360,12 @@ fn declared_type_names(
 }
 
 #[cfg(target_os = "macos")]
-fn pasteboard_type_names(
-    types: &NSArray<NSPasteboardType>,
-) -> Vec<String> {
+fn pasteboard_type_names(types: &NSArray<NSPasteboardType>) -> Vec<String> {
     types.iter().map(|ty| ty.to_string()).collect()
 }
 
 #[cfg(target_os = "macos")]
-fn promised_extension_from_name(
-    file_name: &str,
-) -> String {
+fn promised_extension_from_name(file_name: &str) -> String {
     Path::new(file_name)
         .extension()
         .and_then(|ext| ext.to_str())
@@ -399,9 +375,7 @@ fn promised_extension_from_name(
 }
 
 #[cfg(target_os = "macos")]
-fn promised_file_name_from_source(
-    source_name: &str,
-) -> String {
+fn promised_file_name_from_source(source_name: &str) -> String {
     Path::new(source_name)
         .file_name()
         .and_then(|part| part.to_str())
@@ -423,19 +397,18 @@ fn promise_stage_root() -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-fn unique_path_in_dir(
-    dir: &Path,
-    file_name: &str,
-) -> PathBuf {
+fn unique_path_in_dir(dir: &Path, file_name: &str) -> PathBuf {
     let dest = dir.join(file_name);
     if !dest.exists() {
         return dest;
     }
 
-    let stem = dest.file_stem()
+    let stem = dest
+        .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(file_name);
-    let ext = dest.extension()
+    let ext = dest
+        .extension()
         .and_then(|s| s.to_str())
         .map(|e| format!(".{}", e))
         .unwrap_or_default();
@@ -457,8 +430,13 @@ fn stage_virtual_file_for_file_url_payload(
     file_data: &[u8],
 ) -> Result<String, String> {
     let dest = unique_path_in_dir(stage_root, promised_file_name);
-    fs::write(&dest, file_data)
-        .map_err(|e| format!("Failed to stage promise source file '{}': {}", dest.display(), e))?;
+    fs::write(&dest, file_data).map_err(|e| {
+        format!(
+            "Failed to stage promise source file '{}': {}",
+            dest.display(),
+            e
+        )
+    })?;
     Ok(dest.to_string_lossy().to_string())
 }
 
@@ -469,9 +447,7 @@ fn promised_file_url_type() -> Retained<NSPasteboardType> {
 }
 
 #[cfg(target_os = "macos")]
-fn file_url_probe_path_from_name(
-    file_name: &str,
-) -> String {
+fn file_url_probe_path_from_name(file_name: &str) -> String {
     let leaf_name = Path::new(file_name)
         .file_name()
         .and_then(|part| part.to_str())
@@ -485,9 +461,7 @@ fn file_url_probe_path_from_name(
 }
 
 #[cfg(target_os = "macos")]
-fn promised_file_url_payload_from_path(
-    path: &str,
-) -> Option<Retained<NSString>> {
+fn promised_file_url_payload_from_path(path: &str) -> Option<Retained<NSString>> {
     let ns_path = NSString::from_str(path);
     let file_url = NSURL::fileURLWithPath(&ns_path);
     file_url.absoluteString()
@@ -498,8 +472,9 @@ fn promised_file_url_payload_from_path(
 pub fn write_files_with_pasteboard_item_provider(
     files: &[VirtualClipboardFile],
 ) -> Result<Option<VirtualClipboardWriteResult>, String> {
-    let mtm = MainThreadMarker::new()
-        .ok_or_else(|| "NSPasteboardItemDataProvider must be created on the main thread".to_string())?;
+    let mtm = MainThreadMarker::new().ok_or_else(|| {
+        "NSPasteboardItemDataProvider must be created on the main thread".to_string()
+    })?;
 
     if files.is_empty() {
         return Ok(None);
@@ -537,10 +512,14 @@ pub fn write_files_with_pasteboard_item_provider(
     for file in files {
         let promised_file_name = promised_file_name_from_source(&file.name);
         let promised_extension = promised_extension_from_name(&promised_file_name);
-        let promised_filename_type = NSCreateFilenamePboardType(&NSString::from_str(&promised_extension));
+        let promised_filename_type =
+            NSCreateFilenamePboardType(&NSString::from_str(&promised_extension));
         let promised_file_url_type = Some(promised_file_url_type());
-        let specific_file_contents_type = NSCreateFileContentsPboardType(&NSString::from_str(&promised_extension));
-        let (file_url_source_path, file_url_source_is_staged) = if let Some(root) = stage_root_ready.as_deref() {
+        let specific_file_contents_type =
+            NSCreateFileContentsPboardType(&NSString::from_str(&promised_extension));
+        let (file_url_source_path, file_url_source_is_staged) = if let Some(root) =
+            stage_root_ready.as_deref()
+        {
             match stage_virtual_file_for_file_url_payload(root, &promised_file_name, &file.data) {
                 Ok(path) => {
                     staged_paths.push(path.clone());
@@ -592,9 +571,7 @@ pub fn write_files_with_pasteboard_item_provider(
 
         // 先保持最小类型集合，避免在未实现真实落盘/URL promise 语义前扩大行为面。
         // 若 Finder Cmd+V 不消费，优先从 provider 日志里确认它实际请求的 type。
-        let mut provided_types: Vec<&NSPasteboardType> = vec![
-            unsafe { NSFilesPromisePboardType },
-        ];
+        let mut provided_types: Vec<&NSPasteboardType> = vec![unsafe { NSFilesPromisePboardType }];
         if let Some(filename_type) = promised_filename_type.as_deref() {
             provided_types.push(filename_type);
         }

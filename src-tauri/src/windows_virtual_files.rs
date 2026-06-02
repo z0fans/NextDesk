@@ -730,11 +730,7 @@ unsafe extern "system" fn data_object_get_data_here(
                 return E_OUTOFMEMORY;
             }
             unsafe {
-                copy_nonoverlapping(
-                    file.data.as_ptr(),
-                    locked.cast::<u8>(),
-                    file.data.len(),
-                );
+                copy_nonoverlapping(file.data.as_ptr(), locked.cast::<u8>(), file.data.len());
                 let _ = GlobalUnlock(hglobal);
             }
             log::debug!(

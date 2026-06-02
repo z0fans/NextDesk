@@ -2,7 +2,6 @@
 <html lang="en" class="dark">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>NextDesk</title>
     <script>
@@ -11,8 +10,15 @@
         var saved = localStorage.getItem('nextdesk-theme');
         if (saved === 'light') {
           document.documentElement.classList.remove('dark');
+        } else if (saved === 'auto' || !saved) {
+          // Auto mode: determine by local time (7:00-19:00 = light)
+          var hour = new Date().getHours();
+          if (hour >= 7 && hour < 19) {
+            document.documentElement.classList.remove('dark');
+          }
+          // Otherwise keep dark (HTML default)
         }
-        // If saved === 'dark' or no saved theme, keep the HTML default class="dark"
+        // If saved === 'dark', keep the HTML default class="dark"
       })();
     </script>
   </head>

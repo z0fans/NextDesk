@@ -1,8 +1,8 @@
 {
     "name": "NextDesk RDP Node Filter",
     "code": "nextdesk_filter",
-    "version": "1.0.0",
-    "description": "只允许 NextDesk 客户端获取带 rdp-only 标签的专用加速节点，防止节点被滥用",
+    "version": "1.3.1",
+    "description": "只允许 NextDesk 客户端获取带 rdp-only 标签或权限组的专用加速节点，防止节点被滥用",
     "author": "NextDesk",
     "require": {
         "xboard": ">=1.0.0"
@@ -11,8 +11,8 @@
         "protected_tag": {
             "type": "string",
             "default": "rdp-only",
-            "label": "受保护的节点标签",
-            "description": "带有此标签的节点只会下发给 NextDesk 客户端，其他客户端看不到"
+            "label": "受保护的节点标签或权限组",
+            "description": "带有此标签，或属于同名权限组的节点，只会下发给 NextDesk 客户端，其他客户端看不到"
         },
         "client_identifier": {
             "type": "string",

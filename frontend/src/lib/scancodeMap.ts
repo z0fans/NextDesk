@@ -104,13 +104,3 @@ const CODE_TO_SCANCODE: Record<string, number> = {
 export function codeToScancode(code: string): number | undefined {
   return CODE_TO_SCANCODE[code];
 }
-
-/**
- * For macOS: remap Cmd → Ctrl before lookup.
- * Returns the effective code to look up.
- */
-export function macRemapCode(code: string): string {
-  if (code === 'MetaLeft')  return 'ControlLeft';
-  if (code === 'MetaRight') return 'ControlRight';
-  return code;
-}

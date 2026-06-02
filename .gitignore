@@ -21,9 +21,12 @@ Thumbs.db
 # Environment
 .env
 .env.local
+vless.yaml
+*.code-workspace
 
 # Rust build
 src-tauri/target/
+tube-server/target/
 
 # Large binaries (downloaded by CI/scripts)
 .backend/bin/mihomo

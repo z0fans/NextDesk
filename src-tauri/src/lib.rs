@@ -1,28 +1,28 @@
 mod clash;
-mod cliprdr_backend;
+mod cliprdr;
 mod config;
+mod file_transfer_ws;
+mod frame_ws;
+mod logging;
 mod macos_cursor_fix;
+mod macos_file_promise;
 mod macos_item_provider;
 mod macos_pasteboard_promise;
-mod macos_file_promise;
-mod frame_ws;
-mod clearcodec;
-mod gfx_handler;
 mod rdp_audio;
 mod rdp_proxy;
-mod relay;
 mod rdp_session;
 mod rdpdr_backend;
+mod relay;
 mod state;
-mod subscription;
 mod sub_scheduler;
+mod subscription;
 mod tube;
 mod updater;
 mod virtual_file_clipboard;
 mod windows_virtual_files;
 
 use serde_json::Value;
-use state::{AppState, ProxyGroup, RunMode, Server};
+use state::{AppState, RunMode, Server};
 use std::collections::HashMap;
 use tauri::{AppHandle, Manager, State};
 
@@ -31,48 +31,25 @@ async fn start_engine(
     app_state: State<'_, AppState>,
     force_internal: Option<bool>,
 ) -> Result<bool, String> {
-    // [DISABLED] 复用模式暂时禁用，始终使用独立内核
-    // let force = force_internal.unwrap_or(false);
-    // // Detect external clash first (unless forced to internal)
-    // if !force {
-    //     if let Some((host, port)) =
-    //         clash::detect_external_clash().await
-    //     {
-    //         let api = format!("http://{host}:{port}");
-    //         let proxy_port =
-    //             clash::get_clash_proxy_port(&host, port).await;
-    //         *app_state.clash_api_base.lock().unwrap() =
-    //             api.clone();
-    //         *app_state.proxy_port.lock().unwrap() = proxy_port;
-    //         *app_state.reuse_mode.lock().unwrap() = true;
-    //         // Trigger geodata update in background
-    //         let api_clone = api.clone();
-    //         tokio::spawn(async move {
-    //             clash::trigger_geodata_update(&api_clone)
-    //                 .await;
-    //         });
-    //         return Ok(true);
-    //     }
-    // }
     let _ = force_internal; // suppress unused variable warning
 
     // Always use independent kernel — no reuse mode
     *app_state.reuse_mode.lock().unwrap() = false;
 
     // Verify runtime config exists (no longer require specific group names)
-    let config_path = config::get_user_config_dir()
-        .join("runtime_clash.yaml");
+    let config_path = config::get_user_config_dir().join("runtime_clash.yaml");
     if !config_path.exists() {
         return Err("No subscription loaded. Please load a subscription first.".into());
     }
 
+    // Ensure interface-name is set to bypass external TUN/VPN
+    config::ensure_interface_name(&config_path);
+
     match clash::start_clash_process().await {
         Ok(child) => {
-            *app_state.clash_process.lock().unwrap() =
-                Some(child);
+            *app_state.clash_process.lock().unwrap() = Some(child);
             // Set default ports for internal engine
-            *app_state.clash_api_base.lock().unwrap() =
-                "http://127.0.0.1:17891".to_string();
+            *app_state.clash_api_base.lock().unwrap() = "http://127.0.0.1:17891".to_string();
             *app_state.proxy_port.lock().unwrap() = 17897;
             // Wait for Clash API to become ready (up to 15s)
             let ready = {
@@ -83,14 +60,8 @@ async fn start_engine(
                     .unwrap_or_default();
                 let mut ok = false;
                 for _ in 0..240 {
-                    tokio::time::sleep(
-                        std::time::Duration::from_millis(500),
-                    ).await;
-                    if let Ok(resp) = client
-                        .get("http://127.0.0.1:17891/version")
-                        .send()
-                        .await
-                    {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    if let Ok(resp) = client.get("http://127.0.0.1:17891/version").send().await {
                         if resp.status().is_success() {
                             ok = true;
                             break;
@@ -105,13 +76,9 @@ async fn start_engine(
                 // (mihomo downloads latest Country.mmdb via its own proxy)
                 tauri::async_runtime::spawn(async {
                     // Wait a few seconds for proxy connections to establish
-                    tokio::time::sleep(
-                        std::time::Duration::from_secs(5),
-                    ).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     eprintln!("[start_engine] Triggering geodata update...");
-                    clash::trigger_geodata_update(
-                        "http://127.0.0.1:17891",
-                    ).await;
+                    clash::trigger_geodata_update("http://127.0.0.1:17891").await;
                     eprintln!("[start_engine] Geodata update triggered");
                 });
             } else {
@@ -127,9 +94,7 @@ async fn start_engine(
 }
 
 #[tauri::command]
-async fn stop_engine(
-    app_state: State<'_, AppState>,
-) -> Result<bool, String> {
+async fn stop_engine(app_state: State<'_, AppState>) -> Result<bool, String> {
     let mut proc = app_state.clash_process.lock().unwrap();
     if let Some(ref mut child) = *proc {
         let _ = child.start_kill();
@@ -139,9 +104,7 @@ async fn stop_engine(
 }
 
 #[tauri::command]
-fn get_status(
-    app_state: State<'_, AppState>,
-) -> Result<Value, String> {
+fn get_status(app_state: State<'_, AppState>) -> Result<Value, String> {
     let clash_running = {
         let proc = app_state.clash_process.lock().unwrap();
         if let Some(ref child) = *proc {
@@ -159,21 +122,13 @@ fn get_status(
 }
 
 #[tauri::command]
-fn get_servers(
-    app_state: State<'_, AppState>,
-) -> Result<Vec<Server>, String> {
+fn get_servers(app_state: State<'_, AppState>) -> Result<Vec<Server>, String> {
     Ok(app_state.servers.lock().unwrap().clone())
 }
 
 #[tauri::command]
-fn get_subscription_url(
-    app_state: State<'_, AppState>,
-) -> Result<String, String> {
-    Ok(app_state
-        .subscription_url
-        .lock()
-        .unwrap()
-        .clone())
+fn get_subscription_url(app_state: State<'_, AppState>) -> Result<String, String> {
+    Ok(app_state.subscription_url.lock().unwrap().clone())
 }
 
 #[tauri::command]
@@ -182,21 +137,18 @@ fn save_config() -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn get_rdp_proxy_port(
-    app_state: State<'_, AppState>,
-) -> Result<u16, String> {
+fn get_rdp_proxy_port(app_state: State<'_, AppState>) -> Result<u16, String> {
     Ok(*app_state.rdp_proxy_port.lock().unwrap())
 }
 
 #[tauri::command]
-fn get_mac_clipboard_strategy(
-    app_state: State<'_, AppState>,
-) -> Result<String, String> {
-    Ok(app_state
-        .mac_clipboard_strategy
-        .lock()
-        .unwrap()
-        .clone())
+fn get_file_transfer_ws_port(app_state: State<'_, AppState>) -> u16 {
+    *app_state.file_transfer_ws_port.lock().unwrap()
+}
+
+#[tauri::command]
+fn get_mac_clipboard_strategy(app_state: State<'_, AppState>) -> Result<String, String> {
+    Ok(app_state.mac_clipboard_strategy.lock().unwrap().clone())
 }
 
 #[tauri::command]
@@ -206,18 +158,10 @@ fn set_mac_clipboard_strategy(
 ) -> Result<String, String> {
     let normalized = match strategy.as_str() {
         "session-file-url" | "pasteboard-promise" => strategy,
-        _ => {
-            return Err(format!(
-                "Unsupported mac clipboard strategy: {}",
-                strategy
-            ))
-        }
+        _ => return Err(format!("Unsupported mac clipboard strategy: {}", strategy)),
     };
 
-    *app_state
-        .mac_clipboard_strategy
-        .lock()
-        .unwrap() = normalized.clone();
+    *app_state.mac_clipboard_strategy.lock().unwrap() = normalized.clone();
     Ok(normalized)
 }
 
@@ -254,108 +198,35 @@ async fn load_subscription(
 
     match subscription::load_subscription(&url, proxy_port).await {
         Ok(parsed) => {
-            let servers =
-                subscription::transform_proxies_to_servers(
-                    &parsed.proxies,
-                );
+            let servers = subscription::transform_proxies_to_servers(&parsed.proxies);
             let server_count = servers.len();
 
             // Save state
-            *app_state.servers.lock().unwrap() =
-                servers;
-            *app_state.subscription_url.lock().unwrap() =
-                url;
+            *app_state.servers.lock().unwrap() = servers;
+            *app_state.subscription_url.lock().unwrap() = url;
 
-            // Transform proxy groups for frontend
-            let groups: Vec<ProxyGroup> = parsed
-                .proxy_groups
-                .iter()
-                .filter_map(|g| {
-                    let name = g
-                        .get("name")?
-                        .as_str()?
-                        .to_string();
-                    let gtype = g
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("select")
-                        .to_string();
-                    let proxies: Vec<String> = g
-                        .get("proxies")
-                        .and_then(|v| v.as_sequence())
-                        .map(|seq| {
-                            seq.iter()
-                                .filter_map(|p| {
-                                    p.as_str().map(
-                                        |s| s.to_string(),
-                                    )
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    Some(ProxyGroup {
-                        name,
-                        group_type: gtype,
-                        proxies,
-                        now: None,
-                    })
-                })
-                .collect();
-
-            // If no proxy groups from subscription (URI list format),
-            // generate default Server-RDP and Auto-RDP groups
-            let groups: Vec<ProxyGroup> = if groups.is_empty() && server_count > 0 {
-                let server_names: Vec<String> = app_state
-                    .servers
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|s| s.name.clone())
-                    .collect();
-                vec![
-                    ProxyGroup {
-                        name: "Server-RDP".to_string(),
-                        group_type: "select".to_string(),
-                        proxies: server_names.clone(),
-                        now: None,
-                    },
-                    ProxyGroup {
-                        name: "Auto-RDP".to_string(),
-                        group_type: "fallback".to_string(),
-                        proxies: server_names,
-                        now: None,
-                    },
-                ]
-            } else {
-                groups
-            };
-
-            *app_state
-                .proxy_groups
+            let server_names: Vec<String> = app_state
+                .servers
                 .lock()
-                .unwrap() = groups.clone();
+                .unwrap()
+                .iter()
+                .map(|s| s.name.clone())
+                .collect();
+            let groups = config::build_rdp_proxy_groups(&server_names);
+
+            *app_state.proxy_groups.lock().unwrap() = groups.clone();
 
             // Generate clash config
             if let Some(raw) = &parsed.raw_config {
                 config::generate_clash_config_from_subscription(raw);
             } else {
-                config::generate_clash_config(
-                    &parsed.proxies,
-                );
+                config::generate_clash_config(&parsed.proxies);
             }
 
             // Persist config
             let saved = config::SavedConfig {
-                subscription_url: app_state
-                    .subscription_url
-                    .lock()
-                    .unwrap()
-                    .clone(),
-                servers: app_state
-                    .servers
-                    .lock()
-                    .unwrap()
-                    .clone(),
+                subscription_url: app_state.subscription_url.lock().unwrap().clone(),
+                servers: app_state.servers.lock().unwrap().clone(),
                 proxy_groups: groups.clone(),
                 tube_enabled: *app_state.tube_enabled.lock().unwrap(),
                 cloud_mode: *app_state.cloud_mode.lock().unwrap(),
@@ -390,47 +261,50 @@ async fn load_subscription(
                 proxy_groups: pg_json,
             })
         }
-        Err(e) => {
-            Ok(subscription::SubscriptionResult {
-                success: false,
-                error: Some(e),
-                server_count: 0,
-                proxy_groups: vec![],
-            })
-        }
+        Err(e) => Ok(subscription::SubscriptionResult {
+            success: false,
+            error: Some(e),
+            server_count: 0,
+            proxy_groups: vec![],
+        }),
     }
 }
 
 #[tauri::command]
-async fn get_proxy_groups(
-    app_state: State<'_, AppState>,
-) -> Result<Vec<Value>, String> {
-    // [DISABLED] 复用模式暂时禁用，始终使用独立内核
-    // let reuse = *app_state.reuse_mode.lock().unwrap();
-    // if reuse {
-    //     let api =
-    //         app_state.clash_api_base.lock().unwrap().clone();
-    //     return Ok(clash::fetch_proxy_groups(&api).await);
-    // }
+async fn get_proxy_groups(app_state: State<'_, AppState>) -> Result<Vec<Value>, String> {
+    let groups = app_state.proxy_groups.lock().unwrap().clone();
+    let server_names: std::collections::HashSet<String> = app_state
+        .servers
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| config::is_selectable_proxy_name(&s.name))
+        .map(|s| s.name.clone())
+        .collect();
+    let api = app_state.clash_api_base.lock().unwrap().clone();
 
-    let groups =
-        app_state.proxy_groups.lock().unwrap().clone();
-    let api =
-        app_state.clash_api_base.lock().unwrap().clone();
-
-    let rdp_kw = ["server-", "auto-", "proxy"];
     let mut result = vec![];
     for g in &groups {
         let lower = g.name.to_lowercase();
-        if !rdp_kw.iter().any(|kw| lower.contains(kw)) {
+        if !lower.contains("server-") || lower.contains("server-rdp") || lower.contains("auto-rdp")
+        {
             continue;
         }
-        let now =
-            clash::get_active_proxy(&api, &g.name).await;
+        let proxies: Vec<String> = g
+            .proxies
+            .iter()
+            .filter(|proxy| server_names.contains(*proxy))
+            .cloned()
+            .collect();
+        if proxies.is_empty() {
+            continue;
+        }
+        let now = clash::get_active_proxy(&api, &g.name).await;
+        let now = now.filter(|name| server_names.contains(name));
         result.push(serde_json::json!({
             "name": g.name,
             "type": g.group_type,
-            "proxies": g.proxies,
+            "proxies": proxies,
             "now": now,
         }));
     }
@@ -443,14 +317,8 @@ async fn switch_proxy(
     proxy_name: String,
     app_state: State<'_, AppState>,
 ) -> Result<bool, String> {
-    let api =
-        app_state.clash_api_base.lock().unwrap().clone();
-    Ok(clash::switch_proxy(
-        &api,
-        &group_name,
-        &proxy_name,
-    )
-    .await)
+    let api = app_state.clash_api_base.lock().unwrap().clone();
+    Ok(clash::switch_proxy(&api, &group_name, &proxy_name).await)
 }
 
 #[tauri::command]
@@ -458,79 +326,45 @@ async fn test_group_delays(
     group_name: String,
     app_state: State<'_, AppState>,
 ) -> Result<HashMap<String, i64>, String> {
-    let api =
-        app_state.clash_api_base.lock().unwrap().clone();
-    // [DISABLED] 复用模式暂时禁用，始终使用独立内核
-    // let reuse = *app_state.reuse_mode.lock().unwrap();
-    // let proxies = if reuse {
-    //     // Fetch from Clash API
-    //     let groups =
-    //         clash::fetch_proxy_groups(&api).await;
-    //     groups
-    //         .iter()
-    //         .find(|g| {
-    //             g.get("name")
-    //                 .and_then(|n| n.as_str())
-    //                 == Some(&group_name)
-    //         })
-    //         .and_then(|g| g.get("proxies"))
-    //         .and_then(|p| p.as_array())
-    //         .map(|arr| {
-    //             arr.iter()
-    //                 .filter_map(|v| {
-    //                     v.as_str()
-    //                         .map(|s| s.to_string())
-    //                 })
-    //                 .collect()
-    //         })
-    //         .unwrap_or_default()
-    // } else {
-    //     let groups =
-    //         app_state.proxy_groups.lock().unwrap();
-    //     groups
-    //         .iter()
-    //         .find(|g| g.name == group_name)
-    //         .map(|g| g.proxies.clone())
-    //         .unwrap_or_default()
-    // };
+    let api = app_state.clash_api_base.lock().unwrap().clone();
 
     let proxies = {
         let groups = app_state.proxy_groups.lock().unwrap();
+        let server_names: std::collections::HashSet<String> = app_state
+            .servers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| config::is_selectable_proxy_name(&s.name))
+            .map(|s| s.name.clone())
+            .collect();
         groups
             .iter()
             .find(|g| g.name == group_name)
-            .map(|g| g.proxies.clone())
+            .map(|g| {
+                g.proxies
+                    .iter()
+                    .filter(|proxy| server_names.contains(*proxy))
+                    .cloned()
+                    .collect::<Vec<String>>()
+            })
             .unwrap_or_default()
     };
 
-    Ok(clash::test_group_delays(
-        &api,
-        &group_name,
-        &proxies,
-    )
-    .await)
+    Ok(clash::test_group_delays(&api, &group_name, &proxies).await)
 }
 
 #[tauri::command]
-async fn test_servers_connectivity(
-    app_state: State<'_, AppState>,
-) -> Result<Vec<Server>, String> {
-    let mut servers =
-        app_state.servers.lock().unwrap().clone();
-    subscription::test_servers_connectivity(
-        &mut servers,
-    )
-    .await;
+async fn test_servers_connectivity(app_state: State<'_, AppState>) -> Result<Vec<Server>, String> {
+    let mut servers = app_state.servers.lock().unwrap().clone();
+    subscription::test_servers_connectivity(&mut servers).await;
     *app_state.servers.lock().unwrap() = servers.clone();
     Ok(servers)
 }
 
 #[tauri::command]
-async fn get_connections(
-    app_state: State<'_, AppState>,
-) -> Result<Value, String> {
-    let api =
-        app_state.clash_api_base.lock().unwrap().clone();
+async fn get_connections(app_state: State<'_, AppState>) -> Result<Value, String> {
+    let api = app_state.clash_api_base.lock().unwrap().clone();
     Ok(clash::get_connections(&api).await)
 }
 
@@ -551,8 +385,7 @@ fn get_current_version() -> Result<String, String> {
 
 #[tauri::command]
 fn get_system_language() -> Result<String, String> {
-    let locale =
-        sys_locale::get_locale().unwrap_or_default();
+    let locale = sys_locale::get_locale().unwrap_or_default();
     if locale.starts_with("zh") {
         Ok("zh-CN".into())
     } else {
@@ -594,13 +427,9 @@ fn rdp_log_batch(entries: Vec<RdpLogEntry>) -> Result<(), String> {
                 e.ts, e.level, e.module, e.msg, data
             )
         } else {
-            format!(
-                "[{}][{}][{}] {}\n",
-                e.ts, e.level, e.module, e.msg
-            )
+            format!("[{}][{}][{}] {}\n", e.ts, e.level, e.module, e.msg)
         };
-        f.write_all(line.as_bytes())
-            .map_err(|e| e.to_string())?;
+        f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -609,8 +438,7 @@ fn rdp_log_batch(entries: Vec<RdpLogEntry>) -> Result<(), String> {
 fn rdp_log_clear() -> Result<(), String> {
     let path = rdp_log_path();
     if path.exists() {
-        std::fs::write(&path, b"")
-            .map_err(|e| e.to_string())?;
+        std::fs::write(&path, b"").map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -623,10 +451,7 @@ fn frontend_log(msg: String) -> Result<(), String> {
         "Requesting file DATA",
         "[rdpdr-wasm] async read complete",
     ];
-    if NOISY_PATTERNS
-        .iter()
-        .any(|pattern| msg.contains(pattern))
-    {
+    if NOISY_PATTERNS.iter().any(|pattern| msg.contains(pattern)) {
         return Ok(());
     }
     let entry = RdpLogEntry {
@@ -646,32 +471,13 @@ fn frontend_log(msg: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_run_mode(
-    app_state: State<'_, AppState>,
-) -> Result<RunMode, String> {
+fn get_run_mode(app_state: State<'_, AppState>) -> Result<RunMode, String> {
     Ok(RunMode {
-        reuse_mode: *app_state
-            .reuse_mode
-            .lock()
-            .unwrap(),
-        clash_api: app_state
-            .clash_api_base
-            .lock()
-            .unwrap()
-            .clone(),
-        proxy_port: *app_state
-            .proxy_port
-            .lock()
-            .unwrap(),
-        cloud_mode: *app_state
-            .cloud_mode
-            .lock()
-            .unwrap(),
-        dashboard_url: app_state
-            .dashboard_url
-            .lock()
-            .unwrap()
-            .clone(),
+        reuse_mode: *app_state.reuse_mode.lock().unwrap(),
+        clash_api: app_state.clash_api_base.lock().unwrap().clone(),
+        proxy_port: *app_state.proxy_port.lock().unwrap(),
+        cloud_mode: *app_state.cloud_mode.lock().unwrap(),
+        dashboard_url: app_state.dashboard_url.lock().unwrap().clone(),
     })
 }
 
@@ -684,10 +490,7 @@ fn get_proxy_port_sync(api_port: u16) -> u16 {
 
     let timeout = Duration::from_secs(2);
     let addr = format!("127.0.0.1:{api_port}");
-    if let Ok(mut stream) = TcpStream::connect_timeout(
-        &addr.parse().unwrap(),
-        timeout,
-    ) {
+    if let Ok(mut stream) = TcpStream::connect_timeout(&addr.parse().unwrap(), timeout) {
         stream.set_read_timeout(Some(timeout)).ok();
         stream.set_write_timeout(Some(timeout)).ok();
         let req = format!(
@@ -698,24 +501,17 @@ fn get_proxy_port_sync(api_port: u16) -> u16 {
         if stream.write_all(req.as_bytes()).is_ok() {
             let mut buf = vec![0u8; 4096];
             if let Ok(n) = stream.read(&mut buf) {
-                let body =
-                    String::from_utf8_lossy(&buf[..n]);
+                let body = String::from_utf8_lossy(&buf[..n]);
                 // Try mixed-port first, then socks-port; skip if 0
                 for key in &["\"mixed-port\"", "\"socks-port\""] {
                     if let Some(pos) = body.find(key) {
                         let after = &body[pos..];
                         if let Some(colon) = after.find(':') {
-                            let num_str: String = after
-                                [colon + 1..]
+                            let num_str: String = after[colon + 1..]
                                 .chars()
-                                .take_while(|c| {
-                                    c.is_ascii_digit()
-                                        || *c == ' '
-                                })
+                                .take_while(|c| c.is_ascii_digit() || *c == ' ')
                                 .collect();
-                            if let Ok(p) =
-                                num_str.trim().parse::<u16>()
-                            {
+                            if let Ok(p) = num_str.trim().parse::<u16>() {
                                 if p > 0 {
                                     return p;
                                 }
@@ -730,17 +526,12 @@ fn get_proxy_port_sync(api_port: u16) -> u16 {
 }
 
 #[tauri::command]
-fn get_tube_enabled(
-    app_state: State<'_, AppState>,
-) -> Result<bool, String> {
+fn get_tube_enabled(app_state: State<'_, AppState>) -> Result<bool, String> {
     Ok(*app_state.tube_enabled.lock().unwrap())
 }
 
 #[tauri::command]
-fn set_tube_enabled(
-    enabled: bool,
-    app_state: State<'_, AppState>,
-) -> Result<bool, String> {
+fn set_tube_enabled(enabled: bool, app_state: State<'_, AppState>) -> Result<bool, String> {
     *app_state.tube_enabled.lock().unwrap() = enabled;
     // Persist
     let mut saved = config::load_saved_config();
@@ -822,9 +613,19 @@ async fn rdp_native_connect(
     let (ws_port, frame_tx) = frame_ws::start_frame_server()
         .await
         .map_err(|e| format!("Failed to start frame WS: {e}"))?;
+    let socks_port = *app_state.proxy_port.lock().unwrap();
 
     let handle = rdp_session::spawn_session(
-        app, tab_id.clone(), host, port, username, password, domain, width, height,
+        app,
+        tab_id.clone(),
+        host,
+        port,
+        socks_port,
+        username,
+        password,
+        domain,
+        width,
+        height,
         frame_tx,
     );
     let mut mgr = app_state.native_sessions.lock().unwrap();
@@ -843,7 +644,8 @@ fn rdp_native_input(
     use smallvec::smallvec;
 
     let mgr = app_state.native_sessions.lock().unwrap();
-    let tx = mgr.get_input_tx(&tab_id)
+    let tx = mgr
+        .get_input_tx(&tab_id)
         .ok_or_else(|| format!("Session not found: {tab_id}"))?;
 
     let mut flags = KeyboardFlags::empty();
@@ -875,7 +677,8 @@ fn rdp_native_mouse(
     use smallvec::smallvec;
 
     let mgr = app_state.native_sessions.lock().unwrap();
-    let tx = mgr.get_input_tx(&tab_id)
+    let tx = mgr
+        .get_input_tx(&tab_id)
         .ok_or_else(|| format!("Session not found: {tab_id}"))?;
 
     let x_pos = x.round().max(0.0) as u16;
@@ -891,20 +694,41 @@ fn rdp_native_mouse(
     if is_down && button >= 0 {
         flags |= PointerFlags::DOWN;
     }
-    // If button < 0, this is a pure move event
+    let move_pdu = MousePdu {
+        flags: PointerFlags::MOVE,
+        number_of_wheel_rotation_units: 0,
+        x_position: x_pos,
+        y_position: y_pos,
+    };
+
     if button < 0 {
-        flags = PointerFlags::MOVE;
+        let event = FastPathInputEvent::MouseEvent(move_pdu);
+        return tx
+            .send(rdp_session::NativeRdpInput::FastPath(smallvec![event]))
+            .map_err(|e| format!("Send mouse failed: {e}"));
     }
 
-    let pdu = MousePdu {
+    log::info!(
+        "[rdp-native] mouse button tab={} x={} y={} button={} down={} flags={:?}",
+        tab_id,
+        x_pos,
+        y_pos,
+        button,
+        is_down,
+        flags
+    );
+
+    let button_pdu = MousePdu {
         flags,
         number_of_wheel_rotation_units: 0,
         x_position: x_pos,
         y_position: y_pos,
     };
-    let event = FastPathInputEvent::MouseEvent(pdu);
-    tx.send(rdp_session::NativeRdpInput::FastPath(smallvec![event]))
-        .map_err(|e| format!("Send mouse failed: {e}"))
+    tx.send(rdp_session::NativeRdpInput::FastPath(smallvec![
+        FastPathInputEvent::MouseEvent(move_pdu),
+        FastPathInputEvent::MouseEvent(button_pdu)
+    ]))
+    .map_err(|e| format!("Send mouse failed: {e}"))
 }
 
 #[tauri::command]
@@ -921,7 +745,8 @@ fn rdp_native_wheel(
     use smallvec::smallvec;
 
     let mgr = app_state.native_sessions.lock().unwrap();
-    let tx = mgr.get_input_tx(&tab_id)
+    let tx = mgr
+        .get_input_tx(&tab_id)
         .ok_or_else(|| format!("Session not found: {tab_id}"))?;
 
     let x_pos = x.round().max(0.0) as u16;
@@ -950,10 +775,7 @@ fn rdp_native_wheel(
 }
 
 #[tauri::command]
-fn rdp_native_disconnect(
-    tab_id: String,
-    app_state: State<'_, AppState>,
-) -> Result<(), String> {
+fn rdp_native_disconnect(tab_id: String, app_state: State<'_, AppState>) -> Result<(), String> {
     let mut mgr = app_state.native_sessions.lock().unwrap();
     mgr.disconnect(&tab_id);
     Ok(())
@@ -967,7 +789,8 @@ fn rdp_native_resize(
     app_state: State<'_, AppState>,
 ) -> Result<(), String> {
     let mgr = app_state.native_sessions.lock().unwrap();
-    let tx = mgr.get_input_tx(&tab_id)
+    let tx = mgr
+        .get_input_tx(&tab_id)
         .ok_or_else(|| format!("Session not found: {tab_id}"))?;
     tx.send(rdp_session::NativeRdpInput::Resize { width, height })
         .map_err(|e| format!("Send resize failed: {e}"))
@@ -998,20 +821,48 @@ fn rdp_audio_push(
     mgr.push(&tab_id, pcm)
 }
 
+/// Binary-friendly variant of `rdp_audio_push`.
+///
+/// Sends PCM bytes via Tauri's raw IPC body (`InvokeBody::Raw`) instead of a
+/// JSON `Vec<u8>`. This avoids the ~6× bandwidth bloat caused by serializing
+/// each byte to a JSON number on every audio packet.
+///
+/// Frontend usage:
+/// ```ts
+/// invoke('rdp_audio_push_raw', uint8Array, { headers: { 'X-Tab-Id': tabId } });
+/// ```
 #[tauri::command]
-fn rdp_audio_close(
-    tab_id: String,
+fn rdp_audio_push_raw(
+    request: tauri::ipc::Request<'_>,
     app_state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let tab_id = request
+        .headers()
+        .get("X-Tab-Id")
+        .and_then(|v| v.to_str().ok())
+        .ok_or("missing X-Tab-Id header")?
+        .to_string();
+
+    let pcm = match request.body() {
+        tauri::ipc::InvokeBody::Raw(bytes) => bytes.clone(),
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err("rdp_audio_push_raw expects raw binary body".into())
+        }
+    };
+
+    let mgr = app_state.audio_manager.lock().unwrap();
+    mgr.push(&tab_id, pcm)
+}
+
+#[tauri::command]
+fn rdp_audio_close(tab_id: String, app_state: State<'_, AppState>) -> Result<(), String> {
     let mut mgr = app_state.audio_manager.lock().unwrap();
     mgr.close(&tab_id);
     Ok(())
 }
 
 #[tauri::command]
-fn get_auto_update_status(
-    app_state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
+fn get_auto_update_status(app_state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let enabled = *app_state.auto_update_enabled.lock().unwrap();
     let last_sync_ts = *app_state.last_sync_ts.lock().unwrap();
     let sync_state = app_state.sync_state.lock().unwrap().clone();
@@ -1023,10 +874,7 @@ fn get_auto_update_status(
 }
 
 #[tauri::command]
-fn set_auto_update_enabled(
-    enabled: bool,
-    app_state: State<'_, AppState>,
-) -> Result<(), String> {
+fn set_auto_update_enabled(enabled: bool, app_state: State<'_, AppState>) -> Result<(), String> {
     *app_state.auto_update_enabled.lock().unwrap() = enabled;
     let mut saved = config::load_saved_config();
     saved.auto_update_enabled = enabled;
@@ -1043,22 +891,19 @@ async fn trigger_sync_now(app: AppHandle) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Initialize structured logging FIRST so all subsequent code can log.
+    logging::init();
+
     // Load saved config on startup
     let saved = config::load_saved_config();
     let app_state = AppState::default();
     *app_state.servers.lock().unwrap() = saved.servers;
-    *app_state.proxy_groups.lock().unwrap() =
-        saved.proxy_groups;
-    *app_state.subscription_url.lock().unwrap() =
-        saved.subscription_url;
-    *app_state.tube_enabled.lock().unwrap() =
-        saved.tube_enabled;
-    *app_state.cloud_mode.lock().unwrap() =
-        saved.cloud_mode;
-    *app_state.dashboard_url.lock().unwrap() =
-        saved.dashboard_url;
-    *app_state.relay_api_key.lock().unwrap() =
-        saved.relay_api_key;
+    *app_state.proxy_groups.lock().unwrap() = saved.proxy_groups;
+    *app_state.subscription_url.lock().unwrap() = saved.subscription_url;
+    *app_state.tube_enabled.lock().unwrap() = saved.tube_enabled;
+    *app_state.cloud_mode.lock().unwrap() = saved.cloud_mode;
+    *app_state.dashboard_url.lock().unwrap() = saved.dashboard_url;
+    *app_state.relay_api_key.lock().unwrap() = saved.relay_api_key;
     *app_state.auto_update_enabled.lock().unwrap() = saved.auto_update_enabled;
     *app_state.last_sync_ts.lock().unwrap() = saved.last_sync_ts;
 
@@ -1168,14 +1013,37 @@ pub fn run() {
             let relay_api_key = state.relay_api_key.clone();
             tauri::async_runtime::spawn(async move {
                 rdp_proxy::start_proxy(
-                    rdp_port, socks_port, tube_enabled,
-                    cloud_mode, relay_endpoints, dashboard_url, relay_api_key,
-                ).await;
+                    rdp_port,
+                    socks_port,
+                    tube_enabled,
+                    cloud_mode,
+                    relay_endpoints,
+                    dashboard_url,
+                    relay_api_key,
+                )
+                .await;
             });
 
             // Spawn subscription auto-update scheduler
             let app_handle = app.handle().clone();
             sub_scheduler::spawn(app_handle);
+
+            // Start file transfer WebSocket server for CLIPRDR large file bypass
+            let app_handle_for_ft = app.handle().clone();
+            let ft_port = tauri::async_runtime::block_on(async {
+                crate::file_transfer_ws::start_file_transfer_server(app_handle_for_ft).await
+            })
+            .map_err(|e| {
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("file_transfer_ws: {e}"),
+                )) as Box<dyn std::error::Error>
+            })?;
+            log::info!("[setup] File transfer WS port: {ft_port}");
+            {
+                let state = app.state::<AppState>();
+                *state.file_transfer_ws_port.lock().unwrap() = ft_port;
+            }
 
             Ok(())
         })
@@ -1198,6 +1066,7 @@ pub fn run() {
             get_system_language,
             get_run_mode,
             get_rdp_proxy_port,
+            get_file_transfer_ws_port,
             get_mac_clipboard_strategy,
             set_mac_clipboard_strategy,
             rdpdr_backend::rdpdr_scan_folder,
@@ -1224,6 +1093,7 @@ pub fn run() {
             get_relay_endpoints,
             rdp_audio_set_format,
             rdp_audio_push,
+            rdp_audio_push_raw,
             rdp_audio_close,
             rdp_native_connect,
             rdp_native_input,
@@ -1234,6 +1104,11 @@ pub fn run() {
             get_auto_update_status,
             set_auto_update_enabled,
             trigger_sync_now,
+            logging::log_show_in_finder,
+            logging::log_copy_to_desktop,
+            logging::log_clear,
+            logging::log_file_path_str,
+            logging::log_file_size,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

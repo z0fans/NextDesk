@@ -1356,6 +1356,12 @@ function __wbg_get_imports() {
         __wbg_set_once_617be4b8bd597c38: function(arg0, arg1) {
             arg0.once = arg1 !== 0;
         },
+        __wbg_set_onerror_901ca711f94a5bbb: function(arg0, arg1) {
+            arg0.onerror = arg1;
+        },
+        __wbg_set_onopen_34e3e24cf9337ddd: function(arg0, arg1) {
+            arg0.onopen = arg1;
+        },
         __wbg_set_reason_b5edb0791e7766e3: function(arg0, arg1, arg2) {
             arg0.reason = getStringFromWasm0(arg1, arg2);
         },

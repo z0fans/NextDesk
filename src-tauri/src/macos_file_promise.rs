@@ -1,34 +1,19 @@
-use crate::virtual_file_clipboard::{
-    VirtualClipboardFile,
-    VirtualClipboardWriteResult,
-};
+use crate::virtual_file_clipboard::{VirtualClipboardFile, VirtualClipboardWriteResult};
 
 #[cfg(target_os = "macos")]
-use std::{
-    cell::RefCell,
-    fs,
-    path::PathBuf,
-    ptr,
-};
+use std::{cell::RefCell, fs, path::PathBuf, ptr};
 
 #[cfg(target_os = "macos")]
 use block2::DynBlock;
 #[cfg(target_os = "macos")]
 use objc2::{
-    define_class,
-    msg_send,
+    define_class, msg_send,
     rc::Retained,
     runtime::{NSObject, NSObjectProtocol, ProtocolObject},
-    DefinedClass,
-    MainThreadMarker,
-    MainThreadOnly,
+    DefinedClass, MainThreadMarker, MainThreadOnly,
 };
 #[cfg(target_os = "macos")]
-use objc2_app_kit::{
-    NSFilePromiseProvider,
-    NSFilePromiseProviderDelegate,
-    NSPasteboard,
-};
+use objc2_app_kit::{NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSPasteboard};
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 
@@ -77,8 +62,12 @@ define_class!(
             url: &NSURL,
             completion_handler: &DynBlock<dyn Fn(*mut NSError)>,
         ) {
-            log::info!("[file-promise] writePromiseToURL invoked for {}", self.ivars().file_name);
-            let result = url.path()
+            log::info!(
+                "[file-promise] writePromiseToURL invoked for {}",
+                self.ivars().file_name
+            );
+            let result = url
+                .path()
                 .map(|path| PathBuf::from(path.to_string()))
                 .ok_or_else(|| "Missing destination path for file promise".to_string())
                 .and_then(|path| {
@@ -103,10 +92,7 @@ define_class!(
 
 #[cfg(target_os = "macos")]
 impl NextDeskFilePromiseDelegate {
-    fn new(
-        file: &VirtualClipboardFile,
-        mtm: MainThreadMarker,
-    ) -> Retained<Self> {
+    fn new(file: &VirtualClipboardFile, mtm: MainThreadMarker) -> Retained<Self> {
         let delegate = mtm
             .alloc::<Self>()
             .set_ivars(NextDeskFilePromiseDelegateIvars {

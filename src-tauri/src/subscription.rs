@@ -7,7 +7,12 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use url::Url;
 
+use crate::config;
 use crate::state::Server;
+
+const NEXTDESK_SUBSCRIPTION_MARKER_NAME: &str = "__nextdesk_subscription_issuer_librascloud";
+const NEXTDESK_SUBSCRIPTION_AUTH_ERROR: &str =
+    "Subscription is not authorized for NextDesk. Please use the official NextDesk subscription.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionResult {
@@ -20,7 +25,6 @@ pub struct SubscriptionResult {
 
 pub struct ParsedSubscription {
     pub proxies: Vec<serde_yaml::Value>,
-    pub proxy_groups: Vec<serde_yaml::Value>,
     pub raw_config: Option<serde_yaml::Value>,
 }
 
@@ -34,14 +38,13 @@ pub async fn load_subscription(
     if url.trim().is_empty() {
         return Err("URL is empty".into());
     }
-    let mut builder = Client::builder()
-        .timeout(Duration::from_secs(15));
+    let request_url = nextdesk_subscription_url(url);
+    let mut builder = Client::builder().timeout(Duration::from_secs(15));
 
     if let Some(port) = proxy_port {
         // Use active SOCKS5 proxy
-        let proxy = reqwest::Proxy::all(
-            format!("socks5://127.0.0.1:{port}")
-        ).map_err(|e| format!("Proxy config error: {e}"))?;
+        let proxy = reqwest::Proxy::all(format!("socks5://127.0.0.1:{port}"))
+            .map_err(|e| format!("Proxy config error: {e}"))?;
         builder = builder.proxy(proxy);
     } else {
         // No proxy available — force direct connection
@@ -52,8 +55,11 @@ pub async fn load_subscription(
     let client = builder.build().map_err(|e| e.to_string())?;
 
     let resp = client
-        .get(url.trim())
-        .header("User-Agent", concat!("NextDesk/", env!("CARGO_PKG_VERSION"), " (rdp-accelerator)"))
+        .get(request_url)
+        .header(
+            "User-Agent",
+            concat!("NextDesk/", env!("CARGO_PKG_VERSION"), " (rdp-accelerator)"),
+        )
         .send()
         .await
         .map_err(|e| {
@@ -70,22 +76,44 @@ pub async fn load_subscription(
         return Err(format!("HTTP {}", resp.status()));
     }
 
-    let content = resp
-        .text()
-        .await
-        .map_err(|e| e.to_string())?;
+    let content = resp.text().await.map_err(|e| e.to_string())?;
 
     parse_subscription(&content)
 }
 
-fn parse_subscription(
-    content: &str,
-) -> Result<ParsedSubscription, String> {
+fn nextdesk_subscription_url(url: &str) -> String {
+    let trimmed = url.trim();
+    let Ok(mut parsed) = Url::parse(trimmed) else {
+        return trimmed.to_string();
+    };
+
+    let query_pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(key, _)| key != "flag")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+
+    parsed.set_query(None);
+    {
+        let mut pairs = parsed.query_pairs_mut();
+        for (key, value) in query_pairs {
+            pairs.append_pair(&key, &value);
+        }
+        pairs.append_pair("flag", "meta");
+    }
+
+    parsed.to_string()
+}
+
+fn parse_subscription(content: &str) -> Result<ParsedSubscription, String> {
     let content = content.trim();
 
-    // Try base64 decode first
+    // Try base64 decode first (standard and URL-safe variants)
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(content)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(content))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(content))
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(content))
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok());
 
@@ -97,17 +125,17 @@ fn parse_subscription(
 
         // Try JSON
         if text.starts_with('{') || text.starts_with('[') {
-            if let Some(r) = try_parse_json(text) {
+            if let Some(r) = try_parse_json(text)? {
                 return Ok(r);
             }
         }
 
         // Try YAML/Clash config
-        if text.contains("proxies:")
-            || text.starts_with("port:")
-        {
-            if let Some(r) = try_parse_clash_yaml(text) {
-                return Ok(r);
+        if text.contains("proxies:") || text.starts_with("port:") {
+            match try_parse_clash_yaml(text) {
+                Ok(Some(r)) => return Ok(r),
+                Ok(None) => {}
+                Err(e) => return Err(e),
             }
         }
 
@@ -118,11 +146,7 @@ fn parse_subscription(
         {
             let proxies = parse_uri_list(text);
             if !proxies.is_empty() {
-                return Ok(ParsedSubscription {
-                    proxies,
-                    proxy_groups: vec![],
-                    raw_config: None,
-                });
+                return Err(NEXTDESK_SUBSCRIPTION_AUTH_ERROR.into());
             }
         }
     }
@@ -130,12 +154,14 @@ fn parse_subscription(
     Err("Unsupported subscription format".into())
 }
 
-fn try_parse_clash_yaml(
-    content: &str,
-) -> Option<ParsedSubscription> {
-    let data: serde_yaml::Value =
-        serde_yaml::from_str(content).ok()?;
-    let map = data.as_mapping()?;
+fn try_parse_clash_yaml(content: &str) -> Result<Option<ParsedSubscription>, String> {
+    let mut data: serde_yaml::Value = match serde_yaml::from_str(content) {
+        Ok(data) => data,
+        Err(_) => return Ok(None),
+    };
+    let Some(map) = data.as_mapping() else {
+        return Ok(None);
+    };
 
     let proxies = map
         .get(&ykey("proxies"))
@@ -144,27 +170,60 @@ fn try_parse_clash_yaml(
         .unwrap_or_default();
 
     if proxies.is_empty() {
-        return None;
+        eprintln!(
+            "[subscription] Clash YAML has no proxies. Check XBoard node tags and NextDeskFilter protected_tag."
+        );
+        return Err(
+            "Subscription returned Clash YAML but no proxy nodes. Check XBoard node tags and NextDeskFilter protected_tag.".into(),
+        );
     }
 
-    let proxy_groups = map
-        .get(&ykey("proxy-groups"))
-        .and_then(|v| v.as_sequence())
-        .cloned()
-        .unwrap_or_default();
+    let proxies = authorize_and_strip_nextdesk_marker(proxies)?;
+    if let Some(map) = data.as_mapping_mut() {
+        map.insert(
+            ykey("proxies"),
+            serde_yaml::Value::Sequence(proxies.clone()),
+        );
+    }
 
-    Some(ParsedSubscription {
+    Ok(Some(ParsedSubscription {
         proxies,
-        proxy_groups,
         raw_config: Some(data),
-    })
+    }))
 }
 
-fn try_parse_json(
-    content: &str,
-) -> Option<ParsedSubscription> {
-    let data: serde_json::Value =
-        serde_json::from_str(content).ok()?;
+fn authorize_and_strip_nextdesk_marker(
+    proxies: Vec<serde_yaml::Value>,
+) -> Result<Vec<serde_yaml::Value>, String> {
+    let mut authorized = false;
+    let mut filtered = Vec::with_capacity(proxies.len());
+
+    for proxy in proxies {
+        let is_marker = proxy
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(|name| name.trim() == NEXTDESK_SUBSCRIPTION_MARKER_NAME)
+            .unwrap_or(false);
+
+        if is_marker {
+            authorized = true;
+        } else {
+            filtered.push(proxy);
+        }
+    }
+
+    if authorized {
+        Ok(filtered)
+    } else {
+        Err(NEXTDESK_SUBSCRIPTION_AUTH_ERROR.into())
+    }
+}
+
+fn try_parse_json(content: &str) -> Result<Option<ParsedSubscription>, String> {
+    let data: serde_json::Value = match serde_json::from_str(content) {
+        Ok(data) => data,
+        Err(_) => return Ok(None),
+    };
 
     if let Some(arr) = data.as_array() {
         let proxies: Vec<serde_yaml::Value> = arr
@@ -172,17 +231,15 @@ fn try_parse_json(
             .filter_map(|v| {
                 serde_yaml::to_string(v)
                     .ok()
-                    .and_then(|s| {
-                        serde_yaml::from_str(&s).ok()
-                    })
+                    .and_then(|s| serde_yaml::from_str(&s).ok())
             })
             .collect();
         if !proxies.is_empty() {
-            return Some(ParsedSubscription {
+            let proxies = authorize_and_strip_nextdesk_marker(proxies)?;
+            return Ok(Some(ParsedSubscription {
                 proxies,
-                proxy_groups: vec![],
                 raw_config: None,
-            });
+            }));
         }
     }
 
@@ -202,47 +259,26 @@ fn try_parse_json(
             .filter_map(|v| {
                 serde_yaml::to_string(v)
                     .ok()
-                    .and_then(|s| {
-                        serde_yaml::from_str(&s).ok()
-                    })
+                    .and_then(|s| serde_yaml::from_str(&s).ok())
             })
             .collect();
-
-        let groups_json = obj
-            .get("proxy-groups")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let proxy_groups: Vec<serde_yaml::Value> =
-            groups_json
-                .iter()
-                .filter_map(|v| {
-                    serde_yaml::to_string(v)
-                        .ok()
-                        .and_then(|s| {
-                            serde_yaml::from_str(&s).ok()
-                        })
-                })
-                .collect();
 
         let raw = serde_yaml::to_string(&data)
             .ok()
             .and_then(|s| serde_yaml::from_str(&s).ok());
 
         if !proxies.is_empty() {
-            return Some(ParsedSubscription {
+            let proxies = authorize_and_strip_nextdesk_marker(proxies)?;
+            return Ok(Some(ParsedSubscription {
                 proxies,
-                proxy_groups,
                 raw_config: raw,
-            });
+            }));
         }
     }
-    None
+    Ok(None)
 }
 
-fn parse_uri_list(
-    content: &str,
-) -> Vec<serde_yaml::Value> {
+fn parse_uri_list(content: &str) -> Vec<serde_yaml::Value> {
     content
         .lines()
         .filter_map(|line| {
@@ -262,9 +298,7 @@ fn parse_uri_list(
         .collect()
 }
 
-fn parse_ss_uri(
-    uri: &str,
-) -> Option<serde_yaml::Value> {
+fn parse_ss_uri(uri: &str) -> Option<serde_yaml::Value> {
     let uri = &uri[5..]; // strip "ss://"
     let (main, name) = if let Some(idx) = uri.rfind('#') {
         let n = urlencoding::decode(&uri[idx + 1..])
@@ -275,49 +309,42 @@ fn parse_ss_uri(
         (uri, "SS Server".to_string())
     };
 
-    let (method, password, server, port) =
-        if let Some(idx) = main.rfind('@') {
-            let encoded = &main[..idx];
-            let decoded = base64::engine::general_purpose::STANDARD
-                .decode(encoded.as_bytes())
-                .or_else(|_| {
-                    base64::engine::general_purpose::STANDARD
-                        .decode(
-                            format!("{encoded}==").as_bytes(),
-                        )
-                })
-                .ok()
-                .and_then(|b| String::from_utf8(b).ok());
-            let (m, p) = match decoded {
-                Some(d) => {
-                    let parts: Vec<&str> =
-                        d.splitn(2, ':').collect();
-                    if parts.len() == 2 {
-                        (parts[0].to_string(), parts[1].to_string())
-                    } else {
-                        return None;
-                    }
+    let (method, password, server, port) = if let Some(idx) = main.rfind('@') {
+        let encoded = &main[..idx];
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .or_else(|_| {
+                base64::engine::general_purpose::STANDARD.decode(format!("{encoded}==").as_bytes())
+            })
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok());
+        let (m, p) = match decoded {
+            Some(d) => {
+                let parts: Vec<&str> = d.splitn(2, ':').collect();
+                if parts.len() == 2 {
+                    (parts[0].to_string(), parts[1].to_string())
+                } else {
+                    return None;
                 }
-                None => {
-                    let parts: Vec<&str> =
-                        encoded.splitn(2, ':').collect();
-                    if parts.len() == 2 {
-                        (parts[0].to_string(), parts[1].to_string())
-                    } else {
-                        return None;
-                    }
-                }
-            };
-            let server_port = &main[idx + 1..];
-            let sp: Vec<&str> =
-                server_port.splitn(2, ':').collect();
-            if sp.len() != 2 {
-                return None;
             }
-            (m, p, sp[0].to_string(), sp[1].to_string())
-        } else {
-            return None;
+            None => {
+                let parts: Vec<&str> = encoded.splitn(2, ':').collect();
+                if parts.len() == 2 {
+                    (parts[0].to_string(), parts[1].to_string())
+                } else {
+                    return None;
+                }
+            }
         };
+        let server_port = &main[idx + 1..];
+        let sp: Vec<&str> = server_port.splitn(2, ':').collect();
+        if sp.len() != 2 {
+            return None;
+        }
+        (m, p, sp[0].to_string(), sp[1].to_string())
+    } else {
+        return None;
+    };
 
     let port_num: u16 = port.parse().ok()?;
     Some(yaml_map(&[
@@ -330,36 +357,26 @@ fn parse_ss_uri(
     ]))
 }
 
-fn parse_vmess_uri(
-    uri: &str,
-) -> Option<serde_yaml::Value> {
+fn parse_vmess_uri(uri: &str) -> Option<serde_yaml::Value> {
     let encoded = &uri[8..];
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(encoded.as_bytes())
         .or_else(|_| {
-            base64::engine::general_purpose::STANDARD
-                .decode(format!("{encoded}==").as_bytes())
+            base64::engine::general_purpose::STANDARD.decode(format!("{encoded}==").as_bytes())
         })
         .ok()?;
-    let data: HashMap<String, serde_json::Value> =
-        serde_json::from_slice(&decoded).ok()?;
+    let data: HashMap<String, serde_json::Value> = serde_json::from_slice(&decoded).ok()?;
 
     let name = data
         .get("ps")
         .and_then(|v| v.as_str())
         .unwrap_or("VMess Server");
-    let server = data
-        .get("add")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let server = data.get("add").and_then(|v| v.as_str()).unwrap_or("");
     let port = data
         .get("port")
         .and_then(|v| {
             v.as_u64()
-                .or_else(|| {
-                    v.as_str()
-                        .and_then(|s| s.parse().ok())
-                })
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
         .unwrap_or(443);
 
@@ -370,16 +387,12 @@ fn parse_vmess_uri(
         ("port", &port.to_string()),
         (
             "uuid",
-            data.get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
+            data.get("id").and_then(|v| v.as_str()).unwrap_or(""),
         ),
     ]))
 }
 
-fn parse_trojan_uri(
-    uri: &str,
-) -> Option<serde_yaml::Value> {
+fn parse_trojan_uri(uri: &str) -> Option<serde_yaml::Value> {
     let parsed = Url::parse(uri).ok()?;
     let name = urlencoding::decode(parsed.fragment()?)
         .unwrap_or_default()
@@ -399,15 +412,11 @@ fn parse_trojan_uri(
     ]))
 }
 
-fn parse_vless_uri(
-    uri: &str,
-) -> Option<serde_yaml::Value> {
+fn parse_vless_uri(uri: &str) -> Option<serde_yaml::Value> {
     let parsed = Url::parse(uri).ok()?;
-    let name = urlencoding::decode(
-        parsed.fragment().unwrap_or("VLESS Server"),
-    )
-    .unwrap_or_default()
-    .to_string();
+    let name = urlencoding::decode(parsed.fragment().unwrap_or("VLESS Server"))
+        .unwrap_or_default()
+        .to_string();
     let name = if name.is_empty() {
         "VLESS Server"
     } else {
@@ -424,41 +433,36 @@ fn parse_vless_uri(
 }
 
 /// Convert parsed proxies to Server list for frontend
-pub fn transform_proxies_to_servers(
-    proxies: &[serde_yaml::Value],
-) -> Vec<Server> {
+pub fn transform_proxies_to_servers(proxies: &[serde_yaml::Value]) -> Vec<Server> {
     proxies
         .iter()
-        .enumerate()
-        .map(|(i, proxy)| {
-            let fallback =
-                format!("Server-{}", i + 1);
+        .filter_map(|proxy| {
             let name = proxy
                 .get("name")
                 .and_then(|n| n.as_str())
-                .unwrap_or(&fallback)
+                .filter(|name| config::is_selectable_proxy_name(name))?
                 .to_string();
             let host = proxy
                 .get("server")
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
-            Server {
-                id: (i + 1).to_string(),
-                name,
-                host,
-                port: 3389,
-                latency: None,
-                status: "unknown".into(),
-            }
+            Some((name, host))
+        })
+        .enumerate()
+        .map(|(i, (name, host))| Server {
+            id: (i + 1).to_string(),
+            name,
+            host,
+            port: 3389,
+            latency: None,
+            status: "unknown".into(),
         })
         .collect()
 }
 
 /// Test TCP connectivity to servers concurrently
-pub async fn test_servers_connectivity(
-    servers: &mut [Server],
-) {
+pub async fn test_servers_connectivity(servers: &mut [Server]) {
     let mut handles = vec![];
     for server in servers.iter() {
         let host = server.host.clone();
@@ -474,22 +478,17 @@ pub async fn test_servers_connectivity(
             .await;
             match result {
                 Ok(Ok(_)) => {
-                    let ms =
-                        start.elapsed().as_millis() as i64;
+                    let ms = start.elapsed().as_millis() as i64;
                     (id, "online".to_string(), Some(ms))
                 }
-                _ => {
-                    (id, "offline".to_string(), None)
-                }
+                _ => (id, "offline".to_string(), None),
             }
         }));
     }
 
     for handle in handles {
         if let Ok((id, status, latency)) = handle.await {
-            if let Some(s) =
-                servers.iter_mut().find(|s| s.id == id)
-            {
+            if let Some(s) = servers.iter_mut().find(|s| s.id == id) {
                 s.status = status;
                 s.latency = latency;
             }
@@ -497,21 +496,15 @@ pub async fn test_servers_connectivity(
     }
 }
 
-fn yaml_map(
-    pairs: &[(&str, &str)],
-) -> serde_yaml::Value {
+fn yaml_map(pairs: &[(&str, &str)]) -> serde_yaml::Value {
     let mut m = serde_yaml::Mapping::new();
     for (k, v) in pairs {
         // Try to parse as integer for port
         if *k == "port" {
             if let Ok(n) = v.parse::<i64>() {
                 m.insert(
-                    serde_yaml::Value::String(
-                        k.to_string(),
-                    ),
-                    serde_yaml::Value::Number(
-                        serde_yaml::Number::from(n),
-                    ),
+                    serde_yaml::Value::String(k.to_string()),
+                    serde_yaml::Value::Number(serde_yaml::Number::from(n)),
                 );
                 continue;
             }
@@ -528,3 +521,96 @@ fn ykey(s: &str) -> serde_yaml::Value {
     serde_yaml::Value::String(s.to_string())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{
+        nextdesk_subscription_url, parse_subscription, transform_proxies_to_servers, yaml_map,
+    };
+
+    #[test]
+    fn nextdesk_subscription_url_adds_meta_flag_to_short_link() {
+        let url = nextdesk_subscription_url("https://example.com/link/token");
+        assert_eq!(url, "https://example.com/link/token?flag=meta");
+    }
+
+    #[test]
+    fn nextdesk_subscription_url_preserves_existing_query() {
+        let url = nextdesk_subscription_url("https://example.com/api?token=abc&foo=bar");
+        assert_eq!(url, "https://example.com/api?token=abc&foo=bar&flag=meta");
+    }
+
+    #[test]
+    fn nextdesk_subscription_url_replaces_existing_flag() {
+        let url = nextdesk_subscription_url("https://example.com/api?token=abc&flag=clash");
+        assert_eq!(url, "https://example.com/api?token=abc&flag=meta");
+    }
+
+    #[test]
+    fn transform_proxies_to_servers_filters_subscription_metadata_nodes() {
+        let proxies = vec![
+            yaml_map(&[
+                ("name", "Traffic Reset：10617.26 GB"),
+                ("type", "vless"),
+                ("server", "a3f7b2e1.gt2-rs-weissach.pro"),
+                ("port", "35018"),
+            ]),
+            yaml_map(&[
+                ("name", "Expire Date：Lifetime"),
+                ("type", "vless"),
+                ("server", "a3f7b2e1.gt2-rs-weissach.pro"),
+                ("port", "35018"),
+            ]),
+            yaml_map(&[
+                ("name", "🇺🇸 US Server Only 01"),
+                ("type", "vless"),
+                ("server", "a3f7b2e1.gt2-rs-weissach.pro"),
+                ("port", "35018"),
+            ]),
+        ];
+
+        let servers = transform_proxies_to_servers(&proxies);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].id, "1");
+        assert_eq!(servers[0].name, "🇺🇸 US Server Only 01");
+    }
+
+    #[test]
+    fn parse_subscription_rejects_clash_yaml_without_nextdesk_marker() {
+        let content = r#"
+proxies:
+  - name: Other Provider Node
+    type: direct
+"#;
+
+        let err = match parse_subscription(content) {
+            Ok(_) => panic!("subscription without NextDesk marker should be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err,
+            "Subscription is not authorized for NextDesk. Please use the official NextDesk subscription."
+        );
+    }
+
+    #[test]
+    fn parse_subscription_accepts_and_hides_nextdesk_marker_proxy() {
+        let content = r#"
+proxies:
+  - name: __nextdesk_subscription_issuer_librascloud
+    type: http
+    server: 127.0.0.1
+    port: 9
+  - name: RDP Node 01
+    type: direct
+"#;
+
+        let parsed = parse_subscription(content).expect("authorized subscription should parse");
+        let servers = transform_proxies_to_servers(&parsed.proxies);
+
+        assert_eq!(parsed.proxies.len(), 1);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "RDP Node 01");
+    }
+}

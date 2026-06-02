@@ -1,21 +1,21 @@
 use serde::Serialize;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::SystemTime;
 
 #[cfg(target_os = "macos")]
 use crate::macos_file_promise::write_files_with_native_file_promise;
+#[cfg(not(target_os = "macos"))]
+use crate::macos_file_promise::write_files_with_native_file_promise;
 #[cfg(target_os = "macos")]
+use crate::macos_item_provider::write_files_with_item_provider;
+#[cfg(not(target_os = "macos"))]
 use crate::macos_item_provider::write_files_with_item_provider;
 #[cfg(target_os = "macos")]
 use crate::macos_pasteboard_promise::write_files_with_pasteboard_item_provider;
-#[cfg(not(target_os = "macos"))]
-use crate::macos_file_promise::write_files_with_native_file_promise;
-#[cfg(not(target_os = "macos"))]
-use crate::macos_item_provider::write_files_with_item_provider;
 #[cfg(not(target_os = "macos"))]
 use crate::macos_pasteboard_promise::write_files_with_pasteboard_item_provider;
 #[cfg(not(target_os = "macos"))]
@@ -71,49 +71,49 @@ pub fn write_virtual_files_to_local_clipboard(
 
     #[cfg(not(target_os = "macos"))]
     {
-    if let Some(result) = write_files_with_pasteboard_item_provider(files)? {
-        return Ok(result);
-    }
+        if let Some(result) = write_files_with_pasteboard_item_provider(files)? {
+            return Ok(result);
+        }
 
-    if let Some(result) = write_files_with_item_provider(files)? {
-        return Ok(result);
-    }
+        if let Some(result) = write_files_with_item_provider(files)? {
+            return Ok(result);
+        }
 
-    if let Some(result) = write_files_with_native_file_promise(files)? {
-        return Ok(result);
-    }
+        if let Some(result) = write_files_with_native_file_promise(files)? {
+            return Ok(result);
+        }
 
-    if let Some(result) = write_files_with_native_virtual_data_object(files)? {
-        return Ok(result);
-    }
+        if let Some(result) = write_files_with_native_virtual_data_object(files)? {
+            return Ok(result);
+        }
 
-    let staged_paths = stage_files(session_id, files)?;
+        let staged_paths = stage_files(session_id, files)?;
 
-    #[cfg(target_os = "macos")]
-    {
-        write_file_urls_to_macos_pasteboard(&staged_paths)?;
-        return Ok(VirtualClipboardWriteResult {
-            strategy: "macos-file-url-staging".to_string(),
-            staged_paths,
-        });
-    }
+        #[cfg(target_os = "macos")]
+        {
+            write_file_urls_to_macos_pasteboard(&staged_paths)?;
+            return Ok(VirtualClipboardWriteResult {
+                strategy: "macos-file-url-staging".to_string(),
+                staged_paths,
+            });
+        }
 
-    #[cfg(target_os = "windows")]
-    {
-        write_file_paths_to_windows_clipboard(&staged_paths)?;
-        return Ok(VirtualClipboardWriteResult {
-            strategy: "windows-set-clipboard-path".to_string(),
-            staged_paths,
-        });
-    }
+        #[cfg(target_os = "windows")]
+        {
+            write_file_paths_to_windows_clipboard(&staged_paths)?;
+            return Ok(VirtualClipboardWriteResult {
+                strategy: "windows-set-clipboard-path".to_string(),
+                staged_paths,
+            });
+        }
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        Ok(VirtualClipboardWriteResult {
-            strategy: "staging-only".to_string(),
-            staged_paths,
-        })
-    }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Ok(VirtualClipboardWriteResult {
+                strategy: "staging-only".to_string(),
+                staged_paths,
+            })
+        }
     }
 }
 
@@ -123,23 +123,19 @@ fn stage_files(
 ) -> Result<Vec<String>, String> {
     let stage_root = session_stage_root(session_id);
 
-    fs::create_dir_all(&stage_root)
-        .map_err(|e| format!("Failed to create staging dir: {}", e))?;
+    fs::create_dir_all(&stage_root).map_err(|e| format!("Failed to create staging dir: {}", e))?;
 
     let mut staged_paths = Vec::with_capacity(files.len());
     for file in files {
         let dest = unique_path_in_dir(&stage_root, &file.name);
-        fs::write(&dest, &file.data)
-            .map_err(|e| format!("Failed to write staged file: {}", e))?;
+        fs::write(&dest, &file.data).map_err(|e| format!("Failed to write staged file: {}", e))?;
         staged_paths.push(dest.to_string_lossy().to_string());
     }
 
     Ok(staged_paths)
 }
 
-pub fn session_stage_root(
-    session_id: Option<&str>,
-) -> PathBuf {
+pub fn session_stage_root(session_id: Option<&str>) -> PathBuf {
     let base = dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("NextDesk")
@@ -159,19 +155,18 @@ pub fn session_stage_root(
     ))
 }
 
-pub fn unique_path_in_dir(
-    dir: &Path,
-    file_name: &str,
-) -> PathBuf {
+pub fn unique_path_in_dir(dir: &Path, file_name: &str) -> PathBuf {
     let dest = dir.join(file_name);
     if !dest.exists() {
         return dest;
     }
 
-    let stem = dest.file_stem()
+    let stem = dest
+        .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(file_name);
-    let ext = dest.extension()
+    let ext = dest
+        .extension()
         .and_then(|s| s.to_str())
         .map(|e| format!(".{}", e))
         .unwrap_or_default();
@@ -187,9 +182,7 @@ pub fn unique_path_in_dir(
 }
 
 #[cfg(target_os = "macos")]
-fn write_file_urls_to_macos_pasteboard(
-    paths: &[String],
-) -> Result<(), String> {
+pub(crate) fn write_file_urls_to_macos_pasteboard(paths: &[String]) -> Result<(), String> {
     // IMPORTANT: Do NOT mix writeObjects (modern) with addTypes (legacy).
     // Mixing them on macOS 26 causes pasteboard state corruption where Finder
     // reads the PREVIOUS file URL instead of the current one.
@@ -238,9 +231,7 @@ fn write_file_urls_to_macos_pasteboard(
 }
 
 #[cfg(target_os = "windows")]
-fn write_file_paths_to_windows_clipboard(
-    paths: &[String],
-) -> Result<(), String> {
+fn write_file_paths_to_windows_clipboard(paths: &[String]) -> Result<(), String> {
     let joined = paths
         .iter()
         .map(|p| format!("'{}'", p.replace('\'', "''")))
@@ -270,9 +261,7 @@ fn write_file_paths_to_windows_clipboard(
 
 /// Cross-platform helper: write already-staged file paths to the system clipboard.
 /// Used by the chunked file transfer commit command.
-pub fn write_staged_paths_to_clipboard(
-    paths: &[String],
-) -> Result<String, String> {
+pub fn write_staged_paths_to_clipboard(paths: &[String]) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
         write_file_urls_to_macos_pasteboard(paths)?;

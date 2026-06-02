@@ -8,6 +8,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "2"
 serde_yaml = "0.9"
 reqwest = { version = "0.12", features = ["json", "socks"] }
 tokio = { version = "1", features = ["full"] }
@@ -17,9 +18,9 @@ sys-locale = "0.3"
 urlencoding = "2"
 dirs = "6"
 log = "0.4"
+env_logger = "0.11"
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
-ironrdp-rdcleanpath = "0.2.1"
 der = { version = "0.7", features = ["alloc"] }
 tokio-native-tls = "0.3"
 native-tls = "0.2"
@@ -29,6 +30,29 @@ tauri-plugin-dialog = "2.6.0"
 tauri-plugin-fs = "2.4.5"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
+aggligator = "0.9"
+maxminddb = "0.24"
+cpal = "0.17"
+png = "0.17"
+
+# ── IronRDP native crates (local path) ──
+ironrdp = { path = "../../IronRDP/crates/ironrdp", version = "0.14", features = [
+    "session", "connector", "input", "graphics",
+    "rdpsnd", "rdpdr", "cliprdr", "displaycontrol",
+    "dvc", "svc", "echo",
+] }
+ironrdp-core = { path = "../../IronRDP/crates/ironrdp-core", version = "0.1", features = ["alloc"] }
+ironrdp-tokio = { path = "../../IronRDP/crates/ironrdp-tokio", version = "0.8", features = ["reqwest"] }
+ironrdp-tls = { path = "../../IronRDP/crates/ironrdp-tls", version = "0.2", features = ["native-tls"] }
+ironrdp-rdpsnd-native = { path = "../../IronRDP/crates/ironrdp-rdpsnd-native", version = "0.5" }
+ironrdp-cliprdr-native = { path = "../../IronRDP/crates/ironrdp-cliprdr-native", version = "0.5" }
+ironrdp-rdcleanpath = { path = "../../IronRDP/crates/ironrdp-rdcleanpath" }
+ironrdp-dvc = { path = "../../IronRDP/crates/ironrdp-dvc", version = "0.5", features = ["std"] }
+smallvec = "1.15"
+lz4_flex = "0.11"
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+tokio-util = "0.7"
+tracing = { version = "0.1", features = ["log"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
@@ -40,13 +64,34 @@ objc2-foundation = { version = "0.3.2", features = ["NSItemProvider", "NSArray",
 windows = { version = "0.61.3", features = [
   "Win32_Foundation",
   "Win32_System_Com",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
   "Win32_System_Ole",
   "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
 ] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
 [lib]
 name = "nextdesk_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
+
+# Basic optimization for main crate in dev builds (loops, inlining)
+# Without this, pixel extraction + LZ4 call in rdp_session.rs runs 5-10x slower
+[profile.dev]
+opt-level = 1
+
+# Full optimization for hot-path dependency crates
+[profile.dev.package.lz4_flex]
+opt-level = 3
+[profile.dev.package.ironrdp-session]
+opt-level = 2
+[profile.dev.package.ironrdp-graphics]
+opt-level = 2
+[profile.dev.package.ironrdp-pdu]
+opt-level = 2

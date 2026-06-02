@@ -1,7 +1,4 @@
-use crate::virtual_file_clipboard::{
-    VirtualClipboardFile,
-    VirtualClipboardWriteResult,
-};
+use crate::virtual_file_clipboard::{VirtualClipboardFile, VirtualClipboardWriteResult};
 
 #[cfg(target_os = "macos")]
 use std::cell::RefCell;
@@ -60,10 +57,7 @@ pub fn write_files_with_item_provider(
         let file_url = NSURL::fileURLWithPath(&ns_path);
 
         let provider = unsafe {
-            NSItemProvider::initWithContentsOfURL(
-                NSItemProvider::alloc(),
-                Some(&file_url),
-            )
+            NSItemProvider::initWithContentsOfURL(NSItemProvider::alloc(), Some(&file_url))
         };
 
         if let Some(provider) = provider {
@@ -120,10 +114,12 @@ fn unique_path_in_dir(dir: &Path, file_name: &str) -> std::path::PathBuf {
     if !dest.exists() {
         return dest;
     }
-    let stem = dest.file_stem()
+    let stem = dest
+        .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or(file_name);
-    let ext = dest.extension()
+    let ext = dest
+        .extension()
         .and_then(|s| s.to_str())
         .map(|e| format!(".{}", e))
         .unwrap_or_default();

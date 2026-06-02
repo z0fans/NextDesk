@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import {
   Search, Star, ChevronRight, ChevronDown, Monitor,
   Plus, FolderPlus, PanelLeftClose,
-  Pencil, Trash2, MoveRight, X, GripVertical, FolderOpen,
+  Pencil, Trash2, MoveRight, X, GripVertical, FolderOpen, Play,
 } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -12,6 +12,7 @@ import { useTranslation } from '@/i18n/useTranslation';
 
 interface Props {
   store: SessionStore;
+  selectedServerId: string | null;
   onConnectServer: (serverId: string) => void;
   onSelectServer: (serverId: string) => void;
   onNewServer: () => void;
@@ -37,7 +38,7 @@ interface DragState {
 }
 
 export function RdpSidebar({
-  store, onConnectServer, onSelectServer, onNewServer,
+  store, selectedServerId, onConnectServer, onSelectServer, onNewServer,
   onEditServer, onDeleteServer,
 }: Props) {
   const { t } = useTranslation();
@@ -195,6 +196,7 @@ export function RdpSidebar({
             </div>
             {favorites.map(s => (
               <ServerItem key={s.id} server={s} status={getSessionStatus(s.id)} store={store}
+                isSelected={selectedServerId === s.id}
                 onConnect={onConnectServer} onSelect={onSelectServer} onEdit={onEditServer} onDelete={onDeleteServer}
                 groups={groups} onMoveToGroup={(sid, gid) => store.updateServer(sid, { groupId: gid })}
                 onDragStart={startDrag} isDragging={dragging}
@@ -292,6 +294,7 @@ export function RdpSidebar({
               )}
               {group.isExpanded && groupServers.map(s => (
                 <ServerItem key={s.id} server={s} status={getSessionStatus(s.id)} store={store}
+                  isSelected={selectedServerId === s.id}
                   onConnect={onConnectServer} onSelect={onSelectServer} onEdit={onEditServer} onDelete={onDeleteServer}
                   groups={groups} onMoveToGroup={(sid, gid) => store.updateServer(sid, { groupId: gid })}
                   onDragStart={startDrag} isDragging={dragging}
@@ -379,12 +382,13 @@ export function RdpSidebar({
 
 /* ── Server item ── */
 function ServerItem({
-  server, status, store, onConnect, onSelect, onEdit, onDelete,
+  server, status, store, isSelected, onConnect, onSelect, onEdit, onDelete,
   groups, onMoveToGroup, onDragStart, isDragging,
 }: {
   server: { id: string; name: string; host: string; isFavorite: boolean; groupId?: string; colorTag?: string };
   status: string;
   store: SessionStore;
+  isSelected: boolean;
   onConnect: (id: string) => void;
   onSelect: (id: string) => void;
   onEdit: (id: string) => void;
@@ -419,13 +423,15 @@ function ServerItem({
           "flex items-center gap-2 px-3 py-1.5 rounded-md text-xs w-full text-left",
           "hover:bg-accent/50 transition-colors group",
           isDragging ? "cursor-grabbing" : "cursor-grab",
-          status === 'connected' && "bg-emerald-500/5"
+          status === 'connected' && "bg-emerald-500/5",
+          isSelected && "bg-cyan-500/10 border-l-2 border-cyan-500 text-cyan-300"
         )}
         onMouseDown={e => {
           if (e.button === 0) onDragStart(server.id, server.name || server.host, e.clientY);
         }}
         onClick={handleClick}
         onDoubleClick={handleDoubleClick}
+        onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); onConnect(server.id); } }}
         onContextMenu={e => { e.preventDefault(); setCtx({ x: e.clientX, y: e.clientY }); }}
       >
         {server.colorTag ? (
@@ -452,6 +458,10 @@ function ServerItem({
             onContextMenu={e => { e.preventDefault(); setCtx(null); setShowMoveMenu(false); }} />
           <div className="fixed z-50 bg-card/95 backdrop-blur-md border border-border/60 rounded-lg shadow-xl py-1 min-w-[160px] animate-in fade-in zoom-in-95 duration-100"
             style={{ left: ctx.x, top: ctx.y }}>
+            <button className="flex items-center gap-2 w-full px-3 py-1.5 text-xs hover:bg-accent/50 transition-colors cursor-pointer"
+              onClick={() => { setCtx(null); onConnect(server.id); }}>
+              <Play className="h-3 w-3" /> {t('rdpConnect')}
+            </button>
             <button className="flex items-center gap-2 w-full px-3 py-1.5 text-xs hover:bg-accent/50 transition-colors cursor-pointer"
               onClick={() => { setCtx(null); onEdit(server.id); }}>
               <Pencil className="h-3 w-3" /> {t('rdpEdit')}

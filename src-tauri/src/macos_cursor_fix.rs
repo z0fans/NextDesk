@@ -15,17 +15,14 @@ mod imp {
 
     /// Replacement implementation for `+[NSCursor setHiddenUntilMouseMoves:]`.
     /// Does nothing — prevents macOS from hiding the cursor on typing.
-    unsafe extern "C-unwind" fn noop_set_hidden(
-        _cls: &AnyClass, _sel: Sel, _flag: Bool,
-    ) {
+    unsafe extern "C-unwind" fn noop_set_hidden(_cls: &AnyClass, _sel: Sel, _flag: Bool) {
         // Intentionally empty — cursor stays visible during keyboard input
     }
 
     pub fn install() {
         unsafe {
             let cls_name = c"NSCursor";
-            let cls = AnyClass::get(cls_name)
-                .expect("[macos-cursor] NSCursor class not found");
+            let cls = AnyClass::get(cls_name).expect("[macos-cursor] NSCursor class not found");
             let sel = objc2::sel!(setHiddenUntilMouseMoves:);
 
             match cls.class_method(sel) {
@@ -33,10 +30,14 @@ mod imp {
                     let new_imp: objc2::runtime::Imp =
                         std::mem::transmute(noop_set_hidden as *const ());
                     method.set_implementation(new_imp);
-                    eprintln!("[macos] Cursor-hide swizzle installed (setHiddenUntilMouseMoves: → no-op)");
+                    eprintln!(
+                        "[macos] Cursor-hide swizzle installed (setHiddenUntilMouseMoves: → no-op)"
+                    );
                 }
                 None => {
-                    eprintln!("[macos] Warning: +[NSCursor setHiddenUntilMouseMoves:] method not found");
+                    eprintln!(
+                        "[macos] Warning: +[NSCursor setHiddenUntilMouseMoves:] method not found"
+                    );
                 }
             }
         }

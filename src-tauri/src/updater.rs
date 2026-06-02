@@ -1,7 +1,7 @@
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
-use reqwest::Client;
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GITHUB_REPO: &str = "z0fans/NextDesk";
@@ -22,9 +22,7 @@ pub fn get_current_version() -> String {
 }
 
 pub async fn check_for_update() -> UpdateInfo {
-    let url = format!(
-        "https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-    );
+    let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -61,14 +59,10 @@ pub async fn check_for_update() -> UpdateInfo {
         }
     };
 
-    let tag = data
-        .get("tag_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let tag = data.get("tag_name").and_then(|v| v.as_str()).unwrap_or("");
     let latest = tag.trim_start_matches('v').to_string();
 
-    let has_update =
-        compare_versions(&latest, CURRENT_VERSION) > 0;
+    let has_update = compare_versions(&latest, CURRENT_VERSION) > 0;
 
     UpdateInfo {
         has_update,
@@ -80,11 +74,7 @@ pub async fn check_for_update() -> UpdateInfo {
 }
 
 fn compare_versions(v1: &str, v2: &str) -> i32 {
-    let parse = |v: &str| -> Vec<i32> {
-        v.split('.')
-            .filter_map(|s| s.parse().ok())
-            .collect()
-    };
+    let parse = |v: &str| -> Vec<i32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
     let p1 = parse(v1);
     let p2 = parse(v2);
     for (a, b) in p1.iter().zip(p2.iter()) {

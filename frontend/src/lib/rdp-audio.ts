@@ -5,6 +5,8 @@
  * and plays it through the browser's AudioContext.
  */
 
+import { rdpLog } from '@/lib/rdp-logger';
+
 export interface AudioFormatInfo {
   channels: number;
   sampleRate: number;
@@ -55,7 +57,7 @@ export class RdpAudioPlayer {
   }
 
   private handleFormat(info: AudioFormatInfo) {
-    console.log('[rdp-audio] format:', info);
+    rdpLog.info('audio', 'format', info);
     this.format = info;
     // Reset play time on format change
     this.nextPlayTime = 0;
@@ -124,11 +126,11 @@ export class RdpAudioPlayer {
     if (this.gainNode && !this._muted) {
       this.gainNode.gain.setValueAtTime(avg, this.ctx!.currentTime);
     }
-    console.log('[rdp-audio] volume:', avg.toFixed(2));
+    rdpLog.debug('audio', `volume: ${avg.toFixed(2)}`);
   }
 
   private handleClose() {
-    console.log('[rdp-audio] close');
+    rdpLog.info('audio', 'close');
     this.nextPlayTime = 0;
   }
 

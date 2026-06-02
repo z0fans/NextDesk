@@ -114,7 +114,7 @@ export function useSessionStore() {
       const fromIndex = prev.findIndex(g => g.id === groupId);
       if (fromIndex < 0 || fromIndex === toIndex) return prev;
       const minIdx = prev.findIndex(g => g.id !== 'fav' && g.id !== 'default');
-      if (toIndex < minIdx || toIndex >= prev.length) return prev;
+      if (toIndex < minIdx || toIndex > prev.length) return prev;
       const next = [...prev];
       const [moved] = next.splice(fromIndex, 1);
       next.splice(toIndex, 0, moved);
