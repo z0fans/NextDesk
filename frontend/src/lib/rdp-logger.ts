@@ -1,8 +1,7 @@
 /**
- * RDP Debug Logger — Dev-only structured logging for RDP operations.
+ * RDP Debug Logger — structured logging for RDP operations.
  *
- * In production builds, all log calls are no-ops (tree-shaken by Vite).
- * In dev mode, logs are:
+ * Logs are:
  *   1. Printed to console with color-coded module tags
  *   2. Batched and forwarded to Rust backend → /tmp/nextdesk_rdp_debug.log
  *
@@ -46,18 +45,7 @@ const LEVEL_PRIORITY: Record<RdpLogLevel, number> = {
   debug: 0, info: 1, warn: 2, error: 3,
 };
 
-// ── No-op implementation for production ──
-const noop = () => {};
-const noopLogger = {
-  debug: noop as (...args: any[]) => void,
-  info: noop as (...args: any[]) => void,
-  warn: noop as (...args: any[]) => void,
-  error: noop as (...args: any[]) => void,
-  flush: noop as () => void,
-};
-
-// ── Dev implementation ──
-function createDevLogger() {
+function createLogger() {
   const BATCH_INTERVAL = 500;
   const BATCH_SIZE = 20;
   const RING_SIZE = 5000;
@@ -186,12 +174,9 @@ function createDevLogger() {
 
 /**
  * Singleton RDP logger.
- * - Production: all calls are no-ops.
- * - Dev: structured logging to console + file.
- *   Default level: 'info' (hides debug noise).
- *   To see all logs: window.__RDP_LOG_LEVEL = 'debug'
- *   To filter modules: window.__RDP_LOG_MODULES = 'input,render'
+ * Structured logging to console + file.
+ * Default level: 'info' (hides debug noise).
+ * To see all logs: window.__RDP_LOG_LEVEL = 'debug'
+ * To filter modules: window.__RDP_LOG_MODULES = 'input,render'
  */
-export const rdpLog = import.meta.env.DEV
-  ? createDevLogger()
-  : noopLogger;
+export const rdpLog = createLogger();

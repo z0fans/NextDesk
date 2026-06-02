@@ -24,7 +24,7 @@ mod windows_virtual_files;
 use serde_json::Value;
 use state::{AppState, RunMode, Server};
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, TcpListener, UdpSocket};
 use tauri::{AppHandle, Manager, State};
 
 #[tauri::command]
@@ -70,6 +70,45 @@ fn is_private_or_reserved_host(host: &str) -> bool {
     }
 }
 
+fn free_tcp_port() -> Result<u16, String> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| format!("Reserve local TCP port failed: {e}"))?;
+    listener
+        .local_addr()
+        .map(|addr| addr.port())
+        .map_err(|e| format!("Read local TCP port failed: {e}"))
+}
+
+fn free_dns_port() -> Result<u16, String> {
+    for _ in 0..32 {
+        let tcp = TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|e| format!("Reserve local DNS TCP port failed: {e}"))?;
+        let port = tcp
+            .local_addr()
+            .map_err(|e| format!("Read local DNS TCP port failed: {e}"))?
+            .port();
+        if let Ok(udp) = UdpSocket::bind(("127.0.0.1", port)) {
+            drop(udp);
+            return Ok(port);
+        }
+    }
+    Err("Reserve local DNS port failed".into())
+}
+
+fn choose_runtime_ports() -> Result<config::RuntimePorts, String> {
+    let http_port = free_tcp_port()?;
+    let socks_port = free_tcp_port()?;
+    let controller_port = free_tcp_port()?;
+    let dns_port = free_dns_port()?;
+
+    Ok(config::RuntimePorts {
+        http_port,
+        socks_port,
+        controller_port,
+        dns_port,
+    })
+}
+
 async fn start_engine_inner(app_state: &AppState) -> Result<bool, String> {
     if internal_engine_running(app_state) {
         log::info!("[start_engine] Internal Clash already running");
@@ -87,13 +126,22 @@ async fn start_engine_inner(app_state: &AppState) -> Result<bool, String> {
 
     // Ensure interface-name is set to bypass external TUN/VPN
     config::ensure_interface_name(&config_path);
+    let runtime_ports = choose_runtime_ports()?;
+    config::patch_runtime_ports(&config_path, runtime_ports)?;
+    let api_base = format!("http://127.0.0.1:{}", runtime_ports.controller_port);
 
     match clash::start_clash_process().await {
         Ok(child) => {
             *app_state.clash_process.lock().unwrap() = Some(child);
-            // Set default ports for internal engine
-            *app_state.clash_api_base.lock().unwrap() = "http://127.0.0.1:17891".to_string();
-            *app_state.proxy_port.lock().unwrap() = 17897;
+            *app_state.clash_api_base.lock().unwrap() = api_base.clone();
+            *app_state.proxy_port.lock().unwrap() = runtime_ports.socks_port;
+            log::info!(
+                "[start_engine] Runtime ports http={} socks={} api={} dns={}",
+                runtime_ports.http_port,
+                runtime_ports.socks_port,
+                runtime_ports.controller_port,
+                runtime_ports.dns_port
+            );
             // Wait for Clash API to become ready (up to 15s)
             let ready = {
                 let client = reqwest::Client::builder()
@@ -104,7 +152,7 @@ async fn start_engine_inner(app_state: &AppState) -> Result<bool, String> {
                 let mut ok = false;
                 for _ in 0..240 {
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if let Ok(resp) = client.get("http://127.0.0.1:17891/version").send().await {
+                    if let Ok(resp) = client.get(format!("{api_base}/version")).send().await {
                         if resp.status().is_success() {
                             ok = true;
                             break;
@@ -117,11 +165,11 @@ async fn start_engine_inner(app_state: &AppState) -> Result<bool, String> {
                 eprintln!("[start_engine] Internal Clash API ready");
                 // Trigger geodata update in background
                 // (mihomo downloads latest Country.mmdb via its own proxy)
-                tauri::async_runtime::spawn(async {
+                tauri::async_runtime::spawn(async move {
                     // Wait a few seconds for proxy connections to establish
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     eprintln!("[start_engine] Triggering geodata update...");
-                    clash::trigger_geodata_update("http://127.0.0.1:17891").await;
+                    clash::trigger_geodata_update(&api_base).await;
                     eprintln!("[start_engine] Geodata update triggered");
                 });
             } else {

@@ -472,6 +472,50 @@ pub fn generate_clash_config_from_subscription(raw_config: &serde_yaml::Value) -
     config_path
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimePorts {
+    pub http_port: u16,
+    pub socks_port: u16,
+    pub controller_port: u16,
+    pub dns_port: u16,
+}
+
+/// Patch the generated runtime config with per-process local ports.
+///
+/// Dev and packaged apps can run at the same time on this machine. If both use
+/// the fixed default ports, the second mihomo process starts against a stale
+/// first process and RDP silently uses the wrong runtime.
+pub fn patch_runtime_ports(config_path: &PathBuf, ports: RuntimePorts) -> Result<(), String> {
+    let content =
+        fs::read_to_string(config_path).map_err(|e| format!("Read runtime config failed: {e}"))?;
+    let mut config: serde_yaml::Value =
+        serde_yaml::from_str(&content).map_err(|e| format!("Parse runtime config failed: {e}"))?;
+    let map = config
+        .as_mapping_mut()
+        .ok_or_else(|| "Runtime config is not a YAML object".to_string())?;
+
+    insert_yaml_int(map, "port", i64::from(ports.http_port));
+    insert_yaml_int(map, "socks-port", i64::from(ports.socks_port));
+    insert_yaml_str(
+        map,
+        "external-controller",
+        &format!("127.0.0.1:{}", ports.controller_port),
+    );
+
+    if let Some(dns) = map.get_mut(&ykey("dns")) {
+        if let Some(dns_map) = dns.as_mapping_mut() {
+            dns_map.insert(
+                ykey("listen"),
+                serde_yaml::Value::String(format!("127.0.0.1:{}", ports.dns_port)),
+            );
+        }
+    }
+
+    let yaml_str = serde_yaml::to_string(&config)
+        .map_err(|e| format!("Serialize runtime config failed: {e}"))?;
+    fs::write(config_path, yaml_str).map_err(|e| format!("Write runtime config failed: {e}"))
+}
+
 fn ykey(s: &str) -> serde_yaml::Value {
     serde_yaml::Value::String(s.to_string())
 }
@@ -630,9 +674,10 @@ mod tests {
     use super::{
         build_rdp_proxy_groups, build_rdp_rules, build_rdp_runtime_proxy_groups, ensure_port_rule,
         generate_clash_config_from_subscription, get_user_config_dir, is_selectable_proxy_name,
-        preferred_rdp_catch_all_group, real_proxy_names_from_yaml, ykey, SERVER_AMERICAS_GROUP,
-        SERVER_ASIA_GROUP, SERVER_GLOBAL_GROUP,
+        patch_runtime_ports, preferred_rdp_catch_all_group, real_proxy_names_from_yaml, ykey,
+        RuntimePorts, SERVER_AMERICAS_GROUP, SERVER_ASIA_GROUP, SERVER_GLOBAL_GROUP,
     };
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn proxy(name: &str) -> serde_yaml::Value {
         let mut map = serde_yaml::Mapping::new();
@@ -787,5 +832,68 @@ proxies:
             !map.contains_key(&ykey("tun")),
             "NextDesk runtime config must not inherit subscription TUN"
         );
+    }
+
+    #[test]
+    fn runtime_port_patch_updates_all_local_listeners() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("nextdesk-runtime-ports-{nonce}.yaml"));
+        std::fs::write(
+            &path,
+            r#"
+port: 17890
+socks-port: 17897
+external-controller: 127.0.0.1:17891
+dns:
+  enable: true
+  listen: 127.0.0.1:11053
+"#,
+        )
+        .expect("fixture should be written");
+
+        patch_runtime_ports(
+            &path,
+            RuntimePorts {
+                http_port: 18080,
+                socks_port: 18081,
+                controller_port: 18082,
+                dns_port: 18083,
+            },
+        )
+        .expect("runtime ports should patch");
+
+        let doc: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(&path).expect("patched config should be readable"),
+        )
+        .expect("patched config should parse");
+        let map = doc.as_mapping().expect("patched config should be a map");
+        let dns = map
+            .get(&ykey("dns"))
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("dns should stay a map");
+
+        assert_eq!(
+            map.get(&ykey("port")).and_then(serde_yaml::Value::as_i64),
+            Some(18080)
+        );
+        assert_eq!(
+            map.get(&ykey("socks-port"))
+                .and_then(serde_yaml::Value::as_i64),
+            Some(18081)
+        );
+        assert_eq!(
+            map.get(&ykey("external-controller"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("127.0.0.1:18082")
+        );
+        assert_eq!(
+            dns.get(&ykey("listen")).and_then(serde_yaml::Value::as_str),
+            Some("127.0.0.1:18083")
+        );
+
+        std::fs::remove_file(path).ok();
     }
 }
