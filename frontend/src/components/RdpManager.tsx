@@ -10,7 +10,6 @@ import { Monitor } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useTranslation } from '@/i18n/useTranslation';
-import type { TranslationKey } from '@/i18n/translations';
 import { codeToScancode } from '@/lib/scancodeMap';
 
 import DecodeWorkerUrl from '@/lib/decode-worker.ts?worker&url';
@@ -18,7 +17,7 @@ import { rdpLog } from '@/lib/rdp-logger';
 import { api } from '@/api';
 import { useNativeRdp, connectFrameWebSocket, type NativeGfxH264Frame } from '@/hooks/useNativeRdp';
 import { drawDecodedH264FrameToOverlay } from '@/lib/h264-overlay';
-import { isNonRecoverableRdpError } from '@/lib/rdp-errors';
+import { friendlyRdpError, isNonRecoverableRdpError } from '@/lib/rdp-errors';
 
 /**
  * Native RDP mode flag.
@@ -328,51 +327,6 @@ interface WasmSession {
   releaseAllInputs(): void;
   supportsUnicodeKeyboardShortcuts(): boolean;
   synchronizeLockKeys(scroll_lock: boolean, num_lock: boolean, caps_lock: boolean, kana_lock: boolean): void;
-}
-
-/** Map raw RDP/WASM errors to user-friendly messages */
-function friendlyRdpError(raw: string, t: (key: TranslationKey) => string): string {
-  const r = raw.toLowerCase();
-  if (!r.trim())
-    return t('rdpErrUnknown');
-  if (r.includes('status_logon_failure') || r.includes('0xc000006d'))
-    return t('rdpErrLoginFailed');
-  if (r.includes('status_account_disabled') || r.includes('0xc0000072'))
-    return t('rdpErrAccountDisabled');
-  if (r.includes('status_account_locked') || r.includes('0xc0000234'))
-    return t('rdpErrAccountLocked');
-  if (r.includes('status_password_expired') || r.includes('0xc0000071'))
-    return t('rdpErrPasswordExpired');
-  if (r.includes('status_account_expired') || r.includes('0xc0000193'))
-    return t('rdpErrAccountExpired');
-  if (r.includes('status_password_must_change') || r.includes('0xc0000224'))
-    return t('rdpErrPasswordMustChange');
-  if (r.includes('credssp'))
-    return t('rdpErrCredSsp');
-  if (r.includes('tls') || r.includes('ssl') || r.includes('certificate'))
-    return t('rdpErrTls');
-  if (r.includes('dns') || r.includes('resolve'))
-    return t('rdpErrDns');
-  if (r.includes('refused') || r.includes('reset'))
-    return t('rdpErrRefused');
-  if (r.includes('timeout') || r.includes('timed out'))
-    return t('rdpErrTimeout');
-  if (r.includes('read frame by hint') || r.includes('read frame'))
-    return t('rdpErrNoResponse');
-  if (r.includes('rdcleanpath'))
-    return t('rdpErrWsClosed');
-  if (r.includes('websocket') || r.includes('ws://'))
-    return t('rdpErrWsClosed');
-  if (r.includes('canvas'))
-    return t('rdpErrCanvas');
-  if (r.includes('another user connected') || r.includes('forcing the disconnection'))
-    return t('rdpErrAnotherUser');
-  if (r.includes('administratively'))
-    return t('rdpErrAdmin');
-  if (r.includes('idle timeout'))
-    return t('rdpErrIdleTimeout');
-  // fallback: return the original but truncated
-  return raw.length > 200 ? raw.slice(0, 200) + '…' : raw;
 }
 
 let wasmModule: IronRdpWasm | null = null;
