@@ -95,6 +95,13 @@ export interface ConnectionsData {
   uploadTotal: number;
 }
 
+export interface FreeRdpLaunchInfo {
+  pid: number;
+  executable: string;
+  route: string;
+  proxy_port?: number | null;
+}
+
 export const api = {
   startEngine: (forceInternal?: boolean) =>
     invoke<boolean>('start_engine', { forceInternal: forceInternal ?? null }),
@@ -185,6 +192,33 @@ export const api = {
     invoke<void>('trigger_sync_now'),
 
   // ── Native RDP Session ──────────────────────────────
+  rdpFreeRdpConnect: (params: {
+    tabId: string;
+    host: string;
+    port: number;
+    username: string;
+    password: string;
+    domain?: string;
+    width: number;
+    height: number;
+    left: number;
+    top: number;
+  }) => invoke<FreeRdpLaunchInfo>('rdp_freerdp_connect', params),
+
+  rdpFreeRdpDisconnect: (tabId: string) =>
+    invoke<void>('rdp_freerdp_disconnect', { tabId }),
+
+  rdpFreeRdpPlace: (params: {
+    tabId: string;
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+  }) => invoke<void>('rdp_freerdp_place', params),
+
+  rdpFreeRdpSetVisible: (tabId: string, visible: boolean) =>
+    invoke<void>('rdp_freerdp_set_visible', { tabId, visible }),
+
   rdpNativeConnect: (params: {
     tabId: string;
     host: string;

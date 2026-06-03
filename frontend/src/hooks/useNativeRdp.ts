@@ -10,11 +10,16 @@
 import { useEffect, useRef } from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { RdpPointerEvent, RdpStatusEvent } from '@/api';
+import { compactNativeFrameQueue } from '@/lib/native-frame-queue';
 import { rdpLog } from '@/lib/rdp-logger';
 
 const GFX_FRAME_MAGIC = 0xffff;
 const GFX_FRAME_KIND_H264 = 1;
 const GFX_FRAME_HEADER_SIZE = 20;
+const BITMAP_FLUSH_BUDGET_MS = 8;
+const BITMAP_QUEUE_COMPACT_THRESHOLD = 48;
+const BITMAP_QUEUE_HARD_LIMIT = 180;
+const BITMAP_BACKLOG_WARN_THRESHOLD = 120;
 
 export interface NativeGfxH264Frame {
   surfaceId: number;
@@ -182,6 +187,7 @@ export function connectFrameWebSocket(
   canvas: HTMLCanvasElement,
   onFrame?: () => void,
   onGfxH264Frame?: (frame: NativeGfxH264Frame) => void,
+  onUnexpectedClose?: (event: CloseEvent) => void,
 ): () => void {
   const renderer = initGL2(canvas);
   if (!renderer) {
@@ -205,19 +211,82 @@ export function connectFrameWebSocket(
   let currentH = 0;
   let textureInitialized = false;
 
-  // ── rAF draw batching ──
+  // ── rAF frame/upload batching ──
+  // WebSocket events can arrive in bursts during window drag/selection.
+  // Queueing them into the next rAF keeps texture uploads aligned to the
+  // browser's paint cadence instead of slicing the main thread per packet.
+  const frameQueue: ArrayBuffer[] = [];
   let needsDraw = false;
-  let rafId = 0;
+  let renderRafId = 0;
+  let highQueueLogged = false;
+  let lastBatchLogAt = 0;
+  let lastCompactLogAt = 0;
 
-  function scheduleDraw() {
-    if (!needsDraw) {
-      needsDraw = true;
-      rafId = requestAnimationFrame(() => {
-        if (needsDraw) {
-          gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-          needsDraw = false;
-        }
+  function markNeedsDraw() {
+    needsDraw = true;
+  }
+
+  function scheduleFrameFlush() {
+    if (renderRafId !== 0) return;
+    renderRafId = requestAnimationFrame(flushFrameQueue);
+  }
+
+  function flushFrameQueue() {
+    renderRafId = 0;
+    const startedAt = performance.now();
+    let processed = 0;
+    const queuedAtStart = frameQueue.length;
+
+    while (processed < queuedAtStart) {
+      const raw = frameQueue[processed];
+      try {
+        handleBitmapFrame(raw);
+        processed++;
+      } catch (error) {
+        rdpLog.error('render', 'native frame handling failed', {
+          wsPort,
+          byteLength: raw.byteLength,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+
+      if (processed > 0 && performance.now() - startedAt >= BITMAP_FLUSH_BUDGET_MS) {
+        break;
+      }
+    }
+
+    if (processed > 0) {
+      frameQueue.splice(0, processed);
+    }
+
+    if (needsDraw) {
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      needsDraw = false;
+    }
+
+    const elapsed = performance.now() - startedAt;
+    const now = performance.now();
+    const hasBacklog = frameQueue.length > 0;
+    if (
+      processed > 0 &&
+      (elapsed > BITMAP_FLUSH_BUDGET_MS || queuedAtStart > 32 || hasBacklog) &&
+      now - lastBatchLogAt > 1000
+    ) {
+      lastBatchLogAt = now;
+      rdpLog.debug('render', 'native frame batch flushed', {
+        wsPort,
+        processed,
+        queuedAtStart,
+        remaining: frameQueue.length,
+        ms: Math.round(elapsed * 10) / 10,
       });
+    }
+
+    if (hasBacklog) {
+      scheduleFrameFlush();
+    } else if (highQueueLogged) {
+      highQueueLogged = false;
     }
   }
 
@@ -244,6 +313,7 @@ export function connectFrameWebSocket(
   // ── WebSocket ──
   const ws = new WebSocket(`ws://127.0.0.1:${wsPort}`);
   ws.binaryType = 'arraybuffer';
+  let closedByCleanup = false;
 
   ws.onopen = () => {
     console.log(`[frame-ws] connected to port ${wsPort}`);
@@ -251,17 +321,36 @@ export function connectFrameWebSocket(
   };
 
   ws.onmessage = (event: MessageEvent) => {
-    const raw: ArrayBuffer = event.data;
-    try {
-      handleBitmapFrame(raw);
-    } catch (error) {
-      rdpLog.error('render', 'native frame handling failed', {
-        wsPort,
-        byteLength: raw.byteLength,
-        error: error instanceof Error ? error.message : String(error),
+    frameQueue.push(event.data);
+    if (frameQueue.length > BITMAP_QUEUE_COMPACT_THRESHOLD) {
+      const compacted = compactNativeFrameQueue(frameQueue, {
+        maxFrames: BITMAP_QUEUE_HARD_LIMIT,
       });
-      throw error;
+      if (
+        compacted.droppedDuplicateFrames > 0 ||
+        compacted.droppedOverflowFrames > 0
+      ) {
+        frameQueue.splice(0, frameQueue.length, ...compacted.frames);
+        const now = performance.now();
+        if (now - lastCompactLogAt > 1000) {
+          lastCompactLogAt = now;
+          rdpLog.debug('render', 'native frame queue compacted', {
+            wsPort,
+            queued: frameQueue.length,
+            droppedDuplicateFrames: compacted.droppedDuplicateFrames,
+            droppedOverflowFrames: compacted.droppedOverflowFrames,
+          });
+        }
+      }
     }
+    if (!highQueueLogged && frameQueue.length > BITMAP_BACKLOG_WARN_THRESHOLD) {
+      highQueueLogged = true;
+      rdpLog.warn('render', 'native frame queue is backing up', {
+        wsPort,
+        queued: frameQueue.length,
+      });
+    }
+    scheduleFrameFlush();
   };
 
   // ── Bitmap frame handler (with LZ4 decompression) ──
@@ -321,7 +410,6 @@ export function connectFrameWebSocket(
       );
       textureInitialized = true;
       needsDraw = false;
-      cancelAnimationFrame(rafId);
     }
 
     if (!textureInitialized) return;
@@ -355,7 +443,7 @@ export function connectFrameWebSocket(
       gl.RGBA, gl.UNSIGNED_BYTE, pixelData,
     );
 
-    scheduleDraw();
+    markNeedsDraw();
     onFrame?.();
     logFps();
   }
@@ -405,15 +493,33 @@ export function connectFrameWebSocket(
     rdpLog.error('render', 'native frame websocket error', { wsPort });
   };
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
     console.log('[frame-ws] disconnected');
-    rdpLog.info('render', 'native frame websocket closed', { wsPort });
-    cancelAnimationFrame(rafId);
+    rdpLog.info('render', 'native frame websocket closed', {
+      wsPort,
+      code: event.code,
+      reason: event.reason,
+      wasClean: event.wasClean,
+      closedByCleanup,
+    });
+    if (renderRafId !== 0) {
+      cancelAnimationFrame(renderRafId);
+      renderRafId = 0;
+    }
+    frameQueue.length = 0;
+    if (!closedByCleanup) {
+      onUnexpectedClose?.(event);
+    }
   };
 
   // Cleanup function
   return () => {
-    cancelAnimationFrame(rafId);
+    closedByCleanup = true;
+    if (renderRafId !== 0) {
+      cancelAnimationFrame(renderRafId);
+      renderRafId = 0;
+    }
+    frameQueue.length = 0;
     if (ws.readyState <= WebSocket.OPEN) {
       ws.close();
     }

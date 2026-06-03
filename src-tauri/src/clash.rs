@@ -212,8 +212,17 @@ pub async fn get_active_proxy(api_base: &str, group_name: &str) -> Option<String
         .map(|s| s.to_string())
 }
 
-/// Switch proxy in a group
-pub async fn switch_proxy(api_base: &str, group_name: &str, proxy_name: &str) -> bool {
+/// Switch proxy in a group.
+///
+/// By default, NextDesk must not interrupt active RDP/SSH sessions when the user
+/// tests latency or changes the preferred node. Existing TCP flows continue on
+/// their current chain; the new selection applies to subsequent connections.
+pub async fn switch_proxy(
+    api_base: &str,
+    group_name: &str,
+    proxy_name: &str,
+    close_active_rdp: bool,
+) -> bool {
     let client = http_client();
     let encoded = encode_proxy_name(group_name);
     let url = format!("{api_base}/proxies/{encoded}");
@@ -222,9 +231,15 @@ pub async fn switch_proxy(api_base: &str, group_name: &str, proxy_name: &str) ->
         Ok(resp) => {
             let success = resp.status().as_u16() == 204;
             if success {
-                // Close existing RDP connections (port 3389/22) that were routed
-                // through this group, so they reconnect via the new node
-                close_rdp_connections(api_base, group_name).await;
+                if close_active_rdp {
+                    // Explicit reconnect path only. The normal UI switch path
+                    // keeps active RDP/SSH flows alive to avoid frame stalls.
+                    close_rdp_connections(api_base, group_name).await;
+                } else {
+                    eprintln!(
+                        "[clash] Switched {group_name} to {proxy_name}; preserving active RDP/SSH connections"
+                    );
+                }
             }
             success
         }

@@ -1,7 +1,8 @@
 {
   "bundle": {
     "resources": {
-      "../.backend/bin/nextdesk-core": "bin/nextdesk-core"
+      "../.backend/bin/nextdesk-core": "bin/nextdesk-core",
+      "../.backend/freerdp/macos/bin": "bin/freerdp"
     }
   }
 }

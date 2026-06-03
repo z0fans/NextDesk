@@ -32,13 +32,16 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: aarch64-apple-darwin
 
       - name: Install dependencies
         run: npm install && cd frontend && npm install
 
+      - name: Install FreeRDP
+        run: brew install freerdp
+
       - name: Download mihomo & geodata
-        run: bash scripts/download-deps.sh universal-apple-darwin
+        run: bash scripts/download-deps.sh aarch64-apple-darwin
 
       - name: Sanitize signing key
         run: |
@@ -50,7 +53,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          args: --target universal-apple-darwin --config src-tauri/tauri.macos.conf.json
+          args: --target aarch64-apple-darwin --config src-tauri/tauri.macos.conf.json
           tagName: ${{ github.ref_name }}
           releaseName: "NextDesk ${{ github.ref_name }}"
           releaseBody: "See the assets below for download."
@@ -83,6 +86,18 @@ jobs:
 
       - name: Install dependencies
         run: npm install && cd frontend && npm install
+
+      - name: Install FreeRDP
+        shell: pwsh
+        run: choco install freerdp -y --no-progress
+
+      - name: Package FreeRDP
+        shell: pwsh
+        run: ./scripts/package-freerdp-windows.ps1
+
+      - name: Verify FreeRDP resources
+        shell: bash
+        run: bash scripts/verify-freerdp-windows.sh
 
       - name: Download mihomo & geodata
         shell: bash

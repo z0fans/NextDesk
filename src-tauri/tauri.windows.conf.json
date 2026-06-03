@@ -1,7 +1,8 @@
 {
   "bundle": {
     "resources": {
-      "../.backend/bin/nextdesk-core.exe": "bin/nextdesk-core.exe"
+      "../.backend/bin/nextdesk-core.exe": "bin/nextdesk-core.exe",
+      "../.backend/freerdp/windows/bin": "bin/freerdp"
     },
     "windows": {
       "webviewInstallMode": {
