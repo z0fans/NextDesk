@@ -469,8 +469,8 @@ fn find_freerdp_executable(app: &AppHandle) -> Result<PathBuf, String> {
     }
 
     Err(format!(
-        "FreeRDP sidecar not found. Install FreeRDP or set NEXTDESK_FREERDP_BIN. Checked executable name '{}'.",
-        freerdp_executable_name()
+        "FreeRDP sidecar not found. Install FreeRDP or set NEXTDESK_FREERDP_BIN. Checked executable names: {}.",
+        freerdp_executable_names().join(", ")
     ))
 }
 
@@ -479,33 +479,45 @@ fn is_executable_candidate(path: &Path) -> bool {
 }
 
 fn freerdp_candidate_paths(resource_dir: Option<&Path>) -> Vec<PathBuf> {
-    let exe = freerdp_executable_name();
     let mut candidates = Vec::new();
 
-    if let Some(resource_dir) = resource_dir {
-        candidates.push(resource_dir.join("bin").join("freerdp").join(exe));
-        candidates.push(resource_dir.join("bin").join(exe));
-        candidates.push(resource_dir.join(exe));
+    for exe in freerdp_executable_names() {
+        if let Some(resource_dir) = resource_dir {
+            candidates.push(resource_dir.join("bin").join("freerdp").join(exe));
+            candidates.push(resource_dir.join("bin").join(exe));
+            candidates.push(resource_dir.join(exe));
+        }
     }
 
     #[cfg(target_os = "macos")]
     {
-        candidates.push(PathBuf::from("/opt/homebrew/bin").join(exe));
-        candidates.push(PathBuf::from("/usr/local/bin").join(exe));
+        for exe in freerdp_executable_names() {
+            candidates.push(PathBuf::from("/opt/homebrew/bin").join(exe));
+            candidates.push(PathBuf::from("/usr/local/bin").join(exe));
+        }
     }
 
     if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join(exe)));
+        for dir in std::env::split_paths(&path) {
+            for exe in freerdp_executable_names() {
+                candidates.push(dir.join(exe));
+            }
+        }
     }
 
     candidates
 }
 
-fn freerdp_executable_name() -> &'static str {
+fn freerdp_executable_names() -> &'static [&'static str] {
     if cfg!(target_os = "windows") {
-        "sdl-freerdp.exe"
+        &[
+            "wfreerdp.exe",
+            "sdl3-freerdp.exe",
+            "sdl2-freerdp.exe",
+            "sdl-freerdp.exe",
+        ]
     } else {
-        "sdl-freerdp"
+        &["sdl-freerdp"]
     }
 }
 
