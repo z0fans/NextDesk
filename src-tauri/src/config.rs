@@ -7,13 +7,56 @@ use std::process::Command as StdCommand;
 
 use crate::state::{ProxyGroup, Server};
 
-const SOCKS_PORT: u16 = 17897;
 const SERVER_AMERICAS_GROUP: &str = "🖥 Server-Americas";
 const SERVER_ASIA_GROUP: &str = "🖥 Server-Asia";
 const SERVER_GLOBAL_GROUP: &str = "🖥 Server-Global";
 const AUTO_AMERICAS_GROUP: &str = "⚡ Auto-Americas";
 const AUTO_ASIA_GROUP: &str = "⚡ Auto-Asia";
 const AUTO_GLOBAL_GROUP: &str = "⚡ Auto-Global";
+const DEFAULT_RUNTIME_FRONTMATTER: &str = r#"
+port: 17890
+socks-port: 17897
+allow-lan: false
+bind-address: "*"
+mode: rule
+log-level: info
+ipv6: false
+external-controller: 127.0.0.1:17891
+profile:
+  store-selected: true
+  store-fake-ip: true
+unified-delay: true
+tcp-concurrent: true
+dns:
+  enable: true
+  cache-algorithm: arc
+  prefer-h3: false
+  use-hosts: true
+  use-system-hosts: true
+  listen: 127.0.0.1:11053
+  ipv6: false
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  proxy-server-nameserver:
+    - https://dns.alidns.com/dns-query
+    - https://doh.pub/dns-query
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - '*.lan'
+    - '*.local'
+    - '*.arpa'
+    - 'time.*.com'
+    - 'ntp.*.com'
+    - '+.market.xiaomi.com'
+    - 'localhost.ptlogin2.qq.com'
+    - '*.msftncsi.com'
+    - 'www.msftconnecttest.com'
+"#;
 
 pub(crate) fn is_subscription_metadata_proxy_name(name: &str) -> bool {
     let lower = name.trim().to_lowercase();
@@ -344,14 +387,7 @@ pub fn generate_clash_config(proxies: &[serde_yaml::Value]) -> PathBuf {
     let rules = build_rdp_rules(&group_names);
 
     // ── Assemble config ──
-    let mut config = serde_yaml::Mapping::new();
-    insert_yaml_int(&mut config, "port", 17890);
-    insert_yaml_int(&mut config, "socks-port", SOCKS_PORT as i64);
-    insert_yaml_str(&mut config, "external-controller", "127.0.0.1:17891");
-    config.insert(ykey("allow-lan"), serde_yaml::Value::Bool(false));
-    insert_yaml_str(&mut config, "mode", "rule");
-    config.insert(ykey("geodata-mode"), serde_yaml::Value::Bool(false));
-    config.insert(ykey("geo-auto-update"), serde_yaml::Value::Bool(true));
+    let mut config = default_runtime_frontmatter();
     config.insert(
         ykey("proxies"),
         serde_yaml::Value::Sequence(proxies.to_vec()),
@@ -397,20 +433,7 @@ pub fn generate_clash_config_from_subscription(raw_config: &serde_yaml::Value) -
         rdp_groups.iter().map(proxy_group_to_yaml).collect();
     let filtered_rules = build_rdp_rules(&group_names);
 
-    let mode = map
-        .get(&ykey("mode"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("rule");
-
-    let mut config = serde_yaml::Mapping::new();
-    insert_yaml_int(&mut config, "port", 17890);
-    insert_yaml_int(&mut config, "socks-port", SOCKS_PORT as i64);
-    insert_yaml_str(&mut config, "external-controller", "127.0.0.1:17891");
-    config.insert(ykey("allow-lan"), serde_yaml::Value::Bool(false));
-    insert_yaml_str(&mut config, "mode", mode);
-    config.insert(ykey("geodata-mode"), serde_yaml::Value::Bool(false));
-    config.insert(ykey("geo-auto-update"), serde_yaml::Value::Bool(false));
-
+    let mut config = default_runtime_frontmatter();
     config.insert(
         ykey("proxies"),
         serde_yaml::Value::Sequence(filtered_proxies),
@@ -421,44 +444,11 @@ pub fn generate_clash_config_from_subscription(raw_config: &serde_yaml::Value) -
     );
     config.insert(ykey("rules"), serde_yaml::Value::Sequence(filtered_rules));
 
-    if let Some(dns) = map.get(&ykey("dns")) {
-        config.insert(ykey("dns"), dns.clone());
-    }
-
-    // Preserve important Clash Meta settings from original config
-    for key in &[
-        "unified-delay",
-        "tcp-concurrent",
-        "global-client-fingerprint",
-        "find-process-mode",
-        "profile",
-        "sniffer",
-    ] {
+    // Keep protocol-level knobs from the subscription, but keep the runtime
+    // DNS/fake-ip header fixed to NextDesk's validated template.
+    for key in &["global-client-fingerprint", "find-process-mode"] {
         if let Some(val) = map.get(&ykey(key)) {
             config.insert(ykey(key), val.clone());
-        }
-    }
-
-    // Override DNS listen port to avoid conflict with external Clash instances
-    // and add proxy-server-nameserver to bypass fake-ip for proxy server domains
-    if let Some(dns) = config.get_mut(&ykey("dns")) {
-        if let Some(dns_map) = dns.as_mapping_mut() {
-            dns_map.insert(
-                ykey("listen"),
-                serde_yaml::Value::String("127.0.0.1:11053".into()),
-            );
-
-            // Add proxy-server-nameserver if not present
-            // This is critical: without it, proxy server hostnames get fake-ip
-            // which creates a chicken-and-egg DNS resolution problem
-            if !dns_map.contains_key(&ykey("proxy-server-nameserver")) {
-                let nameservers = serde_yaml::Value::Sequence(vec![
-                    serde_yaml::Value::String("https://doh.pub/dns-query".into()),
-                    serde_yaml::Value::String("https://dns.alidns.com/dns-query".into()),
-                    serde_yaml::Value::String("tls://223.5.5.5".into()),
-                ]);
-                dns_map.insert(ykey("proxy-server-nameserver"), nameservers);
-            }
         }
     }
 
@@ -514,6 +504,14 @@ pub fn patch_runtime_ports(config_path: &PathBuf, ports: RuntimePorts) -> Result
     let yaml_str = serde_yaml::to_string(&config)
         .map_err(|e| format!("Serialize runtime config failed: {e}"))?;
     fs::write(config_path, yaml_str).map_err(|e| format!("Write runtime config failed: {e}"))
+}
+
+fn default_runtime_frontmatter() -> serde_yaml::Mapping {
+    serde_yaml::from_str::<serde_yaml::Value>(DEFAULT_RUNTIME_FRONTMATTER)
+        .expect("NextDesk runtime frontmatter template must parse")
+        .as_mapping()
+        .expect("NextDesk runtime frontmatter template must be a map")
+        .clone()
 }
 
 fn ykey(s: &str) -> serde_yaml::Value {
@@ -673,11 +671,15 @@ fn insert_yaml_int(m: &mut serde_yaml::Mapping, key: &str, val: i64) {
 mod tests {
     use super::{
         build_rdp_proxy_groups, build_rdp_rules, build_rdp_runtime_proxy_groups, ensure_port_rule,
-        generate_clash_config_from_subscription, get_user_config_dir, is_selectable_proxy_name,
-        patch_runtime_ports, preferred_rdp_catch_all_group, real_proxy_names_from_yaml, ykey,
-        RuntimePorts, SERVER_AMERICAS_GROUP, SERVER_ASIA_GROUP, SERVER_GLOBAL_GROUP,
+        generate_clash_config, generate_clash_config_from_subscription, get_user_config_dir,
+        is_selectable_proxy_name, patch_runtime_ports, preferred_rdp_catch_all_group,
+        real_proxy_names_from_yaml, ykey, RuntimePorts, SERVER_AMERICAS_GROUP, SERVER_ASIA_GROUP,
+        SERVER_GLOBAL_GROUP,
     };
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static CONFIG_FILE_LOCK: Mutex<()> = Mutex::new(());
 
     fn proxy(name: &str) -> serde_yaml::Value {
         let mut map = serde_yaml::Mapping::new();
@@ -793,6 +795,7 @@ mod tests {
 
     #[test]
     fn subscription_runtime_config_drops_tun_settings() {
+        let _guard = CONFIG_FILE_LOCK.lock().unwrap();
         let config_path = get_user_config_dir().join("runtime_clash.yaml");
         let previous = std::fs::read(&config_path).ok();
 
@@ -831,6 +834,107 @@ proxies:
         assert!(
             !map.contains_key(&ykey("tun")),
             "NextDesk runtime config must not inherit subscription TUN"
+        );
+    }
+
+    #[test]
+    fn subscription_runtime_config_adds_dns_when_subscription_has_none() {
+        let _guard = CONFIG_FILE_LOCK.lock().unwrap();
+        let config_path = get_user_config_dir().join("runtime_clash.yaml");
+        let previous = std::fs::read(&config_path).ok();
+
+        let raw_config: serde_yaml::Value = serde_yaml::from_str(
+            r#"
+mode: rule
+proxies:
+  - name: "US Server Only 01"
+    type: vless
+    server: example.com
+    port: 443
+"#,
+        )
+        .expect("test fixture should parse");
+
+        let generated_path = generate_clash_config_from_subscription(&raw_config);
+        let generated =
+            std::fs::read_to_string(&generated_path).expect("runtime config should be written");
+
+        if let Some(bytes) = previous {
+            std::fs::write(&config_path, bytes).ok();
+        } else {
+            std::fs::remove_file(&config_path).ok();
+        }
+
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(&generated).expect("runtime config should parse");
+        let dns = doc
+            .as_mapping()
+            .and_then(|map| map.get(&ykey("dns")))
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("runtime config should include dns");
+
+        assert_eq!(
+            dns.get(&ykey("enable"))
+                .and_then(serde_yaml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            dns.get(&ykey("listen")).and_then(serde_yaml::Value::as_str),
+            Some("127.0.0.1:11053")
+        );
+        assert!(
+            dns.contains_key(&ykey("proxy-server-nameserver")),
+            "proxy server hostnames must not depend on fake-ip/system DNS"
+        );
+        assert_eq!(
+            dns.get(&ykey("enhanced-mode"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("fake-ip")
+        );
+        assert!(
+            !dns.contains_key(&ykey("nameserver-policy")),
+            "runtime DNS should stay aligned with the active ClashX Meta vless.yaml baseline"
+        );
+        assert!(
+            dns.get(&ykey("fake-ip-filter"))
+                .and_then(serde_yaml::Value::as_sequence)
+                .map(|items| items.len() == 9)
+                .unwrap_or(false),
+            "runtime fake-ip filter should match the active ClashX Meta vless.yaml baseline"
+        );
+    }
+
+    #[test]
+    fn generated_runtime_config_adds_dns_for_proxy_only_inputs() {
+        let _guard = CONFIG_FILE_LOCK.lock().unwrap();
+        let config_path = get_user_config_dir().join("runtime_clash.yaml");
+        let previous = std::fs::read(&config_path).ok();
+        let generated_path = generate_clash_config(&[proxy("US Server Only 01")]);
+        let generated =
+            std::fs::read_to_string(&generated_path).expect("runtime config should be written");
+
+        if let Some(bytes) = previous {
+            std::fs::write(&config_path, bytes).ok();
+        } else {
+            std::fs::remove_file(&config_path).ok();
+        }
+
+        let doc: serde_yaml::Value =
+            serde_yaml::from_str(&generated).expect("runtime config should parse");
+        let dns = doc
+            .as_mapping()
+            .and_then(|map| map.get(&ykey("dns")))
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("runtime config should include dns");
+
+        assert!(
+            dns.contains_key(&ykey("proxy-server-nameserver")),
+            "proxy-only subscriptions still need proxy server DNS"
+        );
+        assert_eq!(
+            dns.get(&ykey("enhanced-mode"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("fake-ip")
         );
     }
 
