@@ -56,6 +56,27 @@ fn internal_engine_running(app_state: &AppState) -> bool {
     }
 }
 
+async fn clash_api_ready(api_base: &str) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .no_proxy()
+        .build()
+        .unwrap_or_default();
+
+    match client.get(format!("{api_base}/version")).send().await {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+fn discard_internal_engine(app_state: &AppState) {
+    let mut proc = app_state.clash_process.lock().unwrap();
+    if let Some(child) = proc.as_mut() {
+        let _ = child.start_kill();
+    }
+    *proc = None;
+}
+
 fn is_private_or_reserved_host(host: &str) -> bool {
     match host.parse::<IpAddr>() {
         Ok(IpAddr::V4(ip)) => {
@@ -111,8 +132,14 @@ fn choose_runtime_ports() -> Result<config::RuntimePorts, String> {
 
 async fn start_engine_inner(app_state: &AppState) -> Result<bool, String> {
     if internal_engine_running(app_state) {
-        log::info!("[start_engine] Internal Clash already running");
-        return Ok(true);
+        let api_base = app_state.clash_api_base.lock().unwrap().clone();
+        if !api_base.is_empty() && clash_api_ready(&api_base).await {
+            log::info!("[start_engine] Internal Clash already running");
+            return Ok(true);
+        }
+
+        log::warn!("[start_engine] Existing Clash process is running but API is not ready; restarting");
+        discard_internal_engine(app_state);
     }
 
     // Always use independent kernel — no reuse mode
@@ -174,6 +201,8 @@ async fn start_engine_inner(app_state: &AppState) -> Result<bool, String> {
                 });
             } else {
                 eprintln!("[start_engine] Warning: Clash API not ready after 120s");
+                discard_internal_engine(app_state);
+                return Err("Internal Clash API not ready; SOCKS5 proxy is unavailable".into());
             }
             Ok(true)
         }
