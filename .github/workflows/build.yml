@@ -5,12 +5,23 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Build target for manual packaging tests'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - macos
+          - windows
 
 env:
   MIHOMO_VERSION: v1.19.21
 
 jobs:
   build-macos:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos' }}
     runs-on: macos-latest
     permissions:
       contents: write
@@ -63,6 +74,12 @@ jobs:
 
   build-windows:
     needs: build-macos
+    if: >-
+      ${{
+        always()
+        && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows')
+        && ((github.event_name == 'workflow_dispatch' && inputs.platform == 'windows') || needs.build-macos.result == 'success')
+      }}
     runs-on: windows-latest
     permissions:
       contents: write
