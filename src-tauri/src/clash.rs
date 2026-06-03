@@ -1,8 +1,9 @@
 use reqwest::Client;
 use serde_json::Value;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::{Child, Command};
 
 use crate::config::{get_log_dir, get_user_config_dir};
@@ -138,7 +139,9 @@ pub async fn start_clash_process() -> Result<Child, String> {
         .try_clone()
         .map_err(|e| format!("Clone failed: {e}"))?;
 
-    let mut cmd = Command::new(&mihomo_path);
+    let runtime_mihomo_path = prepare_runtime_engine_binary(&mihomo_path)?;
+
+    let mut cmd = Command::new(&runtime_mihomo_path);
     cmd.arg("-f")
         .arg(&config_path)
         .arg("-d")
@@ -163,6 +166,41 @@ pub async fn start_clash_process() -> Result<Child, String> {
     let child = cmd.spawn().map_err(|e| format!("Spawn failed: {e}"))?;
 
     Ok(child)
+}
+
+fn prepare_runtime_engine_binary(source: &Path) -> Result<PathBuf, String> {
+    let runtime_dir = std::env::temp_dir().join("nextdesk-core-runtime");
+    fs::create_dir_all(&runtime_dir)
+        .map_err(|e| format!("Create runtime engine dir failed: {e}"))?;
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let extension = source
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| format!(".{ext}"))
+        .unwrap_or_default();
+    let runtime_path =
+        runtime_dir.join(format!("nextdesk-core-{}-{suffix}{extension}", std::process::id()));
+
+    fs::copy(source, &runtime_path)
+        .map_err(|e| format!("Copy runtime engine binary failed: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("Set runtime engine permission failed: {e}"))?;
+    }
+
+    eprintln!(
+        "[clash] runtime core: {} -> {}",
+        source.display(),
+        runtime_path.display()
+    );
+    Ok(runtime_path)
 }
 
 /// Get bin directory (next to executable or project root)
