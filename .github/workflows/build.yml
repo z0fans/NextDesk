@@ -74,7 +74,13 @@ jobs:
           includeUpdaterJson: true
 
   build-macos-intel:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.platform == 'macos-intel' }}
+    needs: build-macos
+    if: >-
+      ${{
+        always()
+        && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos-intel')
+        && ((github.event_name == 'workflow_dispatch' && inputs.platform == 'macos-intel') || needs.build-macos.result == 'success')
+      }}
     runs-on: macos-13
     permissions:
       contents: write
@@ -126,12 +132,15 @@ jobs:
           includeUpdaterJson: true
 
   build-windows:
-    needs: build-macos
+    needs: [build-macos, build-macos-intel]
     if: >-
       ${{
         always()
         && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows')
-        && ((github.event_name == 'workflow_dispatch' && inputs.platform == 'windows') || needs.build-macos.result == 'success')
+        && (
+          (github.event_name == 'workflow_dispatch' && inputs.platform == 'windows')
+          || (needs.build-macos.result == 'success' && needs.build-macos-intel.result == 'success')
+        )
       }}
     runs-on: windows-latest
     permissions:
