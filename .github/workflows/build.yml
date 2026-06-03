@@ -89,7 +89,7 @@ jobs:
 
       - name: Install FreeRDP
         shell: pwsh
-        run: choco install freerdp -y --no-progress
+        run: choco install freerdp.portable -y --no-progress
 
       - name: Package FreeRDP
         shell: pwsh
