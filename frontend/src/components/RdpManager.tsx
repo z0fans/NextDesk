@@ -10,13 +10,14 @@ import { Monitor } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useTranslation } from '@/i18n/useTranslation';
-import type { TranslationKey } from '@/i18n/translations';
 import { codeToScancode } from '@/lib/scancodeMap';
 
 import DecodeWorkerUrl from '@/lib/decode-worker.ts?worker&url';
 import { rdpLog } from '@/lib/rdp-logger';
 import { api } from '@/api';
 import { useNativeRdp, connectFrameWebSocket, type NativeGfxH264Frame } from '@/hooks/useNativeRdp';
+import { drawDecodedH264FrameToOverlay } from '@/lib/h264-overlay';
+import { friendlyRdpError, isNonRecoverableRdpError } from '@/lib/rdp-errors';
 
 /**
  * Native RDP mode flag.
@@ -25,6 +26,8 @@ import { useNativeRdp, connectFrameWebSocket, type NativeGfxH264Frame } from '@/
  */
 const USE_NATIVE_RDP = true;
 const USE_NATIVE_GFX_H264 = true;
+const USE_FREERDP_SIDECAR = true;
+const FALLBACK_TO_IRONRDP_ON_FREERDP_ERROR = true;
 const ADAPTIVE_RESIZE_DEBOUNCE_MS = 800;
 const ADAPTIVE_RESIZE_THRESHOLD_PX = 20;
 const THUMBNAIL_CAPTURE_INTERVAL_MS = 10000;
@@ -326,47 +329,6 @@ interface WasmSession {
   synchronizeLockKeys(scroll_lock: boolean, num_lock: boolean, caps_lock: boolean, kana_lock: boolean): void;
 }
 
-/** Map raw RDP/WASM errors to user-friendly messages */
-function friendlyRdpError(raw: string, t: (key: TranslationKey) => string): string {
-  const r = raw.toLowerCase();
-  if (r.includes('status_logon_failure') || r.includes('0xc000006d'))
-    return t('rdpErrLoginFailed');
-  if (r.includes('status_account_disabled') || r.includes('0xc0000072'))
-    return t('rdpErrAccountDisabled');
-  if (r.includes('status_account_locked') || r.includes('0xc0000234'))
-    return t('rdpErrAccountLocked');
-  if (r.includes('status_password_expired') || r.includes('0xc0000071'))
-    return t('rdpErrPasswordExpired');
-  if (r.includes('status_account_expired') || r.includes('0xc0000193'))
-    return t('rdpErrAccountExpired');
-  if (r.includes('status_password_must_change') || r.includes('0xc0000224'))
-    return t('rdpErrPasswordMustChange');
-  if (r.includes('credssp'))
-    return t('rdpErrCredSsp');
-  if (r.includes('tls') || r.includes('ssl') || r.includes('certificate'))
-    return t('rdpErrTls');
-  if (r.includes('dns') || r.includes('resolve'))
-    return t('rdpErrDns');
-  if (r.includes('refused') || r.includes('reset'))
-    return t('rdpErrRefused');
-  if (r.includes('timeout') || r.includes('timed out'))
-    return t('rdpErrTimeout');
-  if (r.includes('rdcleanpath'))
-    return t('rdpErrWsClosed');
-  if (r.includes('websocket') || r.includes('ws://'))
-    return t('rdpErrWsClosed');
-  if (r.includes('canvas'))
-    return t('rdpErrCanvas');
-  if (r.includes('another user connected') || r.includes('forcing the disconnection'))
-    return t('rdpErrAnotherUser');
-  if (r.includes('administratively'))
-    return t('rdpErrAdmin');
-  if (r.includes('idle timeout'))
-    return t('rdpErrIdleTimeout');
-  // fallback: return the original but truncated
-  return raw.length > 200 ? raw.slice(0, 200) + '…' : raw;
-}
-
 let wasmModule: IronRdpWasm | null = null;
 let wasmReady = false;
 async function loadWasm(): Promise<IronRdpWasm> {
@@ -450,13 +412,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
           const frame = msg.frame as VideoFrame;
           const overlay = h264OverlayRefs.current.get(tabId);
           if (overlay) {
-            if (overlay.width !== frame.displayWidth || overlay.height !== frame.displayHeight) {
-              overlay.width = frame.displayWidth;
-              overlay.height = frame.displayHeight;
-            }
-            const ctx2d = overlay.getContext('2d');
-            if (ctx2d) ctx2d.drawImage(frame, 0, 0, overlay.width, overlay.height);
-            overlay.style.opacity = '1';
+            drawDecodedH264FrameToOverlay(overlay, frame, msg.rect);
           }
           frame.close();
         } else if (msg.type === 'error') {
@@ -506,6 +462,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
 
   // Ref to track which tabs are connected via native backend
   const nativeTabsRef = useRef<Set<string>>(new Set());
+  const freeRdpTabsRef = useRef<Set<string>>(new Set());
 
   // ── Native RDP event rendering hook ──
   // Only active when USE_NATIVE_RDP is enabled
@@ -525,6 +482,16 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       if (userDisconnectedRef.current.has(tabId)) {
         store.updateTabStatus(tabId, 'disconnected');
       } else {
+        if (isNonRecoverableRdpError(message ?? '')) {
+          reconnectCountRef.current.delete(tabId);
+          rdpLog.warn('native', 'non-recoverable disconnect; auto-reconnect suppressed', {
+            tabId,
+            message,
+          });
+          store.updateTabStatus(tabId, 'error', friendlyRdpError(message ?? '', t));
+          return;
+        }
+
         // Auto-reconnect
         store.updateTabStatus(tabId, 'reconnecting');
         const count = reconnectCountRef.current.get(tabId) ?? 0;
@@ -541,7 +508,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
     } else if (status === 'error') {
       nativeTabsRef.current.delete(tabId);
       cleanupH264Worker(tabId);
-      store.updateTabStatus(tabId, 'error');
+      store.updateTabStatus(tabId, 'error', friendlyRdpError(message ?? '', t));
       rdpLog.error('native', `session error: ${message}`, { tabId });
     }
   }, [store, cleanupH264Worker]);
@@ -606,11 +573,60 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
   const getCanvasSize = useCallback(() => {
     const wrap = canvasWrapRef.current;
     if (!wrap) return { w: 1280, h: 720 };
-    const w = Math.floor(wrap.clientWidth);
-    const h = Math.floor(wrap.clientHeight);
+    const rect = wrap.getBoundingClientRect();
+    const w = Math.floor(rect.width || wrap.clientWidth);
+    const h = Math.floor(rect.height || wrap.clientHeight);
     rdpLog.debug('render', `getCanvasSize: ${w} x ${h}`);
     return { w: Math.max(w, 320), h: Math.max(h, 240) };
   }, []);
+
+  const getFreeRdpEmbedRect = useCallback(() => {
+    const wrap = canvasWrapRef.current;
+    if (!wrap) {
+      return { left: 0, top: 0, width: 1280, height: 720 };
+    }
+    const rect = wrap.getBoundingClientRect();
+    const left = Math.max(0, Math.floor(rect.left));
+    const top = Math.max(0, Math.floor(rect.top));
+    const width = Math.max(320, Math.floor(rect.width || wrap.clientWidth));
+    const height = Math.max(240, Math.floor(rect.height || wrap.clientHeight));
+    return { left, top, width, height };
+  }, []);
+
+  const placeFreeRdpSidecar = useCallback((tabId: string) => {
+    if (!freeRdpTabsRef.current.has(tabId)) return;
+    const rect = getFreeRdpEmbedRect();
+    api.rdpFreeRdpPlace({ tabId, ...rect }).catch((error) => {
+      rdpLog.warn('freerdp', 'failed to place FreeRDP sidecar window', {
+        tabId,
+        rect,
+        error: error?.message || String(error),
+      });
+    });
+  }, [getFreeRdpEmbedRect]);
+
+  const syncFreeRdpSidecarVisibility = useCallback(() => {
+    const activeTabId = activeTabIdRef.current;
+    const connectedTabs = new Set(
+      tabsRef.current
+        .filter(tab => tab.status === 'connected')
+        .map(tab => tab.id),
+    );
+
+    for (const tabId of freeRdpTabsRef.current) {
+      const visible = tabId === activeTabId && connectedTabs.has(tabId);
+      api.rdpFreeRdpSetVisible(tabId, visible).catch((error) => {
+        rdpLog.warn('freerdp', 'failed to update FreeRDP sidecar visibility', {
+          tabId,
+          visible,
+          error: error?.message || String(error),
+        });
+      });
+      if (visible) {
+        window.setTimeout(() => placeFreeRdpSidecar(tabId), 80);
+      }
+    }
+  }, [placeFreeRdpSidecar]);
 
   // ── Suppress adaptive resize when sidebar collapses/expands ──
   useEffect(() => {
@@ -717,6 +733,49 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         resizeCooldownRef.current = false;
       }, 1000);
 
+      if (USE_FREERDP_SIDECAR) {
+        try {
+          const embedRect = getFreeRdpEmbedRect();
+          rdpLog.info(
+            'freerdp',
+            `launching embedded FreeRDP sidecar: ${server.host}:${server.port} @ ${w}x${h} pos=${embedRect.left},${embedRect.top}`,
+          );
+          const launch = await api.rdpFreeRdpConnect({
+            tabId,
+            host: server.host,
+            port: server.port,
+            username: server.username,
+            password: server.password,
+            domain: server.domain || undefined,
+            width: w,
+            height: h,
+            left: embedRect.left,
+            top: embedRect.top,
+          });
+          rdpLog.info('freerdp', 'FreeRDP sidecar launched', {
+            tabId,
+            pid: launch.pid,
+            route: launch.route,
+            executable: launch.executable,
+          });
+          freeRdpTabsRef.current.add(tabId);
+          nativeTabsRef.current.delete(tabId);
+          connectingTabsRef.current.delete(tabId);
+          reconnectCountRef.current.delete(tabId);
+          store.updateTabStatus(tabId, 'connected');
+          window.setTimeout(syncFreeRdpSidecarVisibility, 0);
+          setRdpStats({ resolution: `${w}x${h}`, fps: 0, status: 'connected' });
+          return;
+        } catch (error: any) {
+          const message = error?.message || String(error);
+          rdpLog.error('freerdp', 'FreeRDP sidecar launch failed', { tabId, error: message });
+          if (!FALLBACK_TO_IRONRDP_ON_FREERDP_ERROR) {
+            throw error;
+          }
+          rdpLog.warn('freerdp', 'falling back to IronRDP renderer', { tabId });
+        }
+      }
+
       // ── Native RDP mode: connect via Rust backend ──
       if (USE_NATIVE_RDP) {
         rdpLog.info('native', `connecting natively: ${server.host}:${server.port} @ ${w}x${h}`);
@@ -724,7 +783,17 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         const handleNativeGfxFrame = USE_NATIVE_GFX_H264
           ? (frame: NativeGfxH264Frame) => {
               nativeGfxWorker?.postMessage(
-                { type: 'decode', data: frame.data, timestamp: performance.now() * 1000 },
+                {
+                  type: 'decode',
+                  data: frame.data,
+                  timestamp: performance.now() * 1000,
+                  rect: {
+                    left: frame.left,
+                    top: frame.top,
+                    right: frame.right,
+                    bottom: frame.bottom,
+                  },
+                },
                 [frame.data],
               );
             }
@@ -751,6 +820,26 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
             fpsCountRef.current++;
           },
           handleNativeGfxFrame,
+          (event) => {
+            const current = tabsRef.current.find(t => t.id === tabId);
+            if (
+              current &&
+              (current.status === 'connecting' || current.status === 'connected') &&
+              !userDisconnectedRef.current.has(tabId)
+            ) {
+              rdpLog.warn('render', 'native frame websocket closed unexpectedly', {
+                tabId,
+                wsPort,
+                code: event.code,
+                reason: event.reason,
+                wasClean: event.wasClean,
+              });
+              nativeTabsRef.current.delete(tabId);
+              cleanupH264Worker(tabId);
+              store.updateTabStatus(tabId, 'error', t('rdpFrameStreamDisconnected'));
+              setRdpStats(prev => ({ ...prev, status: 'disconnected' }));
+            }
+          },
         );
         // Store cleanup for later disconnection
         (window as any).__rdp_ws_cleanup__ = cleanupWs;
@@ -1384,22 +1473,9 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
             const msg = e.data;
             if (msg.type === 'frame') {
               const frame = msg.frame as VideoFrame;
-              // Draw decoded VideoFrame onto the H.264 overlay canvas (2D context).
-              // The WASM canvas is locked to WebGL2 — using getContext('2d') on it
-              // returns null. The overlay canvas is a separate element with its own 2D ctx.
               const overlay = h264OverlayRefs.current.get(tabId);
               if (overlay) {
-                // Resize overlay to match frame if needed
-                if (overlay.width !== frame.displayWidth || overlay.height !== frame.displayHeight) {
-                  overlay.width = frame.displayWidth;
-                  overlay.height = frame.displayHeight;
-                }
-                const ctx2d = overlay.getContext('2d');
-                if (ctx2d) {
-                  ctx2d.drawImage(frame, 0, 0, overlay.width, overlay.height);
-                }
-                // Make overlay visible on first H.264 frame
-                overlay.style.opacity = '1';
+                drawDecodedH264FrameToOverlay(overlay, frame, msg.rect);
               }
               frame.close();
             } else if (msg.type === 'error') {
@@ -1417,7 +1493,17 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
           if (type === 'h264_frame' && decodeWorkerRef.current) {
             const buf = data.data.buffer.slice(0);
             decodeWorkerRef.current.postMessage(
-              { type: 'decode', data: buf, timestamp: performance.now() * 1000 },
+              {
+                type: 'decode',
+                data: buf,
+                timestamp: performance.now() * 1000,
+                rect: {
+                  left: data.left ?? 0,
+                  top: data.top ?? 0,
+                  right: data.right ?? data.width ?? 0,
+                  bottom: data.bottom ?? data.height ?? 0,
+                },
+              },
               [buf],
             );
           }
@@ -1522,14 +1608,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         store.updateTabStatus(tabId, 'disconnected');
       } else {
         // Check if the disconnect reason is non-recoverable
-        const nonRecoverableReasons = [
-          'another user connected', 'forcing the disconnection',
-          'logon_failure', 'account_disabled', 'account_locked',
-          'account_expired', 'password_expired', 'access_denied',
-          'administratively', 'license', 'idle timeout',
-        ];
-        const lowerReason = reason.toLowerCase();
-        if (nonRecoverableReasons.some(kw => lowerReason.includes(kw))) {
+        if (isNonRecoverableRdpError(reason)) {
           rdpLog.warn('connection', 'non-recoverable disconnect', { reason });
           store.updateTabStatus(tabId, 'error', friendlyRdpError(reason, t));
         } else {
@@ -1550,15 +1629,8 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       clipboardPollInFlightRef.current.delete(tabId);
 
       // Non-recoverable errors: don't reconnect
-      const nonRecoverable = [
-        'logon_failure', 'wrong', 'password', 'account_disabled',
-        'account_locked', 'account_expired', 'password_expired',
-        'access_denied', 'credssp', 'certificate',
-        'another user connected', 'forcing the disconnection',
-        'administratively', 'license',
-      ];
       const lower = raw.toLowerCase();
-      if (nonRecoverable.some(kw => lower.includes(kw))) {
+      if (isNonRecoverableRdpError(raw) || lower.includes('wrong') || lower.includes('password')) {
         store.updateTabStatus(tabId, 'error', friendlyRdpError(raw, t));
       } else if (!userDisconnectedRef.current.has(tabId)) {
         scheduleReconnect(tabId, raw);
@@ -1567,7 +1639,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
         store.updateTabStatus(tabId, 'error', friendlyRdpError(raw, t));
       }
     }
-  }, [store, proxyPort, getCanvasSize, ensureH264Worker]);
+  }, [store, proxyPort, getCanvasSize, getFreeRdpEmbedRect, placeFreeRdpSidecar, syncFreeRdpSidecarVisibility, ensureH264Worker]);
   connectSessionRef.current = connectSession;
 
   // ── Auto-reconnect with exponential backoff ──
@@ -1596,7 +1668,7 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       connectSessionRef.current?.(tabId);
     }, delay);
     reconnectTimerRef.current.set(tabId, timer);
-  }, [store, cleanupH264Worker]);
+  }, [store, cleanupH264Worker, syncFreeRdpSidecarVisibility]);
 
   // Reset reconnect counter on successful connection
   useEffect(() => {
@@ -1641,6 +1713,11 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       api.rdpNativeDisconnect(tabId).catch(() => {});
       nativeTabsRef.current.delete(tabId);
     }
+    if (freeRdpTabsRef.current.has(tabId)) {
+      api.rdpFreeRdpDisconnect(tabId).catch(() => {});
+      freeRdpTabsRef.current.delete(tabId);
+      window.setTimeout(syncFreeRdpSidecarVisibility, 0);
+    }
     cleanupH264Worker(tabId);
     // Shutdown WASM session if any
     const session = sessionRefs.current.get(tabId);
@@ -1682,6 +1759,10 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       api.rdpNativeDisconnect(tabId).catch(() => {});
       nativeTabsRef.current.delete(tabId);
     }
+    if (freeRdpTabsRef.current.has(tabId)) {
+      api.rdpFreeRdpDisconnect(tabId).catch(() => {});
+      freeRdpTabsRef.current.delete(tabId);
+    }
     cleanupH264Worker(tabId);
     const session = sessionRefs.current.get(tabId);
     if (session) {
@@ -1703,6 +1784,63 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
     }, 500);
   }, [store]);
 
+  const performAdaptiveResize = useCallback((reason: string) => {
+    if (resModeRef.current !== 'adaptive') return;
+    if (resizeCooldownRef.current) return;
+
+    const wrap = canvasWrapRef.current;
+    if (!wrap || !wrap.offsetParent) return;
+
+    const tabId = activeTabIdRef.current;
+    if (!tabId) return;
+
+    const tab = tabsRef.current.find(t => t.id === tabId);
+    if (tab?.status !== 'connected') return;
+
+    if (fileTransferInProgressRef.current.has(tabId)) return;
+
+    const { w, h } = getCanvasSize();
+    if (w <= 0 || h <= 0) return;
+
+    const dw = Math.abs(w - lastSizeRef.current.w);
+    const dh = Math.abs(h - lastSizeRef.current.h);
+    if (dw < ADAPTIVE_RESIZE_THRESHOLD_PX && dh < ADAPTIVE_RESIZE_THRESHOLD_PX) return;
+
+    lastSizeRef.current = { w, h };
+
+    if (freeRdpTabsRef.current.has(tabId)) {
+      rdpLog.info('render', `adaptive resize (${reason}, freerdp) → reconnecting embedded sidecar: ${w} x ${h}`);
+      reconnectWithSize(tabId);
+      return;
+    }
+
+    if (USE_NATIVE_RDP && nativeTabsRef.current.has(tabId)) {
+      rdpLog.info('render', `adaptive resize (${reason}, native) → trying DVC: ${w} x ${h}`);
+      api.rdpNativeResize(tabId, w, h)
+        .then(() => {
+          rdpLog.info('render', `adaptive resize (${reason}, native) → DVC success: ${w} x ${h}`);
+        })
+        .catch(() => {
+          rdpLog.warn('render', `adaptive resize (${reason}, native) → DVC failed, reconnecting`);
+          reconnectWithSize(tabId);
+        });
+      return;
+    }
+
+    const session = sessionRefs.current.get(tabId);
+    if (!session) return;
+    try {
+      session.resize(w, h);
+      rdpLog.info('render', `adaptive resize (${reason}) → dynamic PDU sent: ${w} x ${h}`);
+      return;
+    } catch (e) {
+      rdpLog.warn('render', `adaptive resize (${reason}) → dynamic resize failed`, { error: e });
+    }
+
+    rdpLog.info('render', `adaptive resize (${reason}) → reconnect fallback: ${w} x ${h}`);
+    reconnectWithSize(tabId);
+  }, [getCanvasSize, reconnectWithSize]);
+
   // ── Switch resolution mode ──
   const applyResolution = useCallback((mode: string) => {
     rdpLog.info('render', `applyResolution called: ${mode}`);
@@ -1713,6 +1851,10 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
     if (mode === 'adaptive') {
       const { w, h } = getCanvasSize();
       rdpLog.info('render', `switching to adaptive: ${w} x ${h}`);
+      if (freeRdpTabsRef.current.has(tabId)) {
+        reconnectWithSize(tabId);
+        return;
+      }
       // Try native resize first
       if (USE_NATIVE_RDP && nativeTabsRef.current.has(tabId)) {
         api.rdpNativeResize(tabId, w, h).then(() => {
@@ -1742,6 +1884,10 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
       const [ws, hs] = mode.split('x').map(Number);
       if (!ws || !hs) return;
       rdpLog.info('render', `switching to fixed resolution: ${ws} x ${hs}`);
+      if (freeRdpTabsRef.current.has(tabId)) {
+        reconnectWithSize(tabId, ws, hs);
+        return;
+      }
       // Try native resize first
       if (USE_NATIVE_RDP && nativeTabsRef.current.has(tabId)) {
         api.rdpNativeResize(tabId, ws, hs).then(() => {
@@ -2422,57 +2568,8 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
 
   // ── Debounced adaptive resize (Jump Desktop style) ──
   useEffect(() => {
-    const wrap = canvasWrapRef.current;
-    if (!wrap) return;
-
     const doResize = () => {
-      // Skip auto-resize in fixed mode
-      if (resModeRef.current !== 'adaptive') return;
-      if (resizeCooldownRef.current) return; // skip during post-connect cooldown
-      // Skip when RDP view is hidden (e.g. user switched to Dashboard tab)
-      // display:none elements have offsetParent === null
-      if (!wrap.offsetParent) return;
-      const tabId = activeTabIdRef.current;
-      if (!tabId) return;
-      // Skip resize during active file transfer — reconnect would kill the transfer
-      if (fileTransferInProgressRef.current.has(tabId)) return;
-
-      const { w, h } = getCanvasSize();
-      if (w <= 0 || h <= 0) return;
-      // Skip if size change is too small. Window drags generate many layout
-      // changes; only resize the RDP desktop once the user has made a real move.
-      const dw = Math.abs(w - lastSizeRef.current.w);
-      const dh = Math.abs(h - lastSizeRef.current.h);
-      if (dw < ADAPTIVE_RESIZE_THRESHOLD_PX && dh < ADAPTIVE_RESIZE_THRESHOLD_PX) return;
-
-      lastSizeRef.current = { w, h };
-
-      // ── Native mode: use Rust backend DVC resize with reconnect fallback ──
-      if (USE_NATIVE_RDP && nativeTabsRef.current.has(tabId)) {
-        rdpLog.info('render', `adaptive resize (native) → trying DVC: ${w} x ${h}`);
-        api.rdpNativeResize(tabId, w, h)
-          .then(() => {
-            rdpLog.info('render', `adaptive resize (native) → DVC success: ${w} x ${h}`);
-          })
-          .catch(() => {
-            rdpLog.warn('render', 'adaptive resize (native) → DVC failed, reconnecting');
-            reconnectWithSize(tabId);
-          });
-        return;
-      }
-
-      // ── WASM mode: try DisplayControl DVC first, then reconnect ──
-      const session = sessionRefs.current.get(tabId);
-      if (!session) return;
-      try {
-        session.resize(w, h);
-        rdpLog.info('render', `adaptive resize → dynamic PDU sent: ${w} x ${h}`);
-        return;
-      } catch (e) {
-        rdpLog.warn('render', 'dynamic resize failed, falling back to reconnect', { error: e });
-      }
-      rdpLog.info('render', `adaptive resize → reconnect fallback: ${w} x ${h}`);
-      reconnectWithSize(tabId);
+      performAdaptiveResize('observer');
     };
 
     const scheduleResize = () => {
@@ -2482,17 +2579,80 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
 
     // ResizeObserver for wrapper layout changes
     const obs = new ResizeObserver(scheduleResize);
-    obs.observe(wrap);
+    if (canvasWrapRef.current) obs.observe(canvasWrapRef.current);
+    if (containerRef.current) obs.observe(containerRef.current);
 
     // Also listen for window resize (Tauri window drag/resize)
     window.addEventListener('resize', scheduleResize);
+    window.visualViewport?.addEventListener('resize', scheduleResize);
+
+    // Tauri/WebView window resizes can occasionally miss ResizeObserver.
+    // Keep a cheap fallback that only acts when dimensions actually changed.
+    const pollTimer = setInterval(scheduleResize, 1000);
 
     return () => {
       obs.disconnect();
       window.removeEventListener('resize', scheduleResize);
+      window.visualViewport?.removeEventListener('resize', scheduleResize);
+      clearInterval(pollTimer);
       if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
     };
-  }, [store.activeTabId, getCanvasSize, reconnectWithSize]);
+  }, [store.activeTabId, performAdaptiveResize]);
+
+  // Keep the external FreeRDP SDL window visually attached to the active RDP viewport.
+  useEffect(() => {
+    const placeActiveSidecar = () => {
+      const tabId = activeTabIdRef.current;
+      if (!tabId || !freeRdpTabsRef.current.has(tabId)) return;
+      const tab = tabsRef.current.find(t => t.id === tabId);
+      if (tab?.status !== 'connected') return;
+      placeFreeRdpSidecar(tabId);
+    };
+
+    const timer = setInterval(placeActiveSidecar, 300);
+    window.addEventListener('resize', placeActiveSidecar);
+    window.addEventListener('focus', placeActiveSidecar);
+    window.visualViewport?.addEventListener('resize', placeActiveSidecar);
+    placeActiveSidecar();
+
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener('resize', placeActiveSidecar);
+      window.removeEventListener('focus', placeActiveSidecar);
+      window.visualViewport?.removeEventListener('resize', placeActiveSidecar);
+    };
+  }, [store.activeTabId, placeFreeRdpSidecar]);
+
+  useEffect(() => {
+    syncFreeRdpSidecarVisibility();
+  }, [store.activeTabId, store.tabs, syncFreeRdpSidecarVisibility]);
+
+  // ── Calibrate adaptive resolution when switching back to NextDesk ──
+  useEffect(() => {
+    let focusTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const scheduleFocusResize = () => {
+      if (focusTimer) clearTimeout(focusTimer);
+      focusTimer = setTimeout(() => {
+        performAdaptiveResize('window focus');
+      }, 250);
+    };
+
+    const onVisibilityChange = () => {
+      if (!document.hidden) scheduleFocusResize();
+    };
+
+    window.addEventListener('focus', scheduleFocusResize);
+    window.addEventListener('pageshow', scheduleFocusResize);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    return () => {
+      if (focusTimer) clearTimeout(focusTimer);
+      window.removeEventListener('focus', scheduleFocusResize);
+      window.removeEventListener('pageshow', scheduleFocusResize);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [performAdaptiveResize]);
 
   const activeTab = store.activeTab;
   const hasActiveTabs = store.tabs.length > 0;
@@ -2651,8 +2811,11 @@ export function RdpManager({ onMainSidebarCollapse }: { onMainSidebarCollapse?: 
 
               {activeTab?.status === 'error' && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 p-8">
-                  <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/20 text-sm text-destructive max-w-md whitespace-pre-wrap text-center">
-                    {activeTab.errorMsg}
+                  <div className="max-w-md rounded-lg border border-destructive/25 bg-destructive/10 px-4 py-3 text-center shadow-sm">
+                    <p className="text-sm font-semibold text-destructive">{t('rdpStatusError')}</p>
+                    <p className="mt-1 text-sm text-destructive/90 whitespace-pre-wrap">
+                      {activeTab.errorMsg || t('rdpErrUnknown')}
+                    </p>
                   </div>
                   <div className="flex items-center gap-2">
                     <Button variant="outline" size="sm" onClick={() => connectSession(activeTab.id)}>{t('rdpRetry')}</Button>

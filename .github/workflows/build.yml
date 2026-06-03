@@ -5,12 +5,24 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Build target for manual packaging tests'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - macos
+          - macos-intel
+          - windows
 
 env:
   MIHOMO_VERSION: v1.19.21
 
 jobs:
   build-macos:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos' }}
     runs-on: macos-latest
     permissions:
       contents: write
@@ -32,13 +44,16 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: aarch64-apple-darwin
 
       - name: Install dependencies
         run: npm install && cd frontend && npm install
 
+      - name: Install FreeRDP
+        run: brew install freerdp
+
       - name: Download mihomo & geodata
-        run: bash scripts/download-deps.sh universal-apple-darwin
+        run: bash scripts/download-deps.sh aarch64-apple-darwin
 
       - name: Sanitize signing key
         run: |
@@ -50,7 +65,59 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          args: --target universal-apple-darwin --config src-tauri/tauri.macos.conf.json
+          args: --target aarch64-apple-darwin --config src-tauri/tauri.macos.conf.json
+          tagName: ${{ github.ref_name }}
+          releaseName: "NextDesk ${{ github.ref_name }}"
+          releaseBody: "See the assets below for download."
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+
+  build-macos-intel:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.platform == 'macos-intel' }}
+    runs-on: macos-13
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout patched IronRDP
+        shell: bash
+        run: |
+          git clone --no-tags https://github.com/Devolutions/IronRDP.git ../IronRDP
+          git -C ../IronRDP checkout bf694c8a239d4cf53e7dd8edbe26f2aeb07bcf26
+          git -C ../IronRDP apply "$PWD/patches/ironrdp-nextdesk.patch"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Install dependencies
+        run: npm install && cd frontend && npm install
+
+      - name: Install FreeRDP
+        run: brew install freerdp
+
+      - name: Download mihomo & geodata
+        run: bash scripts/download-deps.sh x86_64-apple-darwin
+
+      - name: Sanitize signing key
+        run: |
+          KEY=$(echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" | tr -d '\n\r')
+          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY" >> "$GITHUB_ENV"
+
+      - name: Build & Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --target x86_64-apple-darwin --config src-tauri/tauri.macos.conf.json
           tagName: ${{ github.ref_name }}
           releaseName: "NextDesk ${{ github.ref_name }}"
           releaseBody: "See the assets below for download."
@@ -60,6 +127,12 @@ jobs:
 
   build-windows:
     needs: build-macos
+    if: >-
+      ${{
+        always()
+        && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows')
+        && ((github.event_name == 'workflow_dispatch' && inputs.platform == 'windows') || needs.build-macos.result == 'success')
+      }}
     runs-on: windows-latest
     permissions:
       contents: write
@@ -83,6 +156,18 @@ jobs:
 
       - name: Install dependencies
         run: npm install && cd frontend && npm install
+
+      - name: Install FreeRDP
+        shell: pwsh
+        run: choco install freerdp.portable -y --no-progress
+
+      - name: Package FreeRDP
+        shell: pwsh
+        run: ./scripts/package-freerdp-windows.ps1
+
+      - name: Verify FreeRDP resources
+        shell: bash
+        run: bash scripts/verify-freerdp-windows.sh
 
       - name: Download mihomo & geodata
         shell: bash

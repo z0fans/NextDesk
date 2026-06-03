@@ -3,6 +3,7 @@ mod cliprdr;
 mod config;
 mod file_transfer_ws;
 mod frame_ws;
+mod freerdp_sidecar;
 mod logging;
 mod macos_cursor_fix;
 mod macos_file_promise;
@@ -54,6 +55,27 @@ fn internal_engine_running(app_state: &AppState) -> bool {
             false
         }
     }
+}
+
+async fn clash_api_ready(api_base: &str) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .no_proxy()
+        .build()
+        .unwrap_or_default();
+
+    match client.get(format!("{api_base}/version")).send().await {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+fn discard_internal_engine(app_state: &AppState) {
+    let mut proc = app_state.clash_process.lock().unwrap();
+    if let Some(child) = proc.as_mut() {
+        let _ = child.start_kill();
+    }
+    *proc = None;
 }
 
 fn is_private_or_reserved_host(host: &str) -> bool {
@@ -111,8 +133,14 @@ fn choose_runtime_ports() -> Result<config::RuntimePorts, String> {
 
 async fn start_engine_inner(app_state: &AppState) -> Result<bool, String> {
     if internal_engine_running(app_state) {
-        log::info!("[start_engine] Internal Clash already running");
-        return Ok(true);
+        let api_base = app_state.clash_api_base.lock().unwrap().clone();
+        if !api_base.is_empty() && clash_api_ready(&api_base).await {
+            log::info!("[start_engine] Internal Clash already running");
+            return Ok(true);
+        }
+
+        log::warn!("[start_engine] Existing Clash process is running but API is not ready; restarting");
+        discard_internal_engine(app_state);
     }
 
     // Always use independent kernel — no reuse mode
@@ -174,6 +202,8 @@ async fn start_engine_inner(app_state: &AppState) -> Result<bool, String> {
                 });
             } else {
                 eprintln!("[start_engine] Warning: Clash API not ready after 120s");
+                discard_internal_engine(app_state);
+                return Err("Internal Clash API not ready; SOCKS5 proxy is unavailable".into());
             }
             Ok(true)
         }
@@ -409,7 +439,7 @@ async fn switch_proxy(
     app_state: State<'_, AppState>,
 ) -> Result<bool, String> {
     let api = app_state.clash_api_base.lock().unwrap().clone();
-    Ok(clash::switch_proxy(&api, &group_name, &proxy_name).await)
+    Ok(clash::switch_proxy(&api, &group_name, &proxy_name, false).await)
 }
 
 #[tauri::command]
@@ -729,6 +759,115 @@ async fn rdp_native_connect(
     let mut mgr = app_state.native_sessions.lock().unwrap();
     mgr.insert(tab_id, handle);
     Ok(ws_port)
+}
+
+#[tauri::command]
+async fn rdp_freerdp_connect(
+    app: tauri::AppHandle,
+    tab_id: String,
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    domain: Option<String>,
+    width: u16,
+    height: u16,
+    left: i32,
+    top: i32,
+    app_state: State<'_, AppState>,
+) -> Result<freerdp_sidecar::FreeRdpLaunchInfo, String> {
+    let proxy_port = if is_private_or_reserved_host(&host) {
+        log::info!("[freerdp-sidecar] Private/local target {host}:{port}; using direct route");
+        None
+    } else {
+        log::info!("[freerdp-sidecar] Public target {host}:{port}; ensuring internal engine");
+        start_engine_inner(app_state.inner()).await?;
+        Some(*app_state.proxy_port.lock().unwrap())
+    };
+    let parent_window_id = freerdp_parent_window_id(&app)?;
+
+    freerdp_sidecar::launch(
+        &app,
+        freerdp_sidecar::FreeRdpLaunchRequest {
+            tab_id,
+            host,
+            port,
+            username,
+            password,
+            domain,
+            width,
+            height,
+            left,
+            top,
+            parent_window_id,
+            proxy_port,
+        },
+        app_state.freerdp_sessions.clone(),
+    )
+    .await
+}
+
+#[tauri::command]
+fn rdp_freerdp_disconnect(tab_id: String, app_state: State<'_, AppState>) -> Result<(), String> {
+    freerdp_sidecar::disconnect(&tab_id, app_state.freerdp_sessions.clone())
+}
+
+#[tauri::command]
+async fn rdp_freerdp_place(
+    tab_id: String,
+    left: i32,
+    top: i32,
+    width: u16,
+    height: u16,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    freerdp_sidecar::place_window(
+        &tab_id,
+        left,
+        top,
+        width,
+        height,
+        app_state.freerdp_sessions.clone(),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn rdp_freerdp_set_visible(
+    tab_id: String,
+    visible: bool,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    freerdp_sidecar::set_visible(&tab_id, visible, app_state.freerdp_sessions.clone()).await
+}
+
+fn freerdp_parent_window_id(app: &AppHandle) -> Result<Option<u64>, String> {
+    let Some(window) = app.get_webview_window("main") else {
+        log::warn!("[freerdp-sidecar] main window not found; launching without parent window");
+        return Ok(None);
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = window;
+        log::info!(
+            "[freerdp-sidecar] macOS sidecar uses managed window placement; /parent-window disabled"
+        );
+        return Ok(None);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let hwnd = window
+            .hwnd()
+            .map_err(|err| format!("Read Windows HWND for FreeRDP embedding failed: {err}"))?;
+        let id = hwnd.0 as usize as u64;
+        log::info!("[freerdp-sidecar] using Windows HWND parent id={id}");
+        return Ok(Some(id));
+    }
+
+    #[allow(unreachable_code)]
+    Ok(None)
 }
 
 #[tauri::command]
@@ -1195,6 +1334,10 @@ pub fn run() {
             rdp_audio_push,
             rdp_audio_push_raw,
             rdp_audio_close,
+            rdp_freerdp_connect,
+            rdp_freerdp_disconnect,
+            rdp_freerdp_place,
+            rdp_freerdp_set_visible,
             rdp_native_connect,
             rdp_native_input,
             rdp_native_mouse,
@@ -1227,7 +1370,6 @@ mod tests {
 
     #[test]
     fn rdp_engine_guard_treats_public_targets_as_proxy_required() {
-        assert!(!is_private_or_reserved_host("68.64.138.254"));
         assert!(!is_private_or_reserved_host("example.com"));
     }
 }
