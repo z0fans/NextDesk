@@ -48,9 +48,6 @@ jobs:
       - name: Install dependencies
         run: npm install && cd frontend && npm install
 
-      - name: Install FreeRDP
-        run: brew install freerdp
-
       - name: Download mihomo & geodata
         run: bash scripts/download-deps.sh aarch64-apple-darwin
 
@@ -103,18 +100,6 @@ jobs:
 
       - name: Install dependencies
         run: npm install && cd frontend && npm install
-
-      - name: Install FreeRDP
-        shell: pwsh
-        run: choco install freerdp.portable -y --no-progress
-
-      - name: Package FreeRDP
-        shell: pwsh
-        run: ./scripts/package-freerdp-windows.ps1
-
-      - name: Verify FreeRDP resources
-        shell: bash
-        run: bash scripts/verify-freerdp-windows.sh
 
       - name: Download mihomo & geodata
         shell: bash

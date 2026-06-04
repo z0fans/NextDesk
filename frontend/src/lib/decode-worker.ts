@@ -4,15 +4,14 @@
  * Phase 4: Receives H.264 NAL units from the main thread, decodes them
  * using WebCodecs VideoDecoder, and sends decoded VideoFrames back.
  *
- * Messages IN:  { type: 'decode', data: ArrayBuffer, timestamp: number, rect?: GfxRect }
+ * Messages IN:  { type: 'decode', data: ArrayBuffer, timestamp: number }
  *               { type: 'configure', codec: string }
  *               { type: 'reset' }
- * Messages OUT: { type: 'frame', frame: VideoFrame, rect?: GfxRect }  (transferable)
+ * Messages OUT: { type: 'frame', frame: VideoFrame }  (transferable)
  *               { type: 'error', message: string }
  */
 
 let decoder: VideoDecoder | null = null;
-const pendingRects: Array<unknown> = [];
 
 function hasAnnexBStartCode(data: Uint8Array): boolean {
   for (let i = 0; i < data.length - 4; i++) {
@@ -75,9 +74,8 @@ function initDecoder(codec = 'avc1.64001f') {
 
   decoder = new VideoDecoder({
     output: (frame: VideoFrame) => {
-      const rect = pendingRects.shift();
       // Transfer VideoFrame back to main thread (zero-copy)
-      self.postMessage({ type: 'frame', frame, rect }, [frame] as any);
+      self.postMessage({ type: 'frame', frame }, [frame] as any);
     },
     error: (err: DOMException) => {
       self.postMessage({ type: 'error', message: err.message });
@@ -110,10 +108,8 @@ self.onmessage = (e: MessageEvent) => {
         data,
       });
       try {
-        pendingRects.push(msg.rect);
         decoder!.decode(chunk);
       } catch (err: any) {
-        pendingRects.pop();
         self.postMessage({
           type: 'error', message: err?.message || String(err),
         });
@@ -123,7 +119,6 @@ self.onmessage = (e: MessageEvent) => {
 
     case 'reset': {
       if (decoder && decoder.state !== 'closed') {
-        pendingRects.length = 0;
         decoder.reset();
         initDecoder();
       }
@@ -134,7 +129,6 @@ self.onmessage = (e: MessageEvent) => {
       if (decoder && decoder.state !== 'closed') {
         decoder.close();
       }
-      pendingRects.length = 0;
       decoder = null;
       break;
     }

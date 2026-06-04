@@ -89,7 +89,6 @@ pub struct AppState {
     pub sync_state: Arc<Mutex<SyncState>>,
     pub audio_manager: Arc<Mutex<crate::rdp_audio::AudioManager>>,
     pub native_sessions: Arc<Mutex<crate::rdp_session::SessionManager>>,
-    pub freerdp_sessions: Arc<Mutex<crate::freerdp_sidecar::FreeRdpManager>>,
     pub file_transfer_ws_port: Arc<Mutex<u16>>,
 }
 
@@ -116,9 +115,6 @@ impl Default for AppState {
             sync_state: Arc::new(Mutex::new(SyncState::default())),
             audio_manager: Arc::new(Mutex::new(crate::rdp_audio::AudioManager::default())),
             native_sessions: Arc::new(Mutex::new(crate::rdp_session::SessionManager::default())),
-            freerdp_sessions: Arc::new(Mutex::new(
-                crate::freerdp_sidecar::FreeRdpManager::default(),
-            )),
             file_transfer_ws_port: Arc::new(Mutex::new(0)),
         }
     }

@@ -27,7 +27,6 @@ export type RdpLogModule =
   | 'file'        // file transfer (RDPDR)
   | 'network'     // online / offline detection
   | 'proxy'       // WebSocket / RDCleanPath proxy
-  | 'freerdp'     // FreeRDP sidecar renderer
   | 'native'      // native Rust RDP backend
   | 'wasm';       // IronRDP WASM internal logs
 
@@ -70,7 +69,6 @@ function createLogger() {
     file:       '#aed581',
     network:    '#4dd0e1',
     proxy:      '#ffd54f',
-    freerdp:    '#66bb6a',
     native:     '#ef5350',
     wasm:       '#90a4ae',
   };

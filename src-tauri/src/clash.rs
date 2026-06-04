@@ -1,9 +1,8 @@
 use reqwest::Client;
 use serde_json::Value;
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::config::{get_log_dir, get_user_config_dir};
@@ -139,9 +138,7 @@ pub async fn start_clash_process() -> Result<Child, String> {
         .try_clone()
         .map_err(|e| format!("Clone failed: {e}"))?;
 
-    let runtime_mihomo_path = prepare_runtime_engine_binary(&mihomo_path)?;
-
-    let mut cmd = Command::new(&runtime_mihomo_path);
+    let mut cmd = Command::new(&mihomo_path);
     cmd.arg("-f")
         .arg(&config_path)
         .arg("-d")
@@ -166,41 +163,6 @@ pub async fn start_clash_process() -> Result<Child, String> {
     let child = cmd.spawn().map_err(|e| format!("Spawn failed: {e}"))?;
 
     Ok(child)
-}
-
-fn prepare_runtime_engine_binary(source: &Path) -> Result<PathBuf, String> {
-    let runtime_dir = std::env::temp_dir().join("nextdesk-core-runtime");
-    fs::create_dir_all(&runtime_dir)
-        .map_err(|e| format!("Create runtime engine dir failed: {e}"))?;
-
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or_default();
-    let extension = source
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| format!(".{ext}"))
-        .unwrap_or_default();
-    let runtime_path =
-        runtime_dir.join(format!("nextdesk-core-{}-{suffix}{extension}", std::process::id()));
-
-    fs::copy(source, &runtime_path)
-        .map_err(|e| format!("Copy runtime engine binary failed: {e}"))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("Set runtime engine permission failed: {e}"))?;
-    }
-
-    eprintln!(
-        "[clash] runtime core: {} -> {}",
-        source.display(),
-        runtime_path.display()
-    );
-    Ok(runtime_path)
 }
 
 /// Get bin directory (next to executable or project root)
@@ -250,17 +212,8 @@ pub async fn get_active_proxy(api_base: &str, group_name: &str) -> Option<String
         .map(|s| s.to_string())
 }
 
-/// Switch proxy in a group.
-///
-/// By default, NextDesk must not interrupt active RDP/SSH sessions when the user
-/// tests latency or changes the preferred node. Existing TCP flows continue on
-/// their current chain; the new selection applies to subsequent connections.
-pub async fn switch_proxy(
-    api_base: &str,
-    group_name: &str,
-    proxy_name: &str,
-    close_active_rdp: bool,
-) -> bool {
+/// Switch proxy in a group
+pub async fn switch_proxy(api_base: &str, group_name: &str, proxy_name: &str) -> bool {
     let client = http_client();
     let encoded = encode_proxy_name(group_name);
     let url = format!("{api_base}/proxies/{encoded}");
@@ -269,15 +222,9 @@ pub async fn switch_proxy(
         Ok(resp) => {
             let success = resp.status().as_u16() == 204;
             if success {
-                if close_active_rdp {
-                    // Explicit reconnect path only. The normal UI switch path
-                    // keeps active RDP/SSH flows alive to avoid frame stalls.
-                    close_rdp_connections(api_base, group_name).await;
-                } else {
-                    eprintln!(
-                        "[clash] Switched {group_name} to {proxy_name}; preserving active RDP/SSH connections"
-                    );
-                }
+                // Close existing RDP connections (port 3389/22) that were routed
+                // through this group, so they reconnect via the new node
+                close_rdp_connections(api_base, group_name).await;
             }
             success
         }

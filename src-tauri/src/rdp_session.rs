@@ -20,10 +20,6 @@
 use crate::cliprdr as cliprdr_module;
 use crate::frame_ws::FrameSender;
 use std::collections::HashMap;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
-};
 
 use ironrdp::cliprdr;
 use ironrdp::cliprdr::backend::CliprdrBackendFactory as _;
@@ -37,11 +33,11 @@ use ironrdp::pdu::input::mouse::{MousePdu, PointerFlags};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, SessionResult};
 use ironrdp::{rdpdr, rdpsnd, session};
-use ironrdp_core::{decode, impl_as_any, WriteBuf};
+use ironrdp_core::WriteBuf;
 use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_egfx::pdu::{
-    Avc420BitmapStream, Avc444BitmapStream, CapabilitiesV81Flags, CapabilitiesV8Flags,
-    CapabilitySet, Codec1Type, GfxPdu, PixelFormat as GfxPixelFormat,
+    CapabilitiesV107Flags, CapabilitiesV10Flags, CapabilitiesV81Flags, CapabilitiesV8Flags,
+    CapabilitySet, Codec1Type, GfxPdu,
 };
 use ironrdp_graphics::rdp6::BitmapStreamDecoder;
 use ironrdp_rdpsnd_native::cpal::RdpsndBackend;
@@ -61,14 +57,6 @@ const GFX_FRAME_MAGIC: u16 = 0xffff;
 const GFX_FRAME_KIND_H264: u16 = 1;
 const INPUT_DRAIN_LIMIT: usize = 4096;
 const DEFAULT_NATIVE_RENDER_MODE: NativeRenderMode = NativeRenderMode::Bitmap;
-const MIN_GFX_FALLBACK_SUPPRESS_AREA_RATIO: u32 = 4;
-const VIDEO_DVC_CONTROL_CHANNEL: &str = "Microsoft::Windows::RDS::Video::Control::v08.01";
-const VIDEO_DVC_DATA_CHANNEL: &str = "Microsoft::Windows::RDS::Video::Data::v08.01";
-const GEOMETRY_DVC_CHANNEL: &str = "Microsoft::Windows::RDS::Geometry::v08.01";
-const INPUT_DVC_CHANNEL: &str = "Microsoft::Windows::RDS::Input";
-const LOGGING_DVC_MAX_PAYLOAD_LOGS: usize = 12;
-const GFX_H264_UNSUPPORTED_MESSAGE: &str = "RDPGFX H.264 test mode is active, but the server did not negotiate AVC420/H.264. Disable NEXTDESK_NATIVE_GFX=h264 or enable H.264/AVC on the RDP server.";
-type SharedGfxError = Arc<Mutex<Option<String>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeRenderMode {
@@ -82,25 +70,30 @@ enum NativeRdpRoute {
     Socks5 { port: u16 },
 }
 
-fn should_emit_bitmap_updates(mode: NativeRenderMode, gfx_frame_seen: bool) -> bool {
-    mode == NativeRenderMode::Bitmap || !gfx_frame_seen
+fn should_emit_bitmap_updates(mode: NativeRenderMode) -> bool {
+    mode == NativeRenderMode::Bitmap
 }
 
 fn native_render_mode() -> NativeRenderMode {
-    native_render_mode_from_env(std::env::var("NEXTDESK_NATIVE_GFX").ok().as_deref())
-}
-
-fn native_render_mode_from_env(value: Option<&str>) -> NativeRenderMode {
-    match value.map(str::to_ascii_lowercase).as_deref() {
-        Some("force" | "gfx" | "h264") => NativeRenderMode::GfxH264,
+    match std::env::var("NEXTDESK_NATIVE_GFX")
+        .ok()
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("1" | "true" | "yes" | "gfx" | "h264") => NativeRenderMode::GfxH264,
         _ => DEFAULT_NATIVE_RENDER_MODE,
     }
 }
 
 fn gfx_h264_capabilities() -> Vec<CapabilitySet> {
     vec![
-        // Force the AVC420 capability path while H.264 is experimental.
-        // Advertising V10/V10.7 lets Windows confirm V10 but still emit RemoteFxProgressive.
+        CapabilitySet::V10_7 {
+            flags: CapabilitiesV107Flags::SMALL_CACHE,
+        },
+        CapabilitySet::V10 {
+            flags: CapabilitiesV10Flags::SMALL_CACHE,
+        },
         CapabilitySet::V8_1 {
             flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
         },
@@ -133,56 +126,6 @@ fn build_gfx_h264_frame(
     buf
 }
 
-fn gfx_capability_confirms_h264(cap: &CapabilitySet) -> bool {
-    matches!(
-        cap,
-        CapabilitySet::V8_1 { flags }
-            if flags.contains(CapabilitiesV81Flags::AVC420_ENABLED)
-    )
-}
-
-fn gfx_unsupported_message(cap: &CapabilitySet) -> String {
-    format!("{GFX_H264_UNSUPPORTED_MESSAGE} Confirmed capability: {cap:?}")
-}
-
-fn set_gfx_error_once(error: &SharedGfxError, message: String) {
-    match error.lock() {
-        Ok(mut slot) => {
-            if slot.is_none() {
-                *slot = Some(message);
-            }
-        }
-        Err(err) => {
-            log::error!("[rdp-native] GFX error state poisoned: {err}");
-        }
-    }
-}
-
-fn take_gfx_error(error: &SharedGfxError) -> Option<String> {
-    match error.lock() {
-        Ok(mut slot) => slot.take(),
-        Err(err) => {
-            log::error!("[rdp-native] GFX error state poisoned: {err}");
-            Some("RDPGFX error state is unavailable after a lock failure".to_string())
-        }
-    }
-}
-
-fn extract_gfx_h264_payload<'a>(
-    codec_id: Codec1Type,
-    bitmap_data: &'a [u8],
-) -> Result<&'a [u8], String> {
-    match codec_id {
-        Codec1Type::Avc420 => decode::<Avc420BitmapStream<'a>>(bitmap_data)
-            .map(|stream| stream.data)
-            .map_err(|err| format!("Avc420BitmapStream decode failed: {err}")),
-        Codec1Type::Avc444 | Codec1Type::Avc444v2 => decode::<Avc444BitmapStream<'a>>(bitmap_data)
-            .map(|stream| stream.stream1.data)
-            .map_err(|err| format!("Avc444BitmapStream decode failed: {err}")),
-        other => Err(format!("unsupported H264 codec: {other:?}")),
-    }
-}
-
 fn rgb24_to_rgba(rgb: &[u8]) -> Option<Vec<u8>> {
     if rgb.len() % 3 != 0 {
         return None;
@@ -191,80 +134,6 @@ fn rgb24_to_rgba(rgb: &[u8]) -> Option<Vec<u8>> {
     let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
     for pixel in rgb.chunks_exact(3) {
         rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xff]);
-    }
-    Some(rgba)
-}
-
-fn gfx_region_dimensions(
-    rect: &ironrdp::pdu::geometry::InclusiveRectangle,
-    payload_len: usize,
-    bytes_per_pixel: usize,
-) -> Option<(u16, u16)> {
-    let inclusive_w = usize::from(rect.width());
-    let inclusive_h = usize::from(rect.height());
-    if inclusive_w * inclusive_h * bytes_per_pixel == payload_len {
-        return Some((rect.width(), rect.height()));
-    }
-
-    let exclusive_w = usize::from(rect.right.saturating_sub(rect.left));
-    let exclusive_h = usize::from(rect.bottom.saturating_sub(rect.top));
-    if exclusive_w > 0
-        && exclusive_h > 0
-        && exclusive_w * exclusive_h * bytes_per_pixel == payload_len
-    {
-        return Some((
-            rect.right.saturating_sub(rect.left),
-            rect.bottom.saturating_sub(rect.top),
-        ));
-    }
-
-    None
-}
-
-fn gfx_rect_dimensions_for_codec(
-    rect: &ironrdp::pdu::geometry::InclusiveRectangle,
-) -> SmallVec<[(u16, u16); 2]> {
-    let exclusive_w = rect.right.saturating_sub(rect.left);
-    let exclusive_h = rect.bottom.saturating_sub(rect.top);
-    let inclusive = (rect.width(), rect.height());
-    let mut dimensions = SmallVec::new();
-
-    if exclusive_w > 0 && exclusive_h > 0 {
-        dimensions.push((exclusive_w, exclusive_h));
-    }
-    if dimensions.first().copied() != Some(inclusive) {
-        dimensions.push(inclusive);
-    }
-
-    dimensions
-}
-
-fn gfx_region_can_suppress_bitmap_fallback(
-    width: u16,
-    height: u16,
-    surface_width: u16,
-    surface_height: u16,
-) -> bool {
-    let area = u32::from(width) * u32::from(height);
-    let surface_area = u32::from(surface_width) * u32::from(surface_height);
-    area.saturating_mul(MIN_GFX_FALLBACK_SUPPRESS_AREA_RATIO) >= surface_area
-}
-
-fn gfx_bgra_to_rgba(data: &[u8], pixel_format: GfxPixelFormat) -> Option<Vec<u8>> {
-    if data.len() % 4 != 0 {
-        return None;
-    }
-
-    let mut rgba = Vec::with_capacity(data.len());
-    for pixel in data.chunks_exact(4) {
-        let b = pixel[0];
-        let g = pixel[1];
-        let r = pixel[2];
-        let a = match pixel_format {
-            GfxPixelFormat::XRgb => 0xff,
-            GfxPixelFormat::ARgb => pixel[3],
-        };
-        rgba.extend_from_slice(&[r, g, b, a]);
     }
     Some(rgba)
 }
@@ -278,212 +147,25 @@ fn hex_prefix(bytes: &[u8], max_len: usize) -> String {
         .join(" ")
 }
 
-struct LoggingDvcListener {
-    channel_name: &'static str,
-}
-
-impl LoggingDvcListener {
-    fn new(channel_name: &'static str) -> Self {
-        Self { channel_name }
-    }
-}
-
-impl ironrdp::dvc::DvcChannelListener for LoggingDvcListener {
-    fn channel_name(&self) -> &str {
-        self.channel_name
-    }
-
-    fn create(&mut self) -> Option<Box<dyn ironrdp::dvc::DvcProcessor>> {
-        Some(Box::new(LoggingDvcProcessor::new(self.channel_name)))
-    }
-}
-
-struct LoggingDvcProcessor {
-    channel_name: &'static str,
-    payload_count: usize,
-}
-
-impl LoggingDvcProcessor {
-    fn new(channel_name: &'static str) -> Self {
-        Self {
-            channel_name,
-            payload_count: 0,
-        }
-    }
-}
-
-impl_as_any!(LoggingDvcProcessor);
-
-impl ironrdp::dvc::DvcProcessor for LoggingDvcProcessor {
-    fn channel_name(&self) -> &str {
-        self.channel_name
-    }
-
-    fn start(&mut self, channel_id: u32) -> ironrdp::pdu::PduResult<Vec<ironrdp::dvc::DvcMessage>> {
-        log::info!(
-            "[rdp-native] Diagnostic DVC opened: '{}' id={channel_id}",
-            self.channel_name
-        );
-        Ok(Vec::new())
-    }
-
-    fn process(
-        &mut self,
-        channel_id: u32,
-        payload: &[u8],
-    ) -> ironrdp::pdu::PduResult<Vec<ironrdp::dvc::DvcMessage>> {
-        self.payload_count += 1;
-        if self.payload_count <= LOGGING_DVC_MAX_PAYLOAD_LOGS {
-            log::info!(
-                "[rdp-native] Diagnostic DVC payload: '{}' id={channel_id} #{} {}B prefix=[{}]",
-                self.channel_name,
-                self.payload_count,
-                payload.len(),
-                hex_prefix(payload, 32)
-            );
-        } else if self.payload_count == LOGGING_DVC_MAX_PAYLOAD_LOGS + 1 {
-            log::info!(
-                "[rdp-native] Diagnostic DVC payload logging suppressed: '{}' after {} messages",
-                self.channel_name,
-                LOGGING_DVC_MAX_PAYLOAD_LOGS
-            );
-        }
-        Ok(Vec::new())
-    }
-
-    fn close(&mut self, channel_id: u32) {
-        log::info!(
-            "[rdp-native] Diagnostic DVC closed: '{}' id={channel_id} payloads={}",
-            self.channel_name,
-            self.payload_count
-        );
-    }
-}
-
 struct NativeGfxHandler {
     frame_tx: FrameSender,
-    gfx_frame_seen: Arc<AtomicBool>,
-    gfx_error: SharedGfxError,
     bitmap_decoder: BitmapStreamDecoder,
-    rfx_decoders: HashMap<u32, session::rfx::DecodingContext>,
-    surface_images: HashMap<u16, DecodedImage>,
     surfaces: HashMap<u16, (u16, u16)>,
 }
 
 impl NativeGfxHandler {
-    fn new(
-        frame_tx: FrameSender,
-        gfx_frame_seen: Arc<AtomicBool>,
-        gfx_error: SharedGfxError,
-    ) -> Self {
+    fn new(frame_tx: FrameSender) -> Self {
         Self {
             frame_tx,
-            gfx_frame_seen,
-            gfx_error,
             bitmap_decoder: BitmapStreamDecoder::default(),
-            rfx_decoders: HashMap::new(),
-            surface_images: HashMap::new(),
             surfaces: HashMap::new(),
         }
     }
 
-    fn mark_gfx_frame_seen(&self, kind: &str) {
-        if !self.gfx_frame_seen.swap(true, Ordering::Relaxed) {
-            log::info!("[rdp-native] GFX first drawable frame confirmed: {kind}");
-        }
-    }
-
-    fn mark_gfx_frame_seen_if_large_enough(
-        &self,
-        kind: &str,
-        width: u16,
-        height: u16,
-        surface_width: u16,
-        surface_height: u16,
-    ) {
-        if gfx_region_can_suppress_bitmap_fallback(width, height, surface_width, surface_height) {
-            self.mark_gfx_frame_seen(kind);
-        } else if !self.gfx_frame_seen.load(Ordering::Relaxed) {
-            log::debug!(
-                "[rdp-native] GFX {kind} frame kept with bitmap fallback: region={}x{} surface={}x{}",
-                width,
-                height,
-                surface_width,
-                surface_height
-            );
-        }
-    }
-
-    fn handle_uncompressed(&mut self, w2s: ironrdp_egfx::pdu::WireToSurface1Pdu) {
-        let rect = w2s.destination_rectangle;
-        let Some((surface_width, surface_height)) = self.surfaces.get(&w2s.surface_id).copied()
-        else {
-            log::warn!(
-                "[rdp-native] GFX Uncompressed skipped: unknown surface id={}",
-                w2s.surface_id
-            );
-            return;
-        };
-
-        let Some((width, height)) = gfx_region_dimensions(&rect, w2s.bitmap_data.len(), 4) else {
-            log::warn!(
-                "[rdp-native] GFX Uncompressed skipped: payload length mismatch surface={} pixel_format={:?} rect={}x{}..{}x{} payload={}B",
-                w2s.surface_id,
-                w2s.pixel_format,
-                rect.left,
-                rect.top,
-                rect.right,
-                rect.bottom,
-                w2s.bitmap_data.len(),
-            );
-            return;
-        };
-
-        let Some(rgba) = gfx_bgra_to_rgba(&w2s.bitmap_data, w2s.pixel_format) else {
-            log::warn!(
-                "[rdp-native] GFX Uncompressed skipped: invalid pixel data len={}",
-                w2s.bitmap_data.len()
-            );
-            return;
-        };
-
-        let frame = build_raw_frame(
-            surface_width,
-            surface_height,
-            rect.left,
-            rect.top,
-            width,
-            height,
-            &rgba,
-        );
-        static UNCOMPRESSED_FRAME_COUNT: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        let n = UNCOMPRESSED_FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 5 || n % 100 == 0 {
-            log::info!(
-                "[rdp-native] GFX Uncompressed decoded #{n} surface={} rect={}x{}..{}x{} size={}x{} payload={}B",
-                w2s.surface_id,
-                rect.left,
-                rect.top,
-                rect.right,
-                rect.bottom,
-                width,
-                height,
-                w2s.bitmap_data.len()
-            );
-        }
-        self.mark_gfx_frame_seen_if_large_enough(
-            "Uncompressed",
-            width,
-            height,
-            surface_width,
-            surface_height,
-        );
-        let _ = self.frame_tx.send(frame);
-    }
-
     fn handle_clearcodec(&mut self, w2s: ironrdp_egfx::pdu::WireToSurface1Pdu) {
         let rect = w2s.destination_rectangle;
+        let width = rect.width();
+        let height = rect.height();
         let Some((surface_width, surface_height)) = self.surfaces.get(&w2s.surface_id).copied()
         else {
             log::warn!(
@@ -494,51 +176,27 @@ impl NativeGfxHandler {
         };
 
         let mut rgb = Vec::new();
-        let mut decoded_size = None;
-        let mut last_error = None;
-        for (width, height) in gfx_rect_dimensions_for_codec(&rect) {
-            rgb.clear();
-            match self.bitmap_decoder.decode_bitmap_stream_to_rgb24(
-                &w2s.bitmap_data,
-                &mut rgb,
-                usize::from(width),
-                usize::from(height),
-            ) {
-                Ok(()) => {
-                    decoded_size = Some((width, height));
-                    break;
-                }
-                Err(err) => {
-                    last_error = Some(err);
-                }
-            }
-        }
-
-        let Some((width, height)) = decoded_size else {
-            static CLEARCODEC_DECODE_ERROR_COUNT: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let n =
-                CLEARCODEC_DECODE_ERROR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 5 || n % 100 == 0 {
-                let err = last_error
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "unknown decode error".to_string());
-                log::warn!(
-                    "[rdp-native] GFX ClearCodec decode failed #{n} surface={} pixel_format={:?} rect={}x{}..{}x{} tried={:?} payload={}B prefix=[{}]: {err}",
-                    w2s.surface_id,
-                    w2s.pixel_format,
-                    rect.left,
-                    rect.top,
-                    rect.right,
-                    rect.bottom,
-                    gfx_rect_dimensions_for_codec(&rect),
-                    w2s.bitmap_data.len(),
-                    hex_prefix(&w2s.bitmap_data, 16),
-                );
-            }
+        if let Err(err) = self.bitmap_decoder.decode_bitmap_stream_to_rgb24(
+            &w2s.bitmap_data,
+            &mut rgb,
+            usize::from(width),
+            usize::from(height),
+        ) {
+            log::error!(
+                "[rdp-native] GFX ClearCodec decode failed surface={} pixel_format={:?} rect={}x{}..{}x{} size={}x{} payload={}B prefix=[{}]: {err}",
+                w2s.surface_id,
+                w2s.pixel_format,
+                rect.left,
+                rect.top,
+                rect.right,
+                rect.bottom,
+                width,
+                height,
+                w2s.bitmap_data.len(),
+                hex_prefix(&w2s.bitmap_data, 16),
+            );
             return;
-        };
+        }
 
         let Some(rgba) = rgb24_to_rgba(&rgb) else {
             log::error!(
@@ -572,123 +230,7 @@ impl NativeGfxHandler {
                 rgba.len()
             );
         }
-        self.mark_gfx_frame_seen_if_large_enough(
-            "ClearCodec",
-            width,
-            height,
-            surface_width,
-            surface_height,
-        );
         let _ = self.frame_tx.send(frame);
-    }
-
-    fn emit_image_rect(
-        &self,
-        image: &DecodedImage,
-        rect: ironrdp::pdu::geometry::InclusiveRectangle,
-    ) {
-        let rw = rect.width();
-        let rh = rect.height();
-        let stride = image.stride();
-        let bpp = image.bytes_per_pixel();
-        let src = image.data();
-        let row_bytes = usize::from(rw) * bpp;
-        let mut region_data = Vec::with_capacity(usize::from(rh) * row_bytes);
-
-        for row in 0..usize::from(rh) {
-            let y = usize::from(rect.top) + row;
-            let start = y * stride + usize::from(rect.left) * bpp;
-            region_data.extend_from_slice(&src[start..start + row_bytes]);
-        }
-
-        let frame = build_raw_frame(
-            image.width(),
-            image.height(),
-            rect.left,
-            rect.top,
-            rw,
-            rh,
-            &region_data,
-        );
-        let _ = self.frame_tx.send(frame);
-    }
-
-    fn handle_remote_fx_progressive(&mut self, w2s: ironrdp_egfx::pdu::WireToSurface2Pdu) {
-        let Some((surface_width, surface_height)) = self.surfaces.get(&w2s.surface_id).copied()
-        else {
-            log::warn!(
-                "[rdp-native] GFX RemoteFxProgressive skipped: unknown surface id={}",
-                w2s.surface_id
-            );
-            return;
-        };
-
-        let destination = ironrdp::pdu::geometry::InclusiveRectangle {
-            left: 0,
-            top: 0,
-            right: surface_width.saturating_sub(1),
-            bottom: surface_height.saturating_sub(1),
-        };
-        let decoder = self
-            .rfx_decoders
-            .entry(w2s.codec_context_id)
-            .or_insert_with(session::rfx::DecodingContext::new);
-        let image = self
-            .surface_images
-            .entry(w2s.surface_id)
-            .or_insert_with(|| {
-                DecodedImage::new(PixelFormat::RgbA32, surface_width, surface_height)
-            });
-
-        let mut cursor = ironrdp::pdu::ReadCursor::new(&w2s.bitmap_data);
-        let mut decoded_rects = Vec::new();
-        while !cursor.is_empty() {
-            match decoder.decode(image, &destination, &mut cursor) {
-                Ok((_frame_id, rect)) => decoded_rects.push(rect),
-                Err(err) => {
-                    static RFX_PROGRESSIVE_ERROR_COUNT: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(0);
-                    let n = RFX_PROGRESSIVE_ERROR_COUNT
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n < 8 || n % 100 == 0 {
-                        log::warn!(
-                            "[rdp-native] GFX RemoteFxProgressive decode failed #{n} surface={} context={} payload={}B prefix=[{}]: {err}",
-                            w2s.surface_id,
-                            w2s.codec_context_id,
-                            w2s.bitmap_data.len(),
-                            hex_prefix(&w2s.bitmap_data, 16),
-                        );
-                    }
-                    break;
-                }
-            }
-        }
-
-        if decoded_rects.is_empty() {
-            return;
-        }
-
-        static RFX_PROGRESSIVE_FRAME_COUNT: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        for rect in decoded_rects {
-            let n = RFX_PROGRESSIVE_FRAME_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 8 || n % 100 == 0 {
-                log::info!(
-                    "[rdp-native] GFX RemoteFxProgressive decoded #{n} surface={} context={} rect={}x{}..{}x{} payload={}B",
-                    w2s.surface_id,
-                    w2s.codec_context_id,
-                    rect.left,
-                    rect.top,
-                    rect.right,
-                    rect.bottom,
-                    w2s.bitmap_data.len(),
-                );
-            }
-            self.mark_gfx_frame_seen("RemoteFxProgressive");
-            if let Some(image) = self.surface_images.get(&w2s.surface_id) {
-                self.emit_image_rect(image, rect);
-            }
-        }
     }
 }
 
@@ -707,26 +249,6 @@ impl GraphicsPipelineHandler for NativeGfxHandler {
 
                 if is_h264 {
                     let rect = w2s.destination_rectangle;
-                    let h264_payload = match extract_gfx_h264_payload(
-                        w2s.codec_id,
-                        &w2s.bitmap_data,
-                    ) {
-                        Ok(payload) => payload,
-                        Err(err) => {
-                            log::warn!(
-                                    "[rdp-native] GFX H264 skipped: surface={} codec={:?} rect={}x{}..{}x{} wrapped_payload={}B prefix=[{}]: {err}",
-                                    w2s.surface_id,
-                                    w2s.codec_id,
-                                    rect.left,
-                                    rect.top,
-                                    rect.right,
-                                    rect.bottom,
-                                    w2s.bitmap_data.len(),
-                                    hex_prefix(&w2s.bitmap_data, 16),
-                                );
-                            return None;
-                        }
-                    };
                     let frame = build_gfx_h264_frame(
                         w2s.surface_id,
                         w2s.codec_id,
@@ -734,7 +256,7 @@ impl GraphicsPipelineHandler for NativeGfxHandler {
                         rect.top,
                         rect.right,
                         rect.bottom,
-                        h264_payload,
+                        &w2s.bitmap_data,
                     );
                     static GFX_FRAME_COUNT: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
@@ -745,16 +267,13 @@ impl GraphicsPipelineHandler for NativeGfxHandler {
                             w2s.surface_id,
                             w2s.codec_id,
                             rect.left,
-	                            rect.top,
-	                            rect.right,
-	                            rect.bottom,
-	                            h264_payload.len()
-	                        );
+                            rect.top,
+                            rect.right,
+                            rect.bottom,
+                            w2s.bitmap_data.len()
+                        );
                     }
-                    self.mark_gfx_frame_seen("H264");
                     let _ = self.frame_tx.send(frame);
-                } else if w2s.codec_id == Codec1Type::Uncompressed {
-                    self.handle_uncompressed(w2s);
                 } else if w2s.codec_id == Codec1Type::ClearCodec {
                     self.handle_clearcodec(w2s);
                 } else {
@@ -768,10 +287,6 @@ impl GraphicsPipelineHandler for NativeGfxHandler {
             GfxPdu::CreateSurface(surface) => {
                 self.surfaces
                     .insert(surface.surface_id, (surface.width, surface.height));
-                self.surface_images.insert(
-                    surface.surface_id,
-                    DecodedImage::new(PixelFormat::RgbA32, surface.width, surface.height),
-                );
                 log::info!(
                     "[rdp-native] GFX CreateSurface id={} {}x{}",
                     surface.surface_id,
@@ -781,7 +296,6 @@ impl GraphicsPipelineHandler for NativeGfxHandler {
             }
             GfxPdu::DeleteSurface(surface) => {
                 self.surfaces.remove(&surface.surface_id);
-                self.surface_images.remove(&surface.surface_id);
                 log::info!("[rdp-native] GFX DeleteSurface id={}", surface.surface_id);
             }
             GfxPdu::MapSurfaceToOutput(map) => {
@@ -794,8 +308,6 @@ impl GraphicsPipelineHandler for NativeGfxHandler {
             }
             GfxPdu::ResetGraphics(reset) => {
                 self.surfaces.clear();
-                self.surface_images.clear();
-                self.rfx_decoders.clear();
                 log::info!(
                     "[rdp-native] GFX ResetGraphics {}x{}",
                     reset.width,
@@ -808,103 +320,8 @@ impl GraphicsPipelineHandler for NativeGfxHandler {
             GfxPdu::EndFrame(frame) => {
                 log::trace!("[rdp-native] GFX EndFrame id={}", frame.frame_id);
             }
-            GfxPdu::CapabilitiesConfirm(confirm) => {
-                if gfx_capability_confirms_h264(&confirm.0) {
-                    log::info!(
-                        "[rdp-native] GFX H.264 capability confirmed: {:?}",
-                        confirm.0
-                    );
-                } else {
-                    let message = gfx_unsupported_message(&confirm.0);
-                    log::error!("[rdp-native] {message}");
-                    set_gfx_error_once(&self.gfx_error, message);
-                }
-            }
-            GfxPdu::WireToSurface2(w2s) => {
-                static W2S2_COUNT: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                let n = W2S2_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 10 || n % 100 == 0 {
-                    log::info!(
-                        "[rdp-native] GFX WireToSurface2 #{n} surface={} codec={:?} context={} pixel_format={:?} payload={}B prefix=[{}]",
-                        w2s.surface_id,
-                        w2s.codec_id,
-                        w2s.codec_context_id,
-                        w2s.pixel_format,
-                        w2s.bitmap_data.len(),
-                        hex_prefix(&w2s.bitmap_data, 16),
-                    );
-                }
-                if w2s.codec_id == ironrdp_egfx::pdu::Codec2Type::RemoteFxProgressive {
-                    self.handle_remote_fx_progressive(w2s);
-                }
-            }
-            GfxPdu::SurfaceToCache(cache) => {
-                static SURFACE_TO_CACHE_COUNT: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                let n = SURFACE_TO_CACHE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 10 || n % 100 == 0 {
-                    log::info!(
-                        "[rdp-native] GFX SurfaceToCache #{n} surface={} slot={} key={} rect={}x{}..{}x{}",
-                        cache.surface_id,
-                        cache.cache_slot,
-                        cache.cache_key,
-                        cache.source_rectangle.left,
-                        cache.source_rectangle.top,
-                        cache.source_rectangle.right,
-                        cache.source_rectangle.bottom,
-                    );
-                }
-            }
-            GfxPdu::CacheToSurface(cache) => {
-                static CACHE_TO_SURFACE_COUNT: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                let n = CACHE_TO_SURFACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 10 || n % 100 == 0 {
-                    log::info!(
-                        "[rdp-native] GFX CacheToSurface #{n} surface={} slot={} points={}",
-                        cache.surface_id,
-                        cache.cache_slot,
-                        cache.destination_points.len(),
-                    );
-                }
-            }
-            GfxPdu::SurfaceToSurface(surface) => {
-                static SURFACE_TO_SURFACE_COUNT: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                let n = SURFACE_TO_SURFACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 10 || n % 100 == 0 {
-                    log::info!(
-                        "[rdp-native] GFX SurfaceToSurface #{n} source={} destination={} rect={}x{}..{}x{} points={}",
-                        surface.source_surface_id,
-                        surface.destination_surface_id,
-                        surface.source_rectangle.left,
-                        surface.source_rectangle.top,
-                        surface.source_rectangle.right,
-                        surface.source_rectangle.bottom,
-                        surface.destination_points.len(),
-                    );
-                }
-            }
-            GfxPdu::SolidFill(fill) => {
-                static SOLID_FILL_COUNT: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                let n = SOLID_FILL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 10 || n % 100 == 0 {
-                    log::info!(
-                        "[rdp-native] GFX SolidFill #{n} surface={} rects={}",
-                        fill.surface_id,
-                        fill.rectangles.len(),
-                    );
-                }
-            }
             other => {
-                static OTHER_GFX_PDU_COUNT: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                let n = OTHER_GFX_PDU_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 10 || n % 100 == 0 {
-                    log::debug!("[rdp-native] GFX PDU skipped #{n}: {:?}", other);
-                }
+                log::trace!("[rdp-native] GFX PDU skipped: {:?}", other);
             }
         }
 
@@ -1313,8 +730,6 @@ async fn run_session(
         .join("cliprdr");
     let _ = std::fs::create_dir_all(&temp_dir);
     let temp_dir_str = temp_dir.to_string_lossy().to_string();
-    let gfx_frame_seen = Arc::new(AtomicBool::new(false));
-    let gfx_error: SharedGfxError = Arc::new(Mutex::new(None));
 
     // Connect through the NextDesk acceleration core for public targets.
     let (connection_result, framed) = connect_tcp(
@@ -1325,8 +740,6 @@ async fn run_session(
         cliprdr_tx,
         &temp_dir_str,
         frame_tx.clone(),
-        gfx_frame_seen.clone(),
-        gfx_error.clone(),
         app.clone(),
     )
     .await
@@ -1357,8 +770,6 @@ async fn run_session(
         &mut input_rx,
         &mut cliprdr_rx,
         frame_tx,
-        gfx_frame_seen,
-        gfx_error,
     )
     .await
     .map_err(|e| format!("Session error: {e}"))
@@ -1377,8 +788,6 @@ async fn connect_tcp(
     cliprdr_action_tx: mpsc::UnboundedSender<CliprdrAction>,
     temp_dir: &str,
     frame_tx: FrameSender,
-    gfx_frame_seen: Arc<AtomicBool>,
-    gfx_error: SharedGfxError,
     app_handle: tauri::AppHandle,
 ) -> ConnectorResult<(ConnectionResult, UpgradedFramed)> {
     let stream = connect_rdp_transport(host, port, route).await?;
@@ -1403,12 +812,7 @@ async fn connect_tcp(
         }
     }
 
-    let drdynvc = build_dynamic_virtual_channels(
-        frame_tx.clone(),
-        render_mode,
-        gfx_frame_seen.clone(),
-        gfx_error,
-    );
+    let drdynvc = build_dynamic_virtual_channels(frame_tx.clone(), render_mode);
     log::info!("[rdp-native] DrdynvcClient channels: {:?}", drdynvc);
 
     let cliprdr_factory =
@@ -1546,22 +950,15 @@ fn is_private_or_reserved_ip(host: &str) -> bool {
 fn build_dynamic_virtual_channels(
     frame_tx: FrameSender,
     mode: NativeRenderMode,
-    gfx_frame_seen: Arc<AtomicBool>,
-    gfx_error: SharedGfxError,
 ) -> ironrdp::dvc::DrdynvcClient {
     let mut drdynvc = ironrdp::dvc::DrdynvcClient::new()
         .with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())))
         .with_dynamic_channel(EchoClient::new());
 
     if mode == NativeRenderMode::GfxH264 {
-        drdynvc = drdynvc
-            .with_dynamic_channel(GraphicsPipelineClient::new(Box::new(
-                NativeGfxHandler::new(frame_tx, gfx_frame_seen, gfx_error),
-            )))
-            .with_listener(LoggingDvcListener::new(VIDEO_DVC_CONTROL_CHANNEL))
-            .with_listener(LoggingDvcListener::new(VIDEO_DVC_DATA_CHANNEL))
-            .with_listener(LoggingDvcListener::new(GEOMETRY_DVC_CHANNEL))
-            .with_listener(LoggingDvcListener::new(INPUT_DVC_CHANNEL));
+        drdynvc = drdynvc.with_dynamic_channel(GraphicsPipelineClient::new(Box::new(
+            NativeGfxHandler::new(frame_tx),
+        )));
         log::info!("[rdp-native] GFX graphics pipeline channel registered");
     }
 
@@ -1619,8 +1016,6 @@ async fn active_session(
     input_rx: &mut mpsc::UnboundedReceiver<NativeRdpInput>,
     cliprdr_rx: &mut mpsc::UnboundedReceiver<CliprdrAction>,
     frame_tx: FrameSender,
-    gfx_frame_seen: Arc<AtomicBool>,
-    gfx_error: SharedGfxError,
 ) -> SessionResult<GracefulDisconnectReason> {
     use ironrdp::connector::connection_activation::ConnectionActivationState;
     use ironrdp::session::fast_path;
@@ -1752,11 +1147,6 @@ async fn active_session(
             }
         };
 
-        if let Some(message) = take_gfx_error(&gfx_error) {
-            log::error!("[rdp-native] ending session because GFX H.264 is unavailable: {message}");
-            return Err(session::reason_err!("RDPGFX", "{}", message));
-        }
-
         for out in outputs {
             match out {
                 ActiveStageOutput::ResponseFrame(frame) => {
@@ -1768,10 +1158,7 @@ async fn active_session(
                 }
 
                 ActiveStageOutput::GraphicsUpdate(region) => {
-                    if !should_emit_bitmap_updates(
-                        render_mode,
-                        gfx_frame_seen.load(Ordering::Relaxed),
-                    ) {
+                    if !should_emit_bitmap_updates(render_mode) {
                         static SUPPRESSED_BITMAP_COUNT: std::sync::atomic::AtomicU64 =
                             std::sync::atomic::AtomicU64::new(0);
                         let n = SUPPRESSED_BITMAP_COUNT
@@ -1951,7 +1338,7 @@ mod tests {
     #[test]
     fn native_rdp_routes_public_targets_through_socks() {
         assert_eq!(
-            choose_native_rdp_route("rdp.example.com", 17897),
+            choose_native_rdp_route("64.20.10.254", 17897),
             NativeRdpRoute::Socks5 { port: 17897 }
         );
         assert_eq!(
@@ -2041,101 +1428,30 @@ mod tests {
     }
 
     #[test]
-    fn gfx_h264_mode_keeps_bitmap_fallback_until_first_gfx_frame() {
-        assert!(should_emit_bitmap_updates(NativeRenderMode::Bitmap, false));
-        assert!(should_emit_bitmap_updates(NativeRenderMode::Bitmap, true));
-        assert!(should_emit_bitmap_updates(NativeRenderMode::GfxH264, false));
-        assert!(!should_emit_bitmap_updates(NativeRenderMode::GfxH264, true));
+    fn gfx_h264_mode_suppresses_bitmap_dirty_rects() {
+        assert!(should_emit_bitmap_updates(NativeRenderMode::Bitmap));
+        assert!(!should_emit_bitmap_updates(NativeRenderMode::GfxH264));
     }
 
     #[test]
-    fn gfx_h264_mode_requires_explicit_env_token() {
-        assert_eq!(native_render_mode_from_env(None), NativeRenderMode::Bitmap);
-        assert_eq!(
-            native_render_mode_from_env(Some("")),
-            NativeRenderMode::Bitmap
-        );
-        assert_eq!(
-            native_render_mode_from_env(Some("1")),
-            NativeRenderMode::Bitmap
-        );
-        assert_eq!(
-            native_render_mode_from_env(Some("true")),
-            NativeRenderMode::Bitmap
-        );
-        assert_eq!(
-            native_render_mode_from_env(Some("yes")),
-            NativeRenderMode::Bitmap
-        );
-        assert_eq!(
-            native_render_mode_from_env(Some("h264")),
-            NativeRenderMode::GfxH264
-        );
-        assert_eq!(
-            native_render_mode_from_env(Some("gfx")),
-            NativeRenderMode::GfxH264
-        );
-        assert_eq!(
-            native_render_mode_from_env(Some("force")),
-            NativeRenderMode::GfxH264
-        );
-    }
-
-    #[test]
-    fn gfx_small_dirty_rects_do_not_suppress_bitmap_fallback() {
-        assert!(!gfx_region_can_suppress_bitmap_fallback(1, 1, 1194, 731));
-        assert!(!gfx_region_can_suppress_bitmap_fallback(42, 64, 1194, 731));
-        assert!(gfx_region_can_suppress_bitmap_fallback(
-            1194, 731, 1194, 731
-        ));
-        assert!(gfx_region_can_suppress_bitmap_fallback(600, 400, 1194, 731));
-    }
-
-    #[test]
-    fn gfx_h264_capabilities_force_v81_avc420_path() {
+    fn gfx_h264_capabilities_advertise_avc_without_disabling_it() {
         let caps = gfx_h264_capabilities();
 
-        assert_eq!(caps.len(), 2);
-        assert!(matches!(
-            caps.first(),
-            Some(ironrdp_egfx::pdu::CapabilitySet::V8_1 { flags })
-                if flags.contains(ironrdp_egfx::pdu::CapabilitiesV81Flags::AVC420_ENABLED)
-        ));
         assert!(caps.iter().any(|cap| matches!(
             cap,
             ironrdp_egfx::pdu::CapabilitySet::V8_1 { flags }
                 if flags.contains(ironrdp_egfx::pdu::CapabilitiesV81Flags::AVC420_ENABLED)
         )));
-        assert!(caps.iter().all(|cap| !matches!(
+        assert!(caps.iter().any(|cap| matches!(
             cap,
-            ironrdp_egfx::pdu::CapabilitySet::V10 { .. }
-                | ironrdp_egfx::pdu::CapabilitySet::V10_7 { .. }
+            ironrdp_egfx::pdu::CapabilitySet::V10 { flags }
+                if !flags.contains(ironrdp_egfx::pdu::CapabilitiesV10Flags::AVC_DISABLED)
         )));
-    }
-
-    #[test]
-    fn gfx_capability_confirm_requires_avc420_flag() {
-        let confirmed_without_h264 = CapabilitySet::V8_1 {
-            flags: CapabilitiesV81Flags::SMALL_CACHE,
-        };
-        let confirmed_with_h264 = CapabilitySet::V8_1 {
-            flags: CapabilitiesV81Flags::SMALL_CACHE | CapabilitiesV81Flags::AVC420_ENABLED,
-        };
-
-        assert!(!gfx_capability_confirms_h264(&confirmed_without_h264));
-        assert!(gfx_capability_confirms_h264(&confirmed_with_h264));
-    }
-
-    #[test]
-    fn gfx_unsupported_message_includes_confirmed_capability() {
-        let confirmed_without_h264 = CapabilitySet::V8_1 {
-            flags: CapabilitiesV81Flags::SMALL_CACHE,
-        };
-
-        let message = gfx_unsupported_message(&confirmed_without_h264);
-
-        assert!(message.contains("did not negotiate AVC420/H.264"));
-        assert!(message.contains("SMALL_CACHE"));
+        assert!(caps.iter().any(|cap| matches!(
+            cap,
+            ironrdp_egfx::pdu::CapabilitySet::V10_7 { flags }
+                if !flags.contains(ironrdp_egfx::pdu::CapabilitiesV107Flags::AVC_DISABLED)
+        )));
     }
 
     #[test]
@@ -2148,44 +1464,6 @@ mod tests {
     #[test]
     fn rgb24_to_rgba_rejects_partial_pixel() {
         assert!(rgb24_to_rgba(&[1, 2, 3, 4]).is_none());
-    }
-
-    #[test]
-    fn gfx_region_dimensions_accepts_inclusive_and_exclusive_rectangles() {
-        let rect = ironrdp::pdu::geometry::InclusiveRectangle {
-            left: 10,
-            top: 20,
-            right: 12,
-            bottom: 22,
-        };
-        assert_eq!(gfx_region_dimensions(&rect, 3 * 3 * 4, 4), Some((3, 3)));
-        assert_eq!(gfx_region_dimensions(&rect, 2 * 2 * 4, 4), Some((2, 2)));
-        assert_eq!(gfx_region_dimensions(&rect, 5, 4), None);
-    }
-
-    #[test]
-    fn gfx_rect_dimensions_for_codec_prefers_exclusive_rectangles() {
-        let rect = ironrdp::pdu::geometry::InclusiveRectangle {
-            left: 1152,
-            top: 0,
-            right: 1192,
-            bottom: 64,
-        };
-
-        assert_eq!(
-            gfx_rect_dimensions_for_codec(&rect).as_slice(),
-            &[(40, 64), (41, 65)]
-        );
-    }
-
-    #[test]
-    fn gfx_bgra_to_rgba_converts_xrgb_and_argb() {
-        let xrgb = gfx_bgra_to_rgba(&[1, 2, 3, 0], GfxPixelFormat::XRgb).expect("valid xrgb");
-        assert_eq!(xrgb, vec![3, 2, 1, 0xff]);
-
-        let argb = gfx_bgra_to_rgba(&[4, 5, 6, 7], GfxPixelFormat::ARgb).expect("valid argb");
-        assert_eq!(argb, vec![6, 5, 4, 7]);
-        assert!(gfx_bgra_to_rgba(&[1, 2, 3], GfxPixelFormat::XRgb).is_none());
     }
 
     #[test]
