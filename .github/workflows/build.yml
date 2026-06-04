@@ -14,7 +14,6 @@ on:
         options:
           - all
           - macos
-          - macos-intel
           - windows
 
 env:
@@ -73,74 +72,13 @@ jobs:
           prerelease: false
           includeUpdaterJson: true
 
-  build-macos-intel:
+  build-windows:
     needs: build-macos
     if: >-
       ${{
         always()
-        && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos-intel')
-        && ((github.event_name == 'workflow_dispatch' && inputs.platform == 'macos-intel') || needs.build-macos.result == 'success')
-      }}
-    runs-on: macos-13
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Checkout patched IronRDP
-        shell: bash
-        run: |
-          git clone --no-tags https://github.com/Devolutions/IronRDP.git ../IronRDP
-          git -C ../IronRDP checkout bf694c8a239d4cf53e7dd8edbe26f2aeb07bcf26
-          git -C ../IronRDP apply "$PWD/patches/ironrdp-nextdesk.patch"
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin
-
-      - name: Install dependencies
-        run: npm install && cd frontend && npm install
-
-      - name: Install FreeRDP
-        run: brew install freerdp
-
-      - name: Download mihomo & geodata
-        run: bash scripts/download-deps.sh x86_64-apple-darwin
-
-      - name: Sanitize signing key
-        run: |
-          KEY=$(echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" | tr -d '\n\r')
-          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY" >> "$GITHUB_ENV"
-
-      - name: Build & Release
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          args: --target x86_64-apple-darwin --config src-tauri/tauri.macos.conf.json
-          tagName: ${{ github.ref_name }}
-          releaseName: "NextDesk ${{ github.ref_name }}"
-          releaseBody: "See the assets below for download."
-          releaseDraft: false
-          prerelease: false
-          includeUpdaterJson: true
-
-  build-windows:
-    needs: [build-macos, build-macos-intel]
-    if: >-
-      ${{
-        always()
         && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows')
-        && (
-          (github.event_name == 'workflow_dispatch' && inputs.platform == 'windows')
-          || (needs.build-macos.result == 'success' && needs.build-macos-intel.result == 'success')
-        )
+        && ((github.event_name == 'workflow_dispatch' && inputs.platform == 'windows') || needs.build-macos.result == 'success')
       }}
     runs-on: windows-latest
     permissions:
