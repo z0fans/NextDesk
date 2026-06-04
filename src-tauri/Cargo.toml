@@ -1,6 +1,6 @@
 [package]
 name = "nextdesk"
-version = "1.0.104"
+version = "1.0.105"
 edition = "2021"
 
 [dependencies]
