@@ -442,7 +442,7 @@ export function RdpManager({
   resModeRef.current = resMode;
   const [showNewConn, setShowNewConn] = useState(false);
   const [editServerId, setEditServerId] = useState<string | null>(null);
-  const [proxyPort, setProxyPort] = useState(18765);
+  const [proxyPort, setProxyPort] = useState(0);
 
 
 
@@ -679,7 +679,16 @@ export function RdpManager({
 
   useEffect(() => {
     installRdpConsoleBridge();
-    invoke<number>('get_rdp_proxy_port').then(setProxyPort).catch(() => { });
+    invoke<number>('get_rdp_proxy_port')
+      .then(port => {
+        setProxyPort(port > 0 ? port : 0);
+      })
+      .catch(error => {
+        setProxyPort(0);
+        rdpLog.error('connection', 'rdp proxy port unavailable', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
     invoke<'session-file-url' | 'pasteboard-promise'>('get_mac_clipboard_strategy')
       .then(setMacClipboardStrategy)
       .catch(() => {});
@@ -1027,12 +1036,30 @@ export function RdpManager({
         throw new Error(`Unsupported RDP engine mode: ${RDP_ENGINE_MODE}`);
       }
 
+      let currentProxyPort = proxyPort;
+      try {
+        const latestProxyPort = await invoke<number>('get_rdp_proxy_port');
+        currentProxyPort = latestProxyPort > 0 ? latestProxyPort : 0;
+        if (currentProxyPort !== proxyPort) {
+          setProxyPort(currentProxyPort);
+        }
+      } catch (error) {
+        currentProxyPort = 0;
+        setProxyPort(0);
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`RDP local proxy is unavailable: ${detail}`);
+      }
+
+      if (currentProxyPort <= 0) {
+        throw new Error('RDP local proxy is unavailable: 127.0.0.1:18765 is not bound');
+      }
+
       rdpLog.info('connection', 'official ironrdp web connect request', {
         attemptId,
         tabId,
         host: server.host,
         port: server.port,
-        proxyPort,
+        proxyPort: currentProxyPort,
         width: w,
         height: h,
         officialWebFeatures: {
@@ -1047,7 +1074,7 @@ export function RdpManager({
 
       const size = new wasm.DesktopSize(w, h);
       const builder = new wasm.SessionBuilder()
-        .proxyAddress(`ws://127.0.0.1:${proxyPort}`)
+        .proxyAddress(`ws://127.0.0.1:${currentProxyPort}`)
         .authToken('nextdesk-local')
         .destination(`${server.host}:${server.port}`)
         .username(server.username)

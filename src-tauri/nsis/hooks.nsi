@@ -1,7 +1,8 @@
 !macro NSIS_HOOK_PREINSTALL
   ; Stop old processes before copying files. Runtime core copies are named
-  ; nextdesk-core-<parent-pid>-<timestamp>.exe, so the wildcard is required.
-  nsExec::ExecToLog 'taskkill /F /T /IM nextdesk-core-*.exe'
+  ; nextdesk-core-<parent-pid>-<timestamp>.exe, and taskkill /IM does not
+  ; match that wildcard reliably. PowerShell Get-Process does.
+  nsExec::ExecToLog 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-Process -Name nextdesk-core-* -ErrorAction SilentlyContinue | Stop-Process -Force"'
   nsExec::ExecToLog 'taskkill /F /T /IM nextdesk-core.exe'
   nsExec::ExecToLog 'taskkill /F /T /IM nextdesk.exe'
 !macroend
@@ -15,7 +16,7 @@
 !macro NSIS_HOOK_PREUNINSTALL
   ; Stop running processes before removing installed files. Runtime core copies
   ; are named nextdesk-core-<parent-pid>-<timestamp>.exe.
-  nsExec::ExecToLog 'taskkill /F /T /IM nextdesk-core-*.exe'
+  nsExec::ExecToLog 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-Process -Name nextdesk-core-* -ErrorAction SilentlyContinue | Stop-Process -Force"'
   nsExec::ExecToLog 'taskkill /F /T /IM nextdesk-core.exe'
   nsExec::ExecToLog 'taskkill /F /T /IM nextdesk.exe'
 !macroend

@@ -27,6 +27,43 @@ use std::collections::HashMap;
 use std::net::{IpAddr, TcpListener, UdpSocket};
 use tauri::{AppHandle, Manager, State};
 
+#[cfg(target_os = "windows")]
+fn cleanup_previous_windows_runtime_processes() {
+    let current_pid = std::process::id();
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         Get-Process -Name nextdesk-core-* | Stop-Process -Force; \
+         Get-Process -Name nextdesk | Where-Object {{ $_.Id -ne {current_pid} }} | Stop-Process -Force"
+    );
+
+    match std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .output()
+    {
+        Ok(output) => {
+            log::info!(
+                "[startup] Windows stale NextDesk cleanup exit={} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Err(err) => {
+            log::warn!("[startup] Windows stale NextDesk cleanup failed: {err}");
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn cleanup_previous_windows_runtime_processes() {}
+
 #[tauri::command]
 async fn start_engine(
     app_state: State<'_, AppState>,
@@ -237,9 +274,11 @@ fn get_status(app_state: State<'_, AppState>) -> Result<Value, String> {
         }
     };
     let rdp_port = *app_state.rdp_proxy_port.lock().unwrap();
+    let rdp_proxy_error = app_state.rdp_proxy_error.lock().unwrap().clone();
     Ok(serde_json::json!({
         "clash": clash_running,
         "rdp_proxy_port": rdp_port,
+        "rdp_proxy_error": rdp_proxy_error,
     }))
 }
 
@@ -260,7 +299,16 @@ fn save_config() -> Result<bool, String> {
 
 #[tauri::command]
 fn get_rdp_proxy_port(app_state: State<'_, AppState>) -> Result<u16, String> {
-    Ok(*app_state.rdp_proxy_port.lock().unwrap())
+    if let Some(error) = app_state.rdp_proxy_error.lock().unwrap().clone() {
+        return Err(error);
+    }
+
+    let port = *app_state.rdp_proxy_port.lock().unwrap();
+    if port == 0 {
+        return Err("RDP local proxy is unavailable; 127.0.0.1:18765 is not bound".into());
+    }
+
+    Ok(port)
 }
 
 #[tauri::command]
@@ -1094,6 +1142,7 @@ async fn trigger_sync_now(app: AppHandle) -> Result<(), String> {
 pub fn run() {
     // Initialize structured logging FIRST so all subsequent code can log.
     logging::init();
+    cleanup_previous_windows_runtime_processes();
 
     // Load saved config on startup
     let saved = config::load_saved_config();
@@ -1206,6 +1255,8 @@ pub fn run() {
 
             let state = app.state::<AppState>();
             let rdp_port = *state.rdp_proxy_port.lock().unwrap();
+            let rdp_proxy_port_state = state.rdp_proxy_port.clone();
+            let rdp_proxy_error = state.rdp_proxy_error.clone();
             let socks_port = state.proxy_port.clone();
             let tube_enabled = state.tube_enabled.clone();
             let cloud_mode = state.cloud_mode.clone();
@@ -1221,6 +1272,8 @@ pub fn run() {
                     relay_endpoints,
                     dashboard_url,
                     relay_api_key,
+                    rdp_proxy_port_state,
+                    rdp_proxy_error,
                 )
                 .await;
             });

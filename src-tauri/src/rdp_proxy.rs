@@ -11,6 +11,8 @@ use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 
 /// Shared SOCKS5 port that can be updated at runtime (after Clash detect).
 pub type SharedSocksPort = Arc<Mutex<u16>>;
+type SharedRdpProxyPort = Arc<Mutex<u16>>;
+type SharedRdpProxyError = Arc<Mutex<Option<String>>>;
 
 /// Cloud mode shared state types
 type SharedBool = Arc<Mutex<bool>>;
@@ -26,23 +28,28 @@ pub async fn start_proxy(
     relay_endpoints: SharedEndpoints,
     dashboard_url: SharedString,
     relay_api_key: SharedString,
+    advertised_port: SharedRdpProxyPort,
+    bind_error: SharedRdpProxyError,
 ) {
-    // Bind to 127.0.0.1 (IPv4 loopback). If that fails, try [::1] (IPv6).
+    // Official-web connects to ws://127.0.0.1:<port>, so this proxy must bind
+    // IPv4 loopback. Falling back to [::1] makes the backend look healthy while
+    // the frontend still connects to a stale or wrong IPv4 listener.
     let listener = match TcpListener::bind(format!("127.0.0.1:{port}")).await {
         Ok(l) => {
+            *advertised_port.lock().unwrap() = port;
+            *bind_error.lock().unwrap() = None;
             log::info!("[rdp_proxy] RDCleanPath proxy on 127.0.0.1:{port} (IPv4)");
             l
         }
-        Err(_) => match TcpListener::bind(format!("[::1]:{port}")).await {
-            Ok(l) => {
-                log::info!("[rdp_proxy] RDCleanPath proxy on [::1]:{port} (IPv6)");
-                l
-            }
-            Err(e) => {
-                log::error!("[rdp_proxy] Cannot bind port {port}: {e}");
-                return;
-            }
-        },
+        Err(e) => {
+            let message = format!(
+                "[rdp_proxy] Cannot bind 127.0.0.1:{port}: {e}. official-web requires the IPv4 loopback proxy; stale NextDesk processes may still own the port."
+            );
+            *advertised_port.lock().unwrap() = 0;
+            *bind_error.lock().unwrap() = Some(message.clone());
+            log::error!("{message}");
+            return;
+        }
     };
 
     loop {

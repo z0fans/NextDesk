@@ -20,6 +20,7 @@ export interface RelayEndpoint {
 export interface EngineStatus {
   clash: boolean;
   rdp_proxy_port: number;
+  rdp_proxy_error?: string | null;
 }
 
 export interface Server {
