@@ -211,14 +211,6 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
-    readonly __wbg_rdpfile_free: (a: number, b: number) => void;
-    readonly rdpfile_create: () => number;
-    readonly rdpfile_parse: (a: number, b: number, c: number) => void;
-    readonly rdpfile_write: (a: number) => [number, number];
-    readonly rdpfile_insertStr: (a: number, b: number, c: number, d: number, e: number) => void;
-    readonly rdpfile_insertInt: (a: number, b: number, c: number, d: number) => void;
-    readonly rdpfile_getStr: (a: number, b: number, c: number) => [number, number];
-    readonly rdpfile_getInt: (a: number, b: number, c: number) => number;
     readonly __wbg_session_free: (a: number, b: number) => void;
     readonly __wbg_sessionbuilder_free: (a: number, b: number) => void;
     readonly __wbg_sessionterminationinfo_free: (a: number, b: number) => void;
@@ -278,6 +270,14 @@ export interface InitOutput {
     readonly ironerror_backtrace: (a: number) => [number, number];
     readonly ironerror_kind: (a: number) => number;
     readonly ironerror_rdcleanpathDetails: (a: number) => number;
+    readonly __wbg_rdpfile_free: (a: number, b: number) => void;
+    readonly rdpfile_create: () => number;
+    readonly rdpfile_parse: (a: number, b: number, c: number) => void;
+    readonly rdpfile_write: (a: number) => [number, number];
+    readonly rdpfile_insertStr: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly rdpfile_insertInt: (a: number, b: number, c: number, d: number) => void;
+    readonly rdpfile_getStr: (a: number, b: number, c: number) => [number, number];
+    readonly rdpfile_getInt: (a: number, b: number, c: number) => number;
     readonly __wbg_desktopsize_free: (a: number, b: number) => void;
     readonly __wbg_get_desktopsize_width: (a: number) => number;
     readonly __wbg_set_desktopsize_width: (a: number, b: number) => void;

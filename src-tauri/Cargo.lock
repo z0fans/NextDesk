@@ -3595,6 +3595,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "ironrdp",
+ "ironrdp-bulk",
  "ironrdp-cliprdr-native",
  "ironrdp-core",
  "ironrdp-dvc",

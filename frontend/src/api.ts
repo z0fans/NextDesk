@@ -214,9 +214,13 @@ export const api = {
   // ── Diagnostic Logs ──────────────────────────────────
   logShowInFinder: () => invoke<void>('log_show_in_finder'),
   logCopyToDesktop: () => invoke<string>('log_copy_to_desktop'),
+  logCopyDiagnosticBundleToDesktop: () => invoke<string>('log_copy_diagnostic_bundle_to_desktop'),
   logClear: () => invoke<void>('log_clear'),
   logFilePath: () => invoke<string>('log_file_path_str'),
   logFileSize: () => invoke<number>('log_file_size'),
+  rdpLogClear: () => invoke<void>('rdp_log_clear'),
+  rdpLogFilePath: () => invoke<string>('rdp_log_file_path_str'),
+  rdpLogFileSize: () => invoke<number>('rdp_log_file_size'),
 };
 
 // ── Tauri Event Types (small, via emit) ─────────────

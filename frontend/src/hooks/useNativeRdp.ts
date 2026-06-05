@@ -10,11 +10,17 @@
 import { useEffect, useRef } from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { RdpPointerEvent, RdpStatusEvent } from '@/api';
+import { compactNativeFrameQueue } from '@/lib/native-frame-queue';
 import { rdpLog } from '@/lib/rdp-logger';
 
 const GFX_FRAME_MAGIC = 0xffff;
 const GFX_FRAME_KIND_H264 = 1;
 const GFX_FRAME_HEADER_SIZE = 20;
+const BITMAP_FLUSH_BUDGET_MS = 4;
+const BITMAP_MAX_FRAMES_PER_FLUSH = 3;
+const BITMAP_QUEUE_COMPACT_THRESHOLD = 48;
+const BITMAP_QUEUE_HARD_LIMIT = 180;
+const BITMAP_BACKLOG_WARN_THRESHOLD = 120;
 
 export interface NativeGfxH264Frame {
   surfaceId: number;
@@ -24,6 +30,15 @@ export interface NativeGfxH264Frame {
   right: number;
   bottom: number;
   data: ArrayBuffer;
+}
+
+export interface NativeBitmapFrameInfo {
+  desktopW: number;
+  desktopH: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 // ── LZ4 Block Decompressor (pure TypeScript, no deps) ───────
@@ -110,7 +125,8 @@ function initGL2(canvas: HTMLCanvasElement): GL2Renderer | null {
     alpha: false,
     antialias: false,
     desynchronized: true,
-    preserveDrawingBuffer: true,
+    powerPreference: 'high-performance',
+    preserveDrawingBuffer: false,
   });
   if (!gl) return null;
 
@@ -169,8 +185,14 @@ const HEADER_SIZE = 12;
 interface UseNativeRdpOptions {
   tabId: string | null;
   canvas: HTMLCanvasElement | null;
-  onFrame?: () => void;
+  onFrame?: (frame?: NativeBitmapFrameInfo) => void;
   onStatus?: (tabId: string, status: string, message?: string) => void;
+}
+
+interface NativeFrameDebugContext {
+  tabId?: string;
+  host?: string;
+  shouldRenderFrame?: () => boolean;
 }
 
 /**
@@ -180,13 +202,20 @@ interface UseNativeRdpOptions {
 export function connectFrameWebSocket(
   wsPort: number,
   canvas: HTMLCanvasElement,
-  onFrame?: () => void,
+  onFrame?: (frame?: NativeBitmapFrameInfo) => void,
   onGfxH264Frame?: (frame: NativeGfxH264Frame) => void,
+  onUnexpectedClose?: (event: CloseEvent) => void,
+  debugContext: NativeFrameDebugContext = {},
 ): () => void {
+  const logContext = {
+    wsPort,
+    tabId: debugContext.tabId,
+    host: debugContext.host,
+  };
   const renderer = initGL2(canvas);
   if (!renderer) {
     rdpLog.error('render', 'WebGL2 init failed for native frame websocket', {
-      wsPort,
+      ...logContext,
       canvasWidth: canvas.width,
       canvasHeight: canvas.height,
     });
@@ -195,7 +224,7 @@ export function connectFrameWebSocket(
 
   const { gl, texture } = renderer;
   rdpLog.info('render', 'native frame renderer initialized', {
-    wsPort,
+    ...logContext,
     canvasWidth: canvas.width,
     canvasHeight: canvas.height,
   });
@@ -205,19 +234,149 @@ export function connectFrameWebSocket(
   let currentH = 0;
   let textureInitialized = false;
 
-  // ── rAF draw batching ──
+  // ── rAF frame/upload batching ──
+  // WebSocket events can arrive in bursts during window drag/selection.
+  // Queueing them into the next rAF keeps texture uploads aligned to the
+  // browser's paint cadence instead of slicing the main thread per packet.
+  const frameQueue: ArrayBuffer[] = [];
   let needsDraw = false;
-  let rafId = 0;
+  let renderRafId = 0;
+  let highQueueLogged = false;
+  let lastBatchLogAt = 0;
+  let lastCompactLogAt = 0;
 
-  function scheduleDraw() {
-    if (!needsDraw) {
-      needsDraw = true;
-      rafId = requestAnimationFrame(() => {
-        if (needsDraw) {
-          gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-          needsDraw = false;
-        }
+  // ── Stream stats ──
+  let receivedFrames = 0;
+  let receivedBytes = 0;
+  let processedBitmapFrames = 0;
+  let processedGfxFrames = 0;
+  let drawnFrames = 0;
+  let droppedDuplicateFrames = 0;
+  let droppedOverflowFrames = 0;
+  let droppedInactiveFrames = 0;
+  let maxQueueLength = 0;
+  let lastFrameAt = 0;
+  let lastFlushMs = 0;
+  let lastStatsAt = performance.now();
+  let lastStatsReceivedFrames = 0;
+  let lastStatsReceivedBytes = 0;
+  let lastStatsProcessedFrames = 0;
+  let lastStatsDrawnFrames = 0;
+
+  function bytesToMiB(bytes: number) {
+    return bytes / 1024 / 1024;
+  }
+
+  function logFrameStreamStats(reason: string) {
+    const now = performance.now();
+    const elapsed = Math.max((now - lastStatsAt) / 1000, 0.001);
+    const processedFrames = processedBitmapFrames + processedGfxFrames;
+    const deltaReceivedFrames = receivedFrames - lastStatsReceivedFrames;
+    const deltaReceivedBytes = receivedBytes - lastStatsReceivedBytes;
+    const deltaProcessedFrames = processedFrames - lastStatsProcessedFrames;
+    const deltaDrawnFrames = drawnFrames - lastStatsDrawnFrames;
+
+    rdpLog.info('render', 'native frame stream stats', {
+      ...logContext,
+      reason,
+      recvFrames: deltaReceivedFrames,
+      recvFps: Math.round((deltaReceivedFrames / elapsed) * 10) / 10,
+      recvMiBS: Math.round((bytesToMiB(deltaReceivedBytes) / elapsed) * 100) / 100,
+      processedFrames: deltaProcessedFrames,
+      processedFps: Math.round((deltaProcessedFrames / elapsed) * 10) / 10,
+      drawnFrames: deltaDrawnFrames,
+      drawFps: Math.round((deltaDrawnFrames / elapsed) * 10) / 10,
+      queued: frameQueue.length,
+      maxQueue: maxQueueLength,
+      droppedDuplicateFrames,
+      droppedOverflowFrames,
+      droppedInactiveFrames,
+      lastFrameAgeMs: lastFrameAt > 0 ? Math.round(now - lastFrameAt) : null,
+      lastFlushMs: Math.round(lastFlushMs * 10) / 10,
+      totalReceivedFrames: receivedFrames,
+      totalProcessedFrames: processedFrames,
+      totalDrawnFrames: drawnFrames,
+    });
+
+    lastStatsAt = now;
+    lastStatsReceivedFrames = receivedFrames;
+    lastStatsReceivedBytes = receivedBytes;
+    lastStatsProcessedFrames = processedFrames;
+    lastStatsDrawnFrames = drawnFrames;
+    maxQueueLength = frameQueue.length;
+    droppedDuplicateFrames = 0;
+    droppedOverflowFrames = 0;
+    droppedInactiveFrames = 0;
+  }
+
+  function markNeedsDraw() {
+    needsDraw = true;
+  }
+
+  function scheduleFrameFlush() {
+    if (renderRafId !== 0) return;
+    renderRafId = requestAnimationFrame(flushFrameQueue);
+  }
+
+  function flushFrameQueue() {
+    renderRafId = 0;
+    const startedAt = performance.now();
+    let processed = 0;
+    const queuedAtStart = frameQueue.length;
+    const maxFramesThisFlush = Math.min(queuedAtStart, BITMAP_MAX_FRAMES_PER_FLUSH);
+
+    while (processed < maxFramesThisFlush) {
+      const raw = frameQueue[processed];
+      try {
+        handleBitmapFrame(raw);
+        processed++;
+      } catch (error) {
+        rdpLog.error('render', 'native frame handling failed', {
+          wsPort,
+          byteLength: raw.byteLength,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+
+      if (processed > 0 && performance.now() - startedAt >= BITMAP_FLUSH_BUDGET_MS) {
+        break;
+      }
+    }
+
+    if (processed > 0) {
+      frameQueue.splice(0, processed);
+    }
+
+    if (needsDraw) {
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      drawnFrames++;
+      needsDraw = false;
+    }
+
+    const elapsed = performance.now() - startedAt;
+    lastFlushMs = elapsed;
+    const now = performance.now();
+    const hasBacklog = frameQueue.length > 0;
+    if (
+      processed > 0 &&
+      (elapsed > BITMAP_FLUSH_BUDGET_MS || queuedAtStart > 32 || hasBacklog) &&
+      now - lastBatchLogAt > 1000
+    ) {
+      lastBatchLogAt = now;
+      rdpLog.debug('render', 'native frame batch flushed', {
+        ...logContext,
+        processed,
+        queuedAtStart,
+        remaining: frameQueue.length,
+        ms: Math.round(elapsed * 10) / 10,
       });
+    }
+
+    if (hasBacklog) {
+      scheduleFrameFlush();
+    } else if (highQueueLogged) {
+      highQueueLogged = false;
     }
   }
 
@@ -244,31 +403,67 @@ export function connectFrameWebSocket(
   // ── WebSocket ──
   const ws = new WebSocket(`ws://127.0.0.1:${wsPort}`);
   ws.binaryType = 'arraybuffer';
+  let closedByCleanup = false;
+  const statsTimer = window.setInterval(() => {
+    logFrameStreamStats('interval');
+  }, 5000);
 
   ws.onopen = () => {
     console.log(`[frame-ws] connected to port ${wsPort}`);
-    rdpLog.info('render', 'native frame websocket opened', { wsPort });
+    rdpLog.info('render', 'native frame websocket opened', logContext);
   };
 
   ws.onmessage = (event: MessageEvent) => {
-    const raw: ArrayBuffer = event.data;
-    try {
-      handleBitmapFrame(raw);
-    } catch (error) {
-      rdpLog.error('render', 'native frame handling failed', {
-        wsPort,
-        byteLength: raw.byteLength,
-        error: error instanceof Error ? error.message : String(error),
-      });
-      throw error;
+    const raw = event.data as ArrayBuffer;
+    receivedFrames++;
+    receivedBytes += raw.byteLength;
+    lastFrameAt = performance.now();
+
+    if (debugContext.shouldRenderFrame && !debugContext.shouldRenderFrame()) {
+      droppedInactiveFrames++;
+      return;
     }
+
+    frameQueue.push(raw);
+    maxQueueLength = Math.max(maxQueueLength, frameQueue.length);
+    if (frameQueue.length > BITMAP_QUEUE_COMPACT_THRESHOLD) {
+      const compacted = compactNativeFrameQueue(frameQueue, {
+        maxFrames: BITMAP_QUEUE_HARD_LIMIT,
+      });
+      if (
+        compacted.droppedDuplicateFrames > 0 ||
+        compacted.droppedOverflowFrames > 0
+      ) {
+        droppedDuplicateFrames += compacted.droppedDuplicateFrames;
+        droppedOverflowFrames += compacted.droppedOverflowFrames;
+        frameQueue.splice(0, frameQueue.length, ...compacted.frames);
+        const now = performance.now();
+        if (now - lastCompactLogAt > 1000) {
+          lastCompactLogAt = now;
+          rdpLog.debug('render', 'native frame queue compacted', {
+            ...logContext,
+            queued: frameQueue.length,
+            droppedDuplicateFrames: compacted.droppedDuplicateFrames,
+            droppedOverflowFrames: compacted.droppedOverflowFrames,
+          });
+        }
+      }
+    }
+    if (!highQueueLogged && frameQueue.length > BITMAP_BACKLOG_WARN_THRESHOLD) {
+      highQueueLogged = true;
+      rdpLog.warn('render', 'native frame queue is backing up', {
+        ...logContext,
+        queued: frameQueue.length,
+      });
+    }
+    scheduleFrameFlush();
   };
 
   // ── Bitmap frame handler (with LZ4 decompression) ──
   function handleBitmapFrame(raw: ArrayBuffer) {
     if (raw.byteLength < HEADER_SIZE) {
       rdpLog.warn('render', 'native frame too short', {
-        wsPort,
+        ...logContext,
         byteLength: raw.byteLength,
       });
       return;
@@ -294,7 +489,7 @@ export function connectFrameWebSocket(
     if (!firstBitmapFrameLogged) {
       firstBitmapFrameLogged = true;
       rdpLog.info('render', 'first native bitmap frame received', {
-        wsPort,
+        ...logContext,
         desktopW,
         desktopH,
         x,
@@ -321,7 +516,6 @@ export function connectFrameWebSocket(
       );
       textureInitialized = true;
       needsDraw = false;
-      cancelAnimationFrame(rafId);
     }
 
     if (!textureInitialized) return;
@@ -337,7 +531,7 @@ export function connectFrameWebSocket(
       const expectedBytes = width * height * 4;
       if (raw.byteLength < HEADER_SIZE + expectedBytes) {
         rdpLog.warn('render', 'native bitmap frame payload too short', {
-          wsPort,
+          ...logContext,
           width,
           height,
           expectedBytes,
@@ -355,8 +549,9 @@ export function connectFrameWebSocket(
       gl.RGBA, gl.UNSIGNED_BYTE, pixelData,
     );
 
-    scheduleDraw();
-    onFrame?.();
+    markNeedsDraw();
+    processedBitmapFrames++;
+    onFrame?.({ desktopW, desktopH, x, y, width, height });
     logFps();
   }
 
@@ -372,7 +567,7 @@ export function connectFrameWebSocket(
     const payloadEnd = payloadStart + payloadLen;
     if (payloadEnd > raw.byteLength) {
       rdpLog.warn('render', 'native GFX frame payload too short', {
-        wsPort,
+        ...logContext,
         payloadLen,
         byteLength: raw.byteLength,
       });
@@ -383,7 +578,7 @@ export function connectFrameWebSocket(
     if (!firstGfxFrameLogged) {
       firstGfxFrameLogged = true;
       rdpLog.info('render', 'first native GFX frame received', {
-        wsPort,
+        ...logContext,
         surfaceId: hdr.getUint16(4, true),
         codecId: hdr.getUint16(6, true),
         payloadLen,
@@ -398,22 +593,45 @@ export function connectFrameWebSocket(
       bottom: hdr.getUint16(14, true),
       data,
     });
+    processedGfxFrames++;
+    onFrame?.();
   }
 
   ws.onerror = (e) => {
     console.error('[frame-ws] error:', e);
-    rdpLog.error('render', 'native frame websocket error', { wsPort });
+    rdpLog.error('render', 'native frame websocket error', logContext);
   };
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
     console.log('[frame-ws] disconnected');
-    rdpLog.info('render', 'native frame websocket closed', { wsPort });
-    cancelAnimationFrame(rafId);
+    logFrameStreamStats('close');
+    window.clearInterval(statsTimer);
+    rdpLog.info('render', 'native frame websocket closed', {
+      ...logContext,
+      code: event.code,
+      reason: event.reason,
+      wasClean: event.wasClean,
+      closedByCleanup,
+    });
+    if (renderRafId !== 0) {
+      cancelAnimationFrame(renderRafId);
+      renderRafId = 0;
+    }
+    frameQueue.length = 0;
+    if (!closedByCleanup) {
+      onUnexpectedClose?.(event);
+    }
   };
 
   // Cleanup function
   return () => {
-    cancelAnimationFrame(rafId);
+    closedByCleanup = true;
+    window.clearInterval(statsTimer);
+    if (renderRafId !== 0) {
+      cancelAnimationFrame(renderRafId);
+      renderRafId = 0;
+    }
+    frameQueue.length = 0;
     if (ws.readyState <= WebSocket.OPEN) {
       ws.close();
     }

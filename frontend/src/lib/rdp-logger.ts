@@ -116,6 +116,30 @@ function createLogger() {
     return filter.split(',').includes(module);
   }
 
+  function setLevel(level: RdpLogLevel) {
+    (window as any).__RDP_LOG_LEVEL = level;
+  }
+
+  function getLevel(): RdpLogLevel {
+    return ((window as any).__RDP_LOG_LEVEL || DEFAULT_MIN_LEVEL) as RdpLogLevel;
+  }
+
+  function setModules(modules: RdpLogModule[]) {
+    if (modules.length === 0) {
+      delete (window as any).__RDP_LOG_MODULES;
+      return;
+    }
+    (window as any).__RDP_LOG_MODULES = modules.join(',');
+  }
+
+  function getModules(): RdpLogModule[] {
+    const filter = (window as any).__RDP_LOG_MODULES as string | undefined;
+    if (!filter) return [];
+    return filter
+      .split(',')
+      .filter(Boolean) as RdpLogModule[];
+  }
+
   function log(
     level: RdpLogLevel,
     module: RdpLogModule,
@@ -169,6 +193,10 @@ function createLogger() {
     error: (module: RdpLogModule, msg: string, data?: any) =>
       log('error', module, msg, data),
     flush: doFlush,
+    setLevel,
+    getLevel,
+    setModules,
+    getModules,
   };
 }
 

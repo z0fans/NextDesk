@@ -182,8 +182,10 @@ fn prepare_runtime_engine_binary(source: &Path) -> Result<PathBuf, String> {
         .and_then(|ext| ext.to_str())
         .map(|ext| format!(".{ext}"))
         .unwrap_or_default();
-    let runtime_path =
-        runtime_dir.join(format!("nextdesk-core-{}-{suffix}{extension}", std::process::id()));
+    let runtime_path = runtime_dir.join(format!(
+        "nextdesk-core-{}-{suffix}{extension}",
+        std::process::id()
+    ));
 
     fs::copy(source, &runtime_path)
         .map_err(|e| format!("Copy runtime engine binary failed: {e}"))?;

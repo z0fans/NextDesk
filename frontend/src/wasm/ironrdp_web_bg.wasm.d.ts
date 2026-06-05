@@ -35,6 +35,7 @@ export const sessionbuilder_remoteClipboardChangedCallback: (a: number, b: any) 
 export const sessionbuilder_forceClipboardUpdateCallback: (a: number, b: any) => number;
 export const sessionbuilder_fileContentsRequestCallback: (a: number, b: any) => number;
 export const sessionbuilder_fileContentsResponseCallback: (a: number, b: any) => number;
+export const sessionbuilder_fileChunkCallback: (a: number, b: any) => number;
 export const sessionbuilder_canvasResizedCallback: (a: number, b: any) => number;
 export const sessionbuilder_extension: (a: number, b: number) => number;
 export const sessionbuilder_connect: (a: number) => any;

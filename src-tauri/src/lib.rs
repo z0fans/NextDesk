@@ -138,7 +138,9 @@ async fn start_engine_inner(app_state: &AppState) -> Result<bool, String> {
             return Ok(true);
         }
 
-        log::warn!("[start_engine] Existing Clash process is running but API is not ready; restarting");
+        log::warn!(
+            "[start_engine] Existing Clash process is running but API is not ready; restarting"
+        );
         discard_internal_engine(app_state);
     }
 
@@ -152,7 +154,7 @@ async fn start_engine_inner(app_state: &AppState) -> Result<bool, String> {
     }
 
     // Ensure interface-name is set to bypass external TUN/VPN
-    config::ensure_interface_name(&config_path);
+    config::ensure_runtime_network_config(&config_path);
     let runtime_ports = choose_runtime_ports()?;
     config::patch_runtime_ports(&config_path, runtime_ports)?;
     let api_base = format!("http://127.0.0.1:{}", runtime_ports.controller_port);
@@ -532,6 +534,73 @@ fn rdp_log_path() -> std::path::PathBuf {
 }
 
 #[tauri::command]
+fn rdp_log_file_path_str() -> String {
+    rdp_log_path().to_string_lossy().to_string()
+}
+
+#[tauri::command]
+fn rdp_log_file_size() -> u64 {
+    std::fs::metadata(rdp_log_path())
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+#[tauri::command]
+fn log_copy_diagnostic_bundle_to_desktop() -> Result<String, String> {
+    if !cfg!(debug_assertions) {
+        return Err("Diagnostic bundle export is only available in development builds".into());
+    }
+
+    use std::io::Write;
+
+    let desktop =
+        dirs::desktop_dir().ok_or_else(|| "could not find Desktop directory".to_string())?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dest = desktop.join(format!("nextdesk_diagnostics_{ts}"));
+    std::fs::create_dir_all(&dest).map_err(|e| format!("create diagnostics dir failed: {e}"))?;
+
+    let backend_log = logging::log_file_path();
+    let rdp_log = rdp_log_path();
+    let clash_log =
+        dirs::config_dir().map(|dir| dir.join("NextDesk").join("log").join("clash.log"));
+
+    let mut copied = Vec::new();
+    for (label, path) in [
+        ("nextdesk_debug.log", Some(backend_log)),
+        ("nextdesk_rdp_debug.log", Some(rdp_log)),
+        ("clash.log", clash_log),
+    ] {
+        let Some(path) = path else { continue };
+        if !path.exists() {
+            continue;
+        }
+        let target = dest.join(label);
+        std::fs::copy(&path, &target)
+            .map_err(|e| format!("copy {} failed: {e}", path.display()))?;
+        copied.push(format!("{label}: {}", path.display()));
+    }
+
+    let mut manifest = std::fs::File::create(dest.join("manifest.txt"))
+        .map_err(|e| format!("create diagnostics manifest failed: {e}"))?;
+    writeln!(manifest, "NextDesk diagnostics bundle").map_err(|e| e.to_string())?;
+    writeln!(manifest, "timestamp_unix={ts}").map_err(|e| e.to_string())?;
+    writeln!(manifest, "version={}", env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
+    writeln!(manifest, "target_os={}", std::env::consts::OS).map_err(|e| e.to_string())?;
+    writeln!(manifest, "target_arch={}", std::env::consts::ARCH).map_err(|e| e.to_string())?;
+    writeln!(manifest, "debug_assertions={}", cfg!(debug_assertions)).map_err(|e| e.to_string())?;
+    writeln!(manifest, "copied_logs={}", copied.len()).map_err(|e| e.to_string())?;
+    for item in copied {
+        writeln!(manifest, "{item}").map_err(|e| e.to_string())?;
+    }
+
+    log::info!("Copied diagnostic bundle to {}", dest.display());
+    Ok(dest.to_string_lossy().to_string())
+}
+
+#[tauri::command]
 fn rdp_log_batch(entries: Vec<RdpLogEntry>) -> Result<(), String> {
     use std::io::Write;
     let path = rdp_log_path();
@@ -737,9 +806,10 @@ async fn rdp_native_connect(
 
     // Start a local WebSocket server on a random port for frame delivery.
     // This bypasses Tauri Channel's 5-layer IPC overhead entirely.
-    let (ws_port, frame_tx) = frame_ws::start_frame_server()
-        .await
-        .map_err(|e| format!("Failed to start frame WS: {e}"))?;
+    let (ws_port, frame_tx, frame_ws_shutdown) =
+        frame_ws::start_frame_server(tab_id.clone(), host.clone())
+            .await
+            .map_err(|e| format!("Failed to start frame WS: {e}"))?;
     let socks_port = *app_state.proxy_port.lock().unwrap();
 
     let handle = rdp_session::spawn_session(
@@ -754,6 +824,8 @@ async fn rdp_native_connect(
         width,
         height,
         frame_tx,
+        ws_port,
+        frame_ws_shutdown,
     );
     let mut mgr = app_state.native_sessions.lock().unwrap();
     mgr.insert(tab_id, handle);
@@ -1215,6 +1287,9 @@ pub fn run() {
             frontend_log,
             rdp_log_batch,
             rdp_log_clear,
+            rdp_log_file_path_str,
+            rdp_log_file_size,
+            log_copy_diagnostic_bundle_to_desktop,
             get_tube_enabled,
             set_tube_enabled,
             set_cloud_mode,

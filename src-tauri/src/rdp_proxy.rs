@@ -1,7 +1,11 @@
 use futures_util::{SinkExt, StreamExt};
 use ironrdp_rdcleanpath::RDCleanPathPdu;
-use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
+use std::time::Instant;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 
@@ -168,6 +172,100 @@ fn is_private_ip(host: &str) -> bool {
     } else {
         false // hostname, not IP — use proxy
     }
+}
+
+async fn relay_tls_to_websocket<S>(
+    tls: S,
+    dest: &str,
+    label: &str,
+    tx: &mut futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>,
+    rx: &mut futures_util::stream::SplitStream<WebSocketStream<TcpStream>>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let started = Instant::now();
+    let c2s_bytes = Arc::new(AtomicU64::new(0));
+    let c2s_frames = Arc::new(AtomicU64::new(0));
+    let s2c_bytes = Arc::new(AtomicU64::new(0));
+    let s2c_frames = Arc::new(AtomicU64::new(0));
+    let (mut tr, mut tw) = tokio::io::split(tls);
+
+    let c2s_bytes_write = c2s_bytes.clone();
+    let c2s_frames_write = c2s_frames.clone();
+    let w2t = async {
+        while let Some(message) = rx.next().await {
+            match message {
+                Ok(Message::Binary(data)) => {
+                    let len = data.len() as u64;
+                    if let Err(error) = tw.write_all(&data).await {
+                        return format!("client->server write error: {error}");
+                    }
+                    if let Err(error) = tw.flush().await {
+                        return format!("client->server flush error: {error}");
+                    }
+                    c2s_bytes_write.fetch_add(len, Ordering::Relaxed);
+                    c2s_frames_write.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(Message::Close(frame)) => {
+                    let _ = tw.shutdown().await;
+                    return format!("client websocket close: {frame:?}");
+                }
+                Ok(Message::Text(_)) => {
+                    log::debug!("[rdp_proxy] {label} ignoring websocket text message for {dest}");
+                }
+                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
+                    log::debug!("[rdp_proxy] {label} websocket control frame for {dest}");
+                }
+                Ok(_) => {
+                    log::debug!(
+                        "[rdp_proxy] {label} ignoring non-binary websocket message for {dest}"
+                    );
+                }
+                Err(error) => return format!("client websocket error: {error}"),
+            }
+        }
+
+        let _ = tw.shutdown().await;
+        "client websocket EOF".to_string()
+    };
+
+    let s2c_bytes_read = s2c_bytes.clone();
+    let s2c_frames_read = s2c_frames.clone();
+    let t2w = async {
+        let mut buffer = vec![0u8; 16384];
+        loop {
+            match tr.read(&mut buffer).await {
+                Ok(0) => return "server TLS EOF".to_string(),
+                Ok(n) => {
+                    s2c_bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+                    s2c_frames_read.fetch_add(1, Ordering::Relaxed);
+                    let msg = Message::Binary(buffer[..n].to_vec().into());
+                    if let Err(error) = tx.send(msg).await {
+                        return format!("server->client websocket send error: {error}");
+                    }
+                }
+                Err(error) => return format!("server TLS read error: {error}"),
+            }
+        }
+    };
+
+    let reason = tokio::select! {
+        reason = w2t => reason,
+        reason = t2w => reason,
+    };
+
+    log::info!(
+        "[rdp_proxy] {label} relay end dest={dest} reason={reason}; c2s={}B/{}f s2c={}B/{}f elapsed={}ms",
+        c2s_bytes.load(Ordering::Relaxed),
+        c2s_frames.load(Ordering::Relaxed),
+        s2c_bytes.load(Ordering::Relaxed),
+        s2c_frames.load(Ordering::Relaxed),
+        started.elapsed().as_millis(),
+    );
+    log::info!("[rdp_proxy] {label} Done {dest}");
+
+    Ok(())
 }
 
 async fn handle_inner(
@@ -339,34 +437,7 @@ async fn handle_inner(
     eprintln!("[rdp_proxy] Response sent, entering relay phase");
     log::info!("[rdp_proxy] Response sent, relay");
 
-    // 8: Raw relay
-    let (mut tr, mut tw) = tokio::io::split(tls);
-    let w2t = async {
-        while let Some(Ok(m)) = rx.next().await {
-            if let Message::Binary(d) = m {
-                if tw.write_all(&d).await.is_err() {
-                    break;
-                }
-            }
-        }
-    };
-    let t2w = async {
-        let mut b = vec![0u8; 16384];
-        loop {
-            match tr.read(&mut b).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let msg = Message::Binary(b[..n].to_vec().into());
-                    if tx.send(msg).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    };
-    tokio::select! { _ = w2t => {} _ = t2w => {} }
-    log::info!("[rdp_proxy] Done {dest}");
-    Ok(())
+    relay_tls_to_websocket(tls, &dest, "normal", &mut tx, &mut rx).await
 }
 /// Handle normal X.224 → TLS → bidirectional relay path.
 /// Used by both the default flow and cloud mode flow.
@@ -413,34 +484,7 @@ async fn handle_normal_path(
     tx.send(Message::Binary(resp_bytes.into())).await?;
     log::info!("[rdp_proxy] Response sent, relay");
 
-    // Raw bidirectional relay
-    let (mut tr, mut tw) = tokio::io::split(tls);
-    let w2t = async {
-        while let Some(Ok(m)) = rx.next().await {
-            if let Message::Binary(d) = m {
-                if tw.write_all(&d).await.is_err() {
-                    break;
-                }
-            }
-        }
-    };
-    let t2w = async {
-        let mut b = vec![0u8; 16384];
-        loop {
-            match tr.read(&mut b).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let msg = Message::Binary(b[..n].to_vec().into());
-                    if tx.send(msg).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    };
-    tokio::select! { _ = w2t => {} _ = t2w => {} }
-    log::info!("[rdp_proxy] Done {dest}");
-    Ok(())
+    relay_tls_to_websocket(tls, dest, "cloud", tx, rx).await
 }
 
 /// Handle the full RDP path over an Aggligator tube stream.
@@ -486,32 +530,5 @@ async fn handle_tube_path(
     tx.send(Message::Binary(resp_bytes.into())).await?;
     log::info!("[rdp_proxy] [TUBE] Response sent, relay");
 
-    // Raw relay over TLS-over-Tube
-    let (mut tr, mut tw) = tokio::io::split(tls);
-    let w2t = async {
-        while let Some(Ok(m)) = rx.next().await {
-            if let Message::Binary(d) = m {
-                if tw.write_all(&d).await.is_err() {
-                    break;
-                }
-            }
-        }
-    };
-    let t2w = async {
-        let mut b = vec![0u8; 16384];
-        loop {
-            match tr.read(&mut b).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let msg = Message::Binary(b[..n].to_vec().into());
-                    if tx.send(msg).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    };
-    tokio::select! { _ = w2t => {} _ = t2w => {} }
-    log::info!("[rdp_proxy] [TUBE] Done {dest}");
-    Ok(())
+    relay_tls_to_websocket(tls, dest, "tube", tx, rx).await
 }

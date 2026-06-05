@@ -21,7 +21,11 @@ import {
   Play,
   Square,
   Cloud,
-  AlertTriangle
+  AlertTriangle,
+  Bug,
+  Copy,
+  FolderOpen,
+  Trash2
 } from 'lucide-react';
 import { api, type EngineStatus, type Server, type UpdateInfo, type ProxyGroup, type Connection, type RunMode, type RelayEndpoint, type AutoUpdateStatus } from './api';
 import { check } from '@tauri-apps/plugin-updater';
@@ -39,6 +43,20 @@ import { LanguageProvider } from '@/i18n/LanguageProvider';
 import { useTranslation } from '@/i18n/useTranslation';
 import { LanguageToggle } from '@/components/LanguageToggle';
 import { RdpManager } from '@/components/RdpManager';
+import { rdpLog, type RdpLogModule } from '@/lib/rdp-logger';
+
+const DEV_LOG_MODULES: RdpLogModule[] = [
+  'connection',
+  'render',
+  'proxy',
+  'native',
+  'wasm',
+  'clipboard',
+  'input',
+  'audio',
+  'file',
+  'network',
+];
 
 const formatBytes = (bytes: number): string => {
   if (bytes === 0) return '0 B';
@@ -80,6 +98,70 @@ function AppContent() {
     last_sync_ts: 0,
     sync_state: { type: 'Idle' },
   });
+  const [devLogLevel, setDevLogLevel] = useState<'info' | 'debug'>(() =>
+    import.meta.env.DEV && rdpLog.getLevel() === 'debug' ? 'debug' : 'info'
+  );
+  const [devLogModules, setDevLogModules] = useState<Set<RdpLogModule>>(
+    () => new Set(DEV_LOG_MODULES)
+  );
+  const [backendLogPath, setBackendLogPath] = useState('');
+  const [rdpLogPath, setRdpLogPath] = useState('');
+  const [backendLogSize, setBackendLogSize] = useState(0);
+  const [rdpLogSize, setRdpLogSize] = useState(0);
+  const [diagnosticMessage, setDiagnosticMessage] = useState('');
+
+  const refreshDiagnosticLogInfo = async () => {
+    if (!import.meta.env.DEV) return;
+    const [backendPath, rdpPath, backendSize, rdpSize] = await Promise.all([
+      api.logFilePath(),
+      api.rdpLogFilePath(),
+      api.logFileSize(),
+      api.rdpLogFileSize(),
+    ]);
+    setBackendLogPath(backendPath);
+    setRdpLogPath(rdpPath);
+    setBackendLogSize(backendSize);
+    setRdpLogSize(rdpSize);
+  };
+
+  const handleDevLogLevelToggle = (enabled: boolean) => {
+    const level = enabled ? 'debug' : 'info';
+    rdpLog.setLevel(level);
+    setDevLogLevel(level);
+    rdpLog.info('connection', 'developer log level changed', { level });
+  };
+
+  const handleDevLogModuleToggle = (module: RdpLogModule, enabled: boolean) => {
+    setDevLogModules(prev => {
+      const next = new Set(prev);
+      if (enabled) {
+        next.add(module);
+      } else {
+        next.delete(module);
+      }
+      rdpLog.setModules([...next]);
+      rdpLog.info('connection', 'developer log modules changed', { modules: [...next] });
+      return next;
+    });
+  };
+
+  const handleClearDiagnosticLogs = async () => {
+    if (!window.confirm(t('logClearConfirm'))) return;
+    await Promise.all([api.logClear(), api.rdpLogClear()]);
+    setDiagnosticMessage(t('logCleared'));
+    await refreshDiagnosticLogInfo();
+  };
+
+  const handleCopyDiagnosticBundle = async () => {
+    const path = await api.logCopyDiagnosticBundleToDesktop();
+    setDiagnosticMessage(`${t('diagnosticBundleCopied')}: ${path}`);
+  };
+
+  useEffect(() => {
+    if (import.meta.env.DEV && activeTab === 'settings') {
+      refreshDiagnosticLogInfo().catch(console.error);
+    }
+  }, [activeTab]);
 
   useEffect(() => {
     if (proxyGroups.length > 0) {
@@ -1097,7 +1179,10 @@ function AppContent() {
 
           {/* RDP View — always mounted, hidden via CSS to preserve sessions */}
           <div className={cn("flex-1 overflow-hidden", activeTab !== 'rdp' && "hidden")}>
-            <RdpManager onMainSidebarCollapse={() => setSidebarCollapsed(true)} />
+            <RdpManager
+              isRdpViewVisible={activeTab === 'rdp'}
+              onMainSidebarCollapse={() => setSidebarCollapsed(true)}
+            />
           </div>
 
           {/* Settings View */}
@@ -1228,6 +1313,108 @@ function AppContent() {
                   </div>
                 </CardContent>
               </Card>
+
+              {import.meta.env.DEV && (
+                <Card className="bg-card border-border flex flex-col md:col-span-2">
+                  <CardHeader>
+                    <CardTitle className="text-lg text-foreground flex items-center gap-2">
+                      <Bug className="h-4 w-4 text-cyan-500" />
+                      {t('devLogMode')}
+                    </CardTitle>
+                    <CardDescription className="text-muted-foreground">
+                      {t('devLogModeDesc')}
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-5 flex-1">
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                      <div className="rounded-lg border border-border bg-muted/30 p-3">
+                        <div className="text-xs text-muted-foreground mb-1">{t('backendLog')}</div>
+                        <div className="text-xs font-mono text-foreground break-all">{backendLogPath || '...'}</div>
+                        <div className="text-xs text-muted-foreground mt-2">{t('logFileSize')}: {formatBytes(backendLogSize)}</div>
+                      </div>
+                      <div className="rounded-lg border border-border bg-muted/30 p-3">
+                        <div className="text-xs text-muted-foreground mb-1">{t('rdpLog')}</div>
+                        <div className="text-xs font-mono text-foreground break-all">{rdpLogPath || '...'}</div>
+                        <div className="text-xs text-muted-foreground mt-2">{t('logFileSize')}: {formatBytes(rdpLogSize)}</div>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between rounded-lg border border-border bg-muted/20 p-3">
+                      <div>
+                        <div className="text-sm font-medium text-foreground">{t('debugConsoleLevel')}</div>
+                        <div className="text-xs text-muted-foreground">{t('debugConsoleLevelDesc')}</div>
+                      </div>
+                      <Switch
+                        checked={devLogLevel === 'debug'}
+                        onCheckedChange={handleDevLogLevelToggle}
+                      />
+                    </div>
+
+                    <div className="rounded-lg border border-border bg-muted/20 p-3">
+                      <div className="text-sm font-medium text-foreground mb-3">{t('debugModules')}</div>
+                      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+                        {DEV_LOG_MODULES.map(module => (
+                          <label
+                            key={module}
+                            className="flex items-center justify-between gap-2 rounded-md border border-border bg-card px-3 py-2 text-xs text-foreground"
+                          >
+                            <span className="font-mono">{module}</span>
+                            <Switch
+                              checked={devLogModules.has(module)}
+                              onCheckedChange={(checked) => handleDevLogModuleToggle(module, checked)}
+                            />
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => api.logShowInFinder()}
+                        className="border-input bg-card text-muted-foreground hover:text-foreground"
+                      >
+                        <FolderOpen className="h-3 w-3 mr-2" />
+                        {t('logShowInFinder')}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={refreshDiagnosticLogInfo}
+                        className="border-input bg-card text-muted-foreground hover:text-foreground"
+                      >
+                        <RefreshCw className="h-3 w-3 mr-2" />
+                        {t('refresh')}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleCopyDiagnosticBundle}
+                        className="border-input bg-card text-muted-foreground hover:text-foreground"
+                      >
+                        <Copy className="h-3 w-3 mr-2" />
+                        {t('copyDiagnosticBundle')}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleClearDiagnosticLogs}
+                        className="border-red-500/30 bg-card text-red-400 hover:text-red-300 hover:bg-red-500/10"
+                      >
+                        <Trash2 className="h-3 w-3 mr-2" />
+                        {t('logClear')}
+                      </Button>
+                    </div>
+
+                    {diagnosticMessage && (
+                      <div className="rounded-md border border-cyan-500/20 bg-cyan-500/10 px-3 py-2 text-xs text-cyan-300 break-all">
+                        {diagnosticMessage}
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              )}
             </div>
           )}
 

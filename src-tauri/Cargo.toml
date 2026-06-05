@@ -50,6 +50,7 @@ ironrdp-rdcleanpath = { path = "../../IronRDP/crates/ironrdp-rdcleanpath" }
 ironrdp-dvc = { path = "../../IronRDP/crates/ironrdp-dvc", version = "0.5", features = ["std"] }
 ironrdp-egfx = { path = "../../IronRDP/crates/ironrdp-egfx", version = "0.1" }
 ironrdp-graphics = { path = "../../IronRDP/crates/ironrdp-graphics", version = "0.7" }
+ironrdp-bulk = { path = "../../IronRDP/crates/ironrdp-bulk", version = "0.1.0" }
 smallvec = "1.15"
 lz4_flex = "0.11"
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }

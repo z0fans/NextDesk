@@ -470,16 +470,29 @@ pub struct RuntimePorts {
     pub dns_port: u16,
 }
 
+fn read_runtime_yaml(config_path: &std::path::Path) -> Result<serde_yaml::Value, String> {
+    let content =
+        fs::read_to_string(config_path).map_err(|e| format!("Read runtime config failed: {e}"))?;
+    let content = content.trim_start_matches('\u{feff}');
+
+    for document in serde_yaml::Deserializer::from_str(content) {
+        let value = serde_yaml::Value::deserialize(document)
+            .map_err(|e| format!("Parse runtime config failed: {e}"))?;
+        if !value.is_null() {
+            return Ok(value);
+        }
+    }
+
+    Err("Runtime config is empty".to_string())
+}
+
 /// Patch the generated runtime config with per-process local ports.
 ///
 /// Dev and packaged apps can run at the same time on this machine. If both use
 /// the fixed default ports, the second mihomo process starts against a stale
 /// first process and RDP silently uses the wrong runtime.
 pub fn patch_runtime_ports(config_path: &PathBuf, ports: RuntimePorts) -> Result<(), String> {
-    let content =
-        fs::read_to_string(config_path).map_err(|e| format!("Read runtime config failed: {e}"))?;
-    let mut config: serde_yaml::Value =
-        serde_yaml::from_str(&content).map_err(|e| format!("Parse runtime config failed: {e}"))?;
+    let mut config = read_runtime_yaml(config_path)?;
     let map = config
         .as_mapping_mut()
         .ok_or_else(|| "Runtime config is not a YAML object".to_string())?;
@@ -549,67 +562,28 @@ fn detect_default_interface() -> Option<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        // On Windows, detect the default interface via `route print 0.0.0.0`
-        // and extract the interface name from `netsh interface show interface`
-        let output = StdCommand::new("cmd")
-            .args(["/C", "route", "print", "0.0.0.0"])
+        // `route print` can list multiple default routes in an order that does
+        // not match effective priority. Ask Windows for the active route table
+        // and sort by route + interface metric, then bind mihomo to that alias.
+        let output = StdCommand::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object @{Expression={$_.RouteMetric + $_.InterfaceMetric}}, RouteMetric, InterfaceMetric | Select-Object -First 1 -ExpandProperty InterfaceAlias)",
+            ])
             .output()
             .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // Parse the "Active Routes" section for the default route (0.0.0.0)
-        // Format: Network Destination  Netmask  Gateway  Interface  Metric
-        let mut default_iface_ip: Option<String> = None;
-        let mut in_routes = false;
-        for line in stdout.lines() {
-            if line.contains("Active Routes:") {
-                in_routes = true;
-                continue;
-            }
-            if !in_routes {
-                continue;
-            }
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 5 && parts[0] == "0.0.0.0" && parts[1] == "0.0.0.0" {
-                default_iface_ip = Some(parts[3].to_string());
-                break;
-            }
+        let iface = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if iface.is_empty() {
+            return None;
         }
-        let iface_ip = default_iface_ip?;
 
-        // Now find the interface name that has this IP
-        let output2 = StdCommand::new("netsh")
-            .args(["interface", "ipv4", "show", "addresses"])
-            .output()
-            .ok()?;
-        let stdout2 = String::from_utf8_lossy(&output2.stdout);
-        let mut current_iface: Option<String> = None;
-        for line in stdout2.lines() {
-            let trimmed = line.trim();
-            // Interface lines look like: Configuration for interface "Ethernet"
-            if trimmed.starts_with("Configuration for interface") {
-                if let Some(start) = trimmed.find('"') {
-                    if let Some(end) = trimmed.rfind('"') {
-                        if end > start {
-                            current_iface = Some(trimmed[start + 1..end].to_string());
-                        }
-                    }
-                }
-            }
-            // IP Address line contains the IP
-            if trimmed.contains(&iface_ip) {
-                if let Some(ref name) = current_iface {
-                    // Skip virtual/VPN interfaces
-                    let lower = name.to_lowercase();
-                    if !lower.contains("loopback")
-                        && !lower.contains("tun")
-                        && !lower.contains("wintun")
-                    {
-                        return Some(name.clone());
-                    }
-                }
-            }
+        let lower = iface.to_lowercase();
+        if lower.contains("loopback") || lower.contains("tun") || lower.contains("wintun") {
+            None
+        } else {
+            Some(iface)
         }
-        None
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -625,35 +599,40 @@ fn apply_interface_name(config: &mut serde_yaml::Mapping) {
     }
 }
 
-/// Patch an existing runtime_clash.yaml to ensure interface-name is set.
-/// Called before starting the Clash process to handle configs generated
-/// before this feature was added.
-pub fn ensure_interface_name(config_path: &std::path::Path) {
-    let Some(iface) = detect_default_interface() else {
-        return;
-    };
-
-    let content = match fs::read_to_string(config_path) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let mut doc: serde_yaml::Value = match serde_yaml::from_str(&content) {
+/// Patch an existing runtime_clash.yaml before starting mihomo.
+///
+/// This handles configs generated by older app versions without forcing users
+/// to edit the Clash runtime file manually.
+pub fn ensure_runtime_network_config(config_path: &std::path::Path) {
+    let mut doc = match read_runtime_yaml(config_path) {
         Ok(v) => v,
         Err(_) => return,
     };
 
     if let Some(map) = doc.as_mapping_mut() {
-        // Always update interface-name (network interface may change between sessions)
-        map.insert(
-            ykey("interface-name"),
-            serde_yaml::Value::String(iface.clone()),
-        );
-        if let Ok(yaml_str) = serde_yaml::to_string(&doc) {
-            fs::write(config_path, yaml_str).ok();
+        apply_runtime_dns_template(map);
+
+        if let Some(iface) = detect_default_interface() {
+            // Always update interface-name; the default route may change between sessions.
+            map.insert(
+                ykey("interface-name"),
+                serde_yaml::Value::String(iface.clone()),
+            );
             eprintln!("[config] Patched runtime config with interface-name: {iface}");
         }
+
+        if let Ok(yaml_str) = serde_yaml::to_string(&doc) {
+            fs::write(config_path, yaml_str).ok();
+        }
     }
+}
+
+fn apply_runtime_dns_template(map: &mut serde_yaml::Mapping) {
+    let Some(default_dns) = default_runtime_frontmatter().get(&ykey("dns")).cloned() else {
+        return;
+    };
+
+    map.insert(ykey("dns"), default_dns);
 }
 
 fn insert_yaml_str(m: &mut serde_yaml::Mapping, key: &str, val: &str) {
@@ -671,10 +650,10 @@ fn insert_yaml_int(m: &mut serde_yaml::Mapping, key: &str, val: i64) {
 mod tests {
     use super::{
         build_rdp_proxy_groups, build_rdp_rules, build_rdp_runtime_proxy_groups, ensure_port_rule,
-        generate_clash_config, generate_clash_config_from_subscription, get_user_config_dir,
-        is_selectable_proxy_name, patch_runtime_ports, preferred_rdp_catch_all_group,
-        real_proxy_names_from_yaml, ykey, RuntimePorts, SERVER_AMERICAS_GROUP, SERVER_ASIA_GROUP,
-        SERVER_GLOBAL_GROUP,
+        ensure_runtime_network_config, generate_clash_config,
+        generate_clash_config_from_subscription, get_user_config_dir, is_selectable_proxy_name,
+        patch_runtime_ports, preferred_rdp_catch_all_group, real_proxy_names_from_yaml, ykey,
+        RuntimePorts, SERVER_AMERICAS_GROUP, SERVER_ASIA_GROUP, SERVER_GLOBAL_GROUP,
     };
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -996,6 +975,111 @@ dns:
         assert_eq!(
             dns.get(&ykey("listen")).and_then(serde_yaml::Value::as_str),
             Some("127.0.0.1:18083")
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn runtime_port_patch_accepts_bom_prefixed_yaml() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("nextdesk-runtime-bom-{nonce}.yaml"));
+        std::fs::write(
+            &path,
+            "\u{feff}port: 17890\nsocks-port: 17897\nexternal-controller: 127.0.0.1:17891\ndns:\n  listen: 127.0.0.1:11053\n",
+        )
+        .expect("fixture should be written");
+
+        patch_runtime_ports(
+            &path,
+            RuntimePorts {
+                http_port: 19080,
+                socks_port: 19081,
+                controller_port: 19082,
+                dns_port: 19083,
+            },
+        )
+        .expect("BOM-prefixed runtime config should patch");
+
+        let doc: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(&path).expect("patched config should be readable"),
+        )
+        .expect("patched config should parse");
+        let map = doc.as_mapping().expect("patched config should be a map");
+        assert_eq!(
+            map.get(&ykey("port")).and_then(serde_yaml::Value::as_i64),
+            Some(19080)
+        );
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn existing_runtime_config_refreshes_network_template_before_start() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("nextdesk-runtime-network-{nonce}.yaml"));
+        std::fs::write(
+            &path,
+            r#"
+port: 17890
+dns:
+  enable: true
+  nameserver:
+    - 223.5.5.5
+  proxy-server-nameserver:
+    - 119.29.29.29
+proxies:
+  - name: "US Server Only 01"
+    type: vless
+"#,
+        )
+        .expect("fixture should be written");
+
+        ensure_runtime_network_config(&path);
+
+        let doc: serde_yaml::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(&path).expect("patched config should be readable"),
+        )
+        .expect("patched config should parse");
+        let dns = doc
+            .as_mapping()
+            .and_then(|map| map.get(&ykey("dns")))
+            .and_then(serde_yaml::Value::as_mapping)
+            .expect("dns should stay a map");
+
+        assert_eq!(
+            dns.get(&ykey("nameserver"))
+                .and_then(serde_yaml::Value::as_sequence)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_yaml::Value::as_str)
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec![
+                "https://dns.alidns.com/dns-query",
+                "https://doh.pub/dns-query"
+            ])
+        );
+        assert_eq!(
+            dns.get(&ykey("proxy-server-nameserver"))
+                .and_then(serde_yaml::Value::as_sequence)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_yaml::Value::as_str)
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec![
+                "https://dns.alidns.com/dns-query",
+                "https://doh.pub/dns-query"
+            ])
         );
 
         std::fs::remove_file(path).ok();
