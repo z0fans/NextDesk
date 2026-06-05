@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::config::{get_log_dir, get_user_config_dir};
@@ -169,40 +169,50 @@ pub async fn start_clash_process() -> Result<Child, String> {
 }
 
 fn prepare_runtime_engine_binary(source: &Path) -> Result<PathBuf, String> {
-    let runtime_dir = std::env::temp_dir().join("nextdesk-core-runtime");
-    fs::create_dir_all(&runtime_dir)
-        .map_err(|e| format!("Create runtime engine dir failed: {e}"))?;
-
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or_default();
-    let extension = source
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| format!(".{ext}"))
-        .unwrap_or_default();
-    let runtime_path = runtime_dir.join(format!(
-        "nextdesk-core-{}-{suffix}{extension}",
-        std::process::id()
-    ));
-
-    fs::copy(source, &runtime_path)
-        .map_err(|e| format!("Copy runtime engine binary failed: {e}"))?;
-
-    #[cfg(unix)]
+    #[cfg(not(target_os = "windows"))]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("Set runtime engine permission failed: {e}"))?;
+        return Ok(source.to_path_buf());
     }
 
-    eprintln!(
-        "[clash] runtime core: {} -> {}",
-        source.display(),
-        runtime_path.display()
-    );
-    Ok(runtime_path)
+    #[cfg(target_os = "windows")]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let runtime_dir = std::env::temp_dir().join("nextdesk-core-runtime");
+        fs::create_dir_all(&runtime_dir)
+            .map_err(|e| format!("Create runtime engine dir failed: {e}"))?;
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default();
+        let extension = source
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| format!(".{ext}"))
+            .unwrap_or_default();
+        let runtime_path = runtime_dir.join(format!(
+            "nextdesk-core-{}-{suffix}{extension}",
+            std::process::id()
+        ));
+
+        fs::copy(source, &runtime_path)
+            .map_err(|e| format!("Copy runtime engine binary failed: {e}"))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&runtime_path, fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("Set runtime engine permission failed: {e}"))?;
+        }
+
+        eprintln!(
+            "[clash] runtime core: {} -> {}",
+            source.display(),
+            runtime_path.display()
+        );
+        Ok(runtime_path)
+    }
 }
 
 /// Get bin directory (next to executable or project root)
@@ -481,10 +491,27 @@ pub fn get_clash_log() -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    #[cfg(not(target_os = "windows"))]
+    use std::fs;
 
     use serde_json::json;
 
-    use super::{extract_delay_from_proxy_info, merge_delays_with_snapshot};
+    use super::{
+        extract_delay_from_proxy_info, merge_delays_with_snapshot, prepare_runtime_engine_binary,
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn non_windows_uses_bundled_engine_path() {
+        let source =
+            std::env::temp_dir().join(format!("nextdesk-core-test-source-{}", std::process::id()));
+        fs::write(&source, b"fake core").unwrap();
+
+        let prepared = prepare_runtime_engine_binary(&source).unwrap();
+
+        assert_eq!(prepared, source);
+        let _ = fs::remove_file(&prepared);
+    }
 
     #[test]
     fn merges_partial_group_results_with_snapshot_failures() {

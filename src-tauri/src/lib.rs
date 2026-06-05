@@ -28,12 +28,13 @@ use std::net::{IpAddr, TcpListener, UdpSocket};
 use tauri::{AppHandle, Manager, State};
 
 #[cfg(target_os = "windows")]
-fn cleanup_previous_windows_runtime_processes() {
-    let current_pid = std::process::id();
+fn cleanup_extra_windows_engine_processes(keep_pid: Option<u32>) {
+    let keep_pid = keep_pid.unwrap_or(0);
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
-         Get-Process -Name nextdesk-core-* | Stop-Process -Force; \
-         Get-Process -Name nextdesk | Where-Object {{ $_.Id -ne {current_pid} }} | Stop-Process -Force"
+         Get-Process -Name nextdesk-core* | \
+         Where-Object {{ $_.Id -ne {keep_pid} }} | \
+         Stop-Process -Force"
     );
 
     match std::process::Command::new("powershell")
@@ -49,20 +50,117 @@ fn cleanup_previous_windows_runtime_processes() {
     {
         Ok(output) => {
             log::info!(
-                "[startup] Windows stale NextDesk cleanup exit={} stdout={} stderr={}",
+                "[engine-cleanup] Windows nextdesk-core cleanup exit={} stdout={} stderr={}",
                 output.status,
                 String::from_utf8_lossy(&output.stdout).trim(),
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
         Err(err) => {
-            log::warn!("[startup] Windows stale NextDesk cleanup failed: {err}");
+            log::warn!("[engine-cleanup] Windows nextdesk-core cleanup failed: {err}");
         }
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn cleanup_previous_windows_runtime_processes() {}
+fn cleanup_extra_windows_engine_processes(_keep_pid: Option<u32>) {}
+
+#[cfg(target_os = "macos")]
+fn macos_engine_exe_for_pid(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let command = String::from_utf8_lossy(&output.stdout);
+    command.split_whitespace().next().map(str::to_string)
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_extra_macos_engine_processes(keep_pid: Option<u32>) {
+    let output = match std::process::Command::new("/usr/bin/pgrep")
+        .args(["-f", "nextdesk-core"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => {
+            log::warn!("[engine-cleanup] macOS engine scan failed: {err}");
+            return;
+        }
+    };
+
+    if output.status.success() {
+        let mut killed = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let Ok(pid) = line.trim().parse::<u32>() else {
+                continue;
+            };
+            if Some(pid) == keep_pid || pid == std::process::id() {
+                continue;
+            }
+            let Some(exe) = macos_engine_exe_for_pid(pid) else {
+                continue;
+            };
+            let Some(name) = std::path::Path::new(&exe)
+                .file_name()
+                .and_then(|name| name.to_str())
+            else {
+                continue;
+            };
+            if name != "nextdesk-core" && !name.starts_with("nextdesk-core-") {
+                continue;
+            }
+            match std::process::Command::new("/bin/kill")
+                .arg(pid.to_string())
+                .status()
+            {
+                Ok(status) if status.success() => killed.push(pid),
+                Ok(status) => {
+                    log::warn!("[engine-cleanup] kill nextdesk-core {pid} exited {status}")
+                }
+                Err(err) => log::warn!("[engine-cleanup] kill nextdesk-core {pid} failed: {err}"),
+            }
+        }
+        if !killed.is_empty() {
+            log::info!("[engine-cleanup] killed extra macOS nextdesk-core processes: {killed:?}");
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cleanup_extra_macos_engine_processes(_keep_pid: Option<u32>) {}
+
+fn cleanup_runtime_engine_files() {
+    let runtime_dir = std::env::temp_dir().join("nextdesk-core-runtime");
+    let Ok(entries) = std::fs::read_dir(&runtime_dir) else {
+        return;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("nextdesk-core-") {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(err) => log::warn!(
+                "[engine-cleanup] remove stale runtime core {} failed: {err}",
+                path.display()
+            ),
+        }
+    }
+    if removed > 0 {
+        log::info!("[engine-cleanup] removed {removed} stale runtime core files");
+    }
+}
+
+fn cleanup_extra_engine_processes(keep_pid: Option<u32>) {
+    cleanup_extra_windows_engine_processes(keep_pid);
+    cleanup_extra_macos_engine_processes(keep_pid);
+    cleanup_runtime_engine_files();
+}
 
 #[tauri::command]
 async fn start_engine(
@@ -168,6 +266,12 @@ fn choose_runtime_ports() -> Result<config::RuntimePorts, String> {
 }
 
 async fn start_engine_inner(app_state: &AppState) -> Result<bool, String> {
+    let keep_pid = {
+        let proc = app_state.clash_process.lock().unwrap();
+        proc.as_ref().and_then(|child| child.id())
+    };
+    cleanup_extra_engine_processes(keep_pid);
+
     if internal_engine_running(app_state) {
         let api_base = app_state.clash_api_base.lock().unwrap().clone();
         if !api_base.is_empty() && clash_api_ready(&api_base).await {
@@ -1142,7 +1246,7 @@ async fn trigger_sync_now(app: AppHandle) -> Result<(), String> {
 pub fn run() {
     // Initialize structured logging FIRST so all subsequent code can log.
     logging::init();
-    cleanup_previous_windows_runtime_processes();
+    cleanup_extra_engine_processes(None);
 
     // Load saved config on startup
     let saved = config::load_saved_config();

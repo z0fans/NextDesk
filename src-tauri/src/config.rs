@@ -3,7 +3,6 @@ use serde_json;
 use serde_yaml;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command as StdCommand;
 
 use crate::state::{ProxyGroup, Server};
 
@@ -57,6 +56,14 @@ dns:
     - '*.msftncsi.com'
     - 'www.msftconnecttest.com'
 "#;
+
+fn apply_flclash_interface_name(config: &mut serde_yaml::Mapping) {
+    config.insert(
+        ykey("interface-name"),
+        serde_yaml::Value::String(String::new()),
+    );
+    eprintln!("[config] Cleared interface-name; using mihomo/OS route selection");
+}
 
 pub(crate) fn is_subscription_metadata_proxy_name(name: &str) -> bool {
     let lower = name.trim().to_lowercase();
@@ -395,7 +402,7 @@ pub fn generate_clash_config(proxies: &[serde_yaml::Value]) -> PathBuf {
     config.insert(ykey("proxy-groups"), serde_yaml::Value::Sequence(groups));
     config.insert(ykey("rules"), serde_yaml::Value::Sequence(rules));
 
-    // Bind to physical interface to bypass external TUN/VPN
+    // Match FlClash: do not force-bind a guessed interface.
     apply_interface_name(&mut config);
 
     let config_path = get_user_config_dir().join("runtime_clash.yaml");
@@ -452,7 +459,7 @@ pub fn generate_clash_config_from_subscription(raw_config: &serde_yaml::Value) -
         }
     }
 
-    // Bind to physical interface to bypass external TUN/VPN
+    // Match FlClash: do not force-bind a guessed interface.
     apply_interface_name(&mut config);
 
     let config_path = get_user_config_dir().join("runtime_clash.yaml");
@@ -535,68 +542,11 @@ fn yval(s: &str) -> serde_yaml::Value {
     serde_yaml::Value::String(s.to_string())
 }
 
-/// Detect the default physical network interface to bypass external TUN/VPN.
-/// When another Clash instance runs with TUN mode, its virtual interface (utun*)
-/// intercepts all outbound traffic. By binding to the physical interface (e.g. en0),
-/// our internal Clash sends proxy connections directly, avoiding double-proxy issues
-/// that break VLESS Reality TLS handshakes.
-fn detect_default_interface() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        let output = StdCommand::new("route")
-            .args(["-n", "get", "default"])
-            .output()
-            .ok()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("interface:") {
-                let iface = trimmed.trim_start_matches("interface:").trim();
-                // Only return physical interfaces, not utun/lo
-                if !iface.starts_with("utun") && !iface.starts_with("lo") {
-                    return Some(iface.to_string());
-                }
-            }
-        }
-        None
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // `route print` can list multiple default routes in an order that does
-        // not match effective priority. Ask Windows for the active route table
-        // and sort by route + interface metric, then bind mihomo to that alias.
-        let output = StdCommand::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object @{Expression={$_.RouteMetric + $_.InterfaceMetric}}, RouteMetric, InterfaceMetric | Select-Object -First 1 -ExpandProperty InterfaceAlias)",
-            ])
-            .output()
-            .ok()?;
-        let iface = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if iface.is_empty() {
-            return None;
-        }
-
-        let lower = iface.to_lowercase();
-        if lower.contains("loopback") || lower.contains("tun") || lower.contains("wintun") {
-            None
-        } else {
-            Some(iface)
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        None
-    }
-}
-
-/// Apply interface-name to the config to bypass external TUN
+/// Match FlClash's runtime profile behavior: do not force-bind to a guessed
+/// network interface. Keep `interface-name` present but empty so mihomo and the
+/// OS route table choose the outbound interface.
 fn apply_interface_name(config: &mut serde_yaml::Mapping) {
-    if let Some(iface) = detect_default_interface() {
-        eprintln!("[config] Detected physical interface: {iface}, binding to bypass external TUN");
-        config.insert(ykey("interface-name"), serde_yaml::Value::String(iface));
-    }
+    apply_flclash_interface_name(config);
 }
 
 /// Patch an existing runtime_clash.yaml before starting mihomo.
@@ -612,14 +562,7 @@ pub fn ensure_runtime_network_config(config_path: &std::path::Path) {
     if let Some(map) = doc.as_mapping_mut() {
         apply_runtime_dns_template(map);
 
-        if let Some(iface) = detect_default_interface() {
-            // Always update interface-name; the default route may change between sessions.
-            map.insert(
-                ykey("interface-name"),
-                serde_yaml::Value::String(iface.clone()),
-            );
-            eprintln!("[config] Patched runtime config with interface-name: {iface}");
-        }
+        apply_flclash_interface_name(map);
 
         if let Ok(yaml_str) = serde_yaml::to_string(&doc) {
             fs::write(config_path, yaml_str).ok();
@@ -649,11 +592,12 @@ fn insert_yaml_int(m: &mut serde_yaml::Mapping, key: &str, val: i64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_rdp_proxy_groups, build_rdp_rules, build_rdp_runtime_proxy_groups, ensure_port_rule,
-        ensure_runtime_network_config, generate_clash_config,
-        generate_clash_config_from_subscription, get_user_config_dir, is_selectable_proxy_name,
-        patch_runtime_ports, preferred_rdp_catch_all_group, real_proxy_names_from_yaml, ykey,
-        RuntimePorts, SERVER_AMERICAS_GROUP, SERVER_ASIA_GROUP, SERVER_GLOBAL_GROUP,
+        apply_flclash_interface_name, build_rdp_proxy_groups, build_rdp_rules,
+        build_rdp_runtime_proxy_groups, ensure_port_rule, ensure_runtime_network_config,
+        generate_clash_config, generate_clash_config_from_subscription, get_user_config_dir,
+        is_selectable_proxy_name, patch_runtime_ports, preferred_rdp_catch_all_group,
+        real_proxy_names_from_yaml, ykey, RuntimePorts, SERVER_AMERICAS_GROUP, SERVER_ASIA_GROUP,
+        SERVER_GLOBAL_GROUP,
     };
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -685,6 +629,23 @@ mod tests {
 
         assert_eq!(names.len(), 1);
         assert!(names.contains("🇺🇸 US Server Only 01"));
+    }
+
+    #[test]
+    fn interface_name_is_cleared_like_flclash() {
+        let mut map = serde_yaml::Mapping::new();
+        map.insert(
+            ykey("interface-name"),
+            serde_yaml::Value::String("stale-adapter".to_string()),
+        );
+
+        apply_flclash_interface_name(&mut map);
+
+        assert_eq!(
+            map.get(&ykey("interface-name"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("")
+        );
     }
 
     #[test]
@@ -814,6 +775,12 @@ proxies:
             !map.contains_key(&ykey("tun")),
             "NextDesk runtime config must not inherit subscription TUN"
         );
+        assert_eq!(
+            map.get(&ykey("interface-name"))
+                .and_then(serde_yaml::Value::as_str),
+            Some(""),
+            "runtime config should leave interface-name empty like FlClash"
+        );
     }
 
     #[test]
@@ -846,6 +813,7 @@ proxies:
 
         let doc: serde_yaml::Value =
             serde_yaml::from_str(&generated).expect("runtime config should parse");
+        let map = doc.as_mapping().expect("runtime config should be a map");
         let dns = doc
             .as_mapping()
             .and_then(|map| map.get(&ykey("dns")))
@@ -881,6 +849,12 @@ proxies:
                 .unwrap_or(false),
             "runtime fake-ip filter should match the active ClashX Meta vless.yaml baseline"
         );
+        assert_eq!(
+            map.get(&ykey("interface-name"))
+                .and_then(serde_yaml::Value::as_str),
+            Some(""),
+            "subscription runtime config should leave interface-name empty like FlClash"
+        );
     }
 
     #[test]
@@ -900,6 +874,7 @@ proxies:
 
         let doc: serde_yaml::Value =
             serde_yaml::from_str(&generated).expect("runtime config should parse");
+        let map = doc.as_mapping().expect("runtime config should be a map");
         let dns = doc
             .as_mapping()
             .and_then(|map| map.get(&ykey("dns")))
@@ -914,6 +889,12 @@ proxies:
             dns.get(&ykey("enhanced-mode"))
                 .and_then(serde_yaml::Value::as_str),
             Some("fake-ip")
+        );
+        assert_eq!(
+            map.get(&ykey("interface-name"))
+                .and_then(serde_yaml::Value::as_str),
+            Some(""),
+            "proxy-only runtime config should leave interface-name empty like FlClash"
         );
     }
 
@@ -1028,6 +1009,7 @@ dns:
             &path,
             r#"
 port: 17890
+interface-name: stale-adapter
 dns:
   enable: true
   nameserver:
@@ -1080,6 +1062,13 @@ proxies:
                 "https://dns.alidns.com/dns-query",
                 "https://doh.pub/dns-query"
             ])
+        );
+        assert_eq!(
+            doc.as_mapping()
+                .and_then(|map| map.get(&ykey("interface-name")))
+                .and_then(serde_yaml::Value::as_str),
+            Some(""),
+            "startup patch should clear stale interface-name like FlClash"
         );
 
         std::fs::remove_file(path).ok();

@@ -16,7 +16,7 @@
 //! log::trace!("hot path: chunk={}", i);
 //! ```
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -63,6 +63,16 @@ impl Write for FanoutWriter {
 /// Initialize the global logger. Call once from `lib.rs::run()`.
 pub fn init() {
     let path = log_file_path();
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!(
+                "[logging] Failed to create log directory {}: {}",
+                parent.display(),
+                e
+            );
+        }
+    }
+
     // Truncate on startup so each session starts clean.
     let file = match File::create(&path) {
         Ok(f) => f,
