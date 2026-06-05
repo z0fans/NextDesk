@@ -528,15 +528,9 @@ struct RdpLogEntry {
 const RDP_DEBUG_LOG: &str = "nextdesk_rdp_debug.log";
 
 fn rdp_log_path() -> std::path::PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        return std::path::PathBuf::from("/tmp").join(RDP_DEBUG_LOG);
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        std::env::temp_dir().join("NextDesk").join(RDP_DEBUG_LOG)
-    }
+    // Hardcode /tmp/ — macOS std::env::temp_dir() returns /var/folders/…/T/
+    // which is harder to discover. /tmp/ is universally accessible.
+    std::path::PathBuf::from("/tmp").join(RDP_DEBUG_LOG)
 }
 
 #[tauri::command]
@@ -553,6 +547,10 @@ fn rdp_log_file_size() -> u64 {
 
 #[tauri::command]
 fn log_copy_diagnostic_bundle_to_desktop() -> Result<String, String> {
+    if !cfg!(debug_assertions) {
+        return Err("Diagnostic bundle export is only available in development builds".into());
+    }
+
     use std::io::Write;
 
     let desktop =
@@ -606,10 +604,6 @@ fn log_copy_diagnostic_bundle_to_desktop() -> Result<String, String> {
 fn rdp_log_batch(entries: Vec<RdpLogEntry>) -> Result<(), String> {
     use std::io::Write;
     let path = rdp_log_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -632,10 +626,6 @@ fn rdp_log_batch(entries: Vec<RdpLogEntry>) -> Result<(), String> {
 #[tauri::command]
 fn rdp_log_clear() -> Result<(), String> {
     let path = rdp_log_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-
     if path.exists() {
         std::fs::write(&path, b"").map_err(|e| e.to_string())?;
     }

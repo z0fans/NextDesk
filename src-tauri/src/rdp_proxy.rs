@@ -1,11 +1,10 @@
 use futures_util::{SinkExt, StreamExt};
 use ironrdp_rdcleanpath::RDCleanPathPdu;
-use std::error::Error;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
@@ -17,10 +16,6 @@ pub type SharedSocksPort = Arc<Mutex<u16>>;
 type SharedBool = Arc<Mutex<bool>>;
 type SharedString = Arc<Mutex<String>>;
 type SharedEndpoints = Arc<Mutex<Vec<crate::state::RelayEndpoint>>>;
-
-const SOCKS_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
-const RDP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Start the WS→TCP RDCleanPath proxy with optional SOCKS5 upstream.
 pub async fn start_proxy(
@@ -96,7 +91,7 @@ async fn handle_client(
 async fn connect_to_dest(
     dest: &str,
     socks_port: u16,
-) -> Result<TcpStream, Box<dyn Error>> {
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
     let parts: Vec<&str> = dest.rsplitn(2, ':').collect();
     if parts.len() != 2 {
         return Err(format!("invalid dest: {dest}").into());
@@ -108,10 +103,10 @@ async fn connect_to_dest(
     let use_proxy = !is_private_ip(host);
 
     if use_proxy {
-        // Try SOCKS5 via Clash, with a short timeout.
+        // Try SOCKS5 via Clash, with 3s timeout
         let socks_addr = format!("127.0.0.1:{socks_port}");
         let socks_result = tokio::time::timeout(
-            SOCKS_CONNECT_TIMEOUT,
+            std::time::Duration::from_secs(3),
             tokio_socks::tcp::Socks5Stream::connect(socks_addr.as_str(), (host, port)),
         )
         .await;
@@ -125,10 +120,7 @@ async fn connect_to_dest(
                 log::warn!("[rdp_proxy] SOCKS5 error: {e}, fallback direct");
             }
             Err(_) => {
-                log::warn!(
-                    "[rdp_proxy] SOCKS5 timeout ({}s), fallback direct",
-                    SOCKS_CONNECT_TIMEOUT.as_secs()
-                );
+                log::warn!("[rdp_proxy] SOCKS5 timeout (3s), fallback direct");
             }
         }
     } else {
@@ -136,14 +128,8 @@ async fn connect_to_dest(
     }
 
     // Direct fallback
-    let tcp = tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, TcpStream::connect(dest))
+    let tcp = TcpStream::connect(dest)
         .await
-        .map_err(|_| {
-            format!(
-                "direct tcp {dest}: timeout after {}s",
-                DIRECT_CONNECT_TIMEOUT.as_secs()
-            )
-        })?
         .map_err(|e| format!("direct tcp {dest}: {e}"))?;
     log::info!("[rdp_proxy] Connected direct → {dest}");
     Ok(tcp)
@@ -186,66 +172,6 @@ fn is_private_ip(host: &str) -> bool {
     } else {
         false // hostname, not IP — use proxy
     }
-}
-
-async fn write_x224_request<W>(
-    writer: &mut W,
-    x224_req: &[u8],
-    dest: &str,
-) -> Result<(), Box<dyn Error>>
-where
-    W: AsyncWrite + Unpin,
-{
-    tokio::time::timeout(RDP_HANDSHAKE_TIMEOUT, writer.write_all(x224_req))
-        .await
-        .map_err(|_| {
-            format!(
-                "x224 request {dest}: timeout after {}s",
-                RDP_HANDSHAKE_TIMEOUT.as_secs()
-            )
-        })??;
-    Ok(())
-}
-
-async fn read_x224_response<R>(reader: &mut R, dest: &str) -> Result<Vec<u8>, Box<dyn Error>>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buf = vec![0u8; 4096];
-    let n = tokio::time::timeout(RDP_HANDSHAKE_TIMEOUT, reader.read(&mut buf))
-        .await
-        .map_err(|_| {
-            format!(
-                "x224 response {dest}: timeout after {}s",
-                RDP_HANDSHAKE_TIMEOUT.as_secs()
-            )
-        })??;
-
-    if n == 0 {
-        return Err(format!("x224 response {dest}: EOF").into());
-    }
-
-    Ok(buf[..n].to_vec())
-}
-
-async fn connect_tls<S>(
-    connector: &tokio_native_tls::TlsConnector,
-    host: &str,
-    stream: S,
-    dest: &str,
-) -> Result<tokio_native_tls::TlsStream<S>, Box<dyn Error>>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    tokio::time::timeout(RDP_HANDSHAKE_TIMEOUT, connector.connect(host, stream))
-        .await
-        .map_err(|_| {
-            format!(
-                "tls handshake {dest}: timeout after {}s",
-                RDP_HANDSHAKE_TIMEOUT.as_secs()
-            )
-        })?
-        .map_err(|e| format!("tls: {e}").into())
 }
 
 async fn relay_tls_to_websocket<S>(
@@ -445,23 +371,15 @@ async fn handle_inner(
 
         if let Some((relay_host, relay_port)) = relay_addr {
             let relay_dest = format!("{relay_host}:{relay_port}");
-            match tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, TcpStream::connect(&relay_dest))
-                .await
-            {
-                Ok(Ok(tcp)) => {
+            match TcpStream::connect(&relay_dest).await {
+                Ok(tcp) => {
                     log::info!("[rdp_proxy] Cloud: connected to relay {relay_dest}");
                     // Relay handles TCP-level forwarding, use normal X.224/TLS path
                     return handle_normal_path(tcp, &dest, dest_host, &x224_req, &mut tx, &mut rx)
                         .await;
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     log::warn!("[rdp_proxy] Cloud: relay connect failed: {e}, fallback normal");
-                }
-                Err(_) => {
-                    log::warn!(
-                        "[rdp_proxy] Cloud: relay connect timeout ({}s), fallback normal",
-                        DIRECT_CONNECT_TIMEOUT.as_secs()
-                    );
                 }
             }
         }
@@ -472,15 +390,16 @@ async fn handle_inner(
     eprintln!("[rdp_proxy] TCP connected to {dest}");
 
     // 4: X.224 request
-    write_x224_request(&mut tcp, &x224_req, &dest).await?;
+    tcp.write_all(&x224_req).await?;
     eprintln!("[rdp_proxy] X.224 req sent ({} bytes)", x224_req.len());
 
     // 5: X.224 response
-    let x224_resp = read_x224_response(&mut tcp, &dest).await?;
+    let mut buf = vec![0u8; 4096];
+    let n = tcp.read(&mut buf).await?;
+    let x224_resp = buf[..n].to_vec();
     eprintln!(
-        "[rdp_proxy] X.224 resp received ({} bytes): {:?}",
-        x224_resp.len(),
-        &x224_resp[..x224_resp.len().min(32)]
+        "[rdp_proxy] X.224 resp received ({n} bytes): {:?}",
+        &x224_resp[..n.min(32)]
     );
 
     // 6: TLS + cert
@@ -491,9 +410,9 @@ async fn handle_inner(
     let tls_cx = tokio_native_tls::TlsConnector::from(tls_cx);
     let host = dest.split(':').next().unwrap_or(&dest);
     eprintln!("[rdp_proxy] TLS handshake starting to {host}");
-    let tls = connect_tls(&tls_cx, host, tcp, &dest).await.map_err(|e| {
+    let tls = tls_cx.connect(host, tcp).await.map_err(|e| {
         eprintln!("[rdp_proxy] TLS FAILED: {e}");
-        e
+        format!("tls: {e}")
     })?;
     eprintln!("[rdp_proxy] TLS handshake OK");
     let chain: Vec<Vec<u8>> = tls
@@ -531,10 +450,12 @@ async fn handle_normal_path(
     rx: &mut futures_util::stream::SplitStream<WebSocketStream<TcpStream>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // X.224 request
-    write_x224_request(&mut tcp, x224_req, dest).await?;
+    tcp.write_all(x224_req).await?;
 
     // X.224 response
-    let x224_resp = read_x224_response(&mut tcp, dest).await?;
+    let mut buf = vec![0u8; 4096];
+    let n = tcp.read(&mut buf).await?;
+    let x224_resp = buf[..n].to_vec();
 
     // TLS + cert
     let tls_cx = native_tls::TlsConnector::builder()
@@ -543,7 +464,10 @@ async fn handle_normal_path(
         .build()?;
     let tls_cx = tokio_native_tls::TlsConnector::from(tls_cx);
     let host = dest.split(':').next().unwrap_or(dest);
-    let tls = connect_tls(&tls_cx, host, tcp, dest).await?;
+    let tls = tls_cx
+        .connect(host, tcp)
+        .await
+        .map_err(|e| format!("tls: {e}"))?;
     let chain: Vec<Vec<u8>> = tls
         .get_ref()
         .peer_certificate()
@@ -572,9 +496,13 @@ async fn handle_tube_path(
     tx: &mut futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>,
     rx: &mut futures_util::stream::SplitStream<WebSocketStream<TcpStream>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     // X.224 over tube
-    write_x224_request(&mut tube_io, x224_req, dest).await?;
-    let x224_resp = read_x224_response(&mut tube_io, dest).await?;
+    tube_io.write_all(x224_req).await?;
+    let mut buf = vec![0u8; 4096];
+    let n = tube_io.read(&mut buf).await?;
+    let x224_resp = buf[..n].to_vec();
 
     // TLS over tube
     let tls_cx = native_tls::TlsConnector::builder()
@@ -582,7 +510,10 @@ async fn handle_tube_path(
         .danger_accept_invalid_hostnames(true)
         .build()?;
     let tls_cx = tokio_native_tls::TlsConnector::from(tls_cx);
-    let tls = connect_tls(&tls_cx, dest_host, tube_io, dest).await?;
+    let tls = tls_cx
+        .connect(dest_host, tube_io)
+        .await
+        .map_err(|e| format!("tls: {e}"))?;
     let chain: Vec<Vec<u8>> = tls
         .get_ref()
         .peer_certificate()
