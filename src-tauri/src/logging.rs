@@ -2,7 +2,7 @@
 //!
 //! Initializes env_logger with:
 //! - Output to both stderr (visible in `npx tauri dev` console) and a log file
-//! - Log file path: `/tmp/nextdesk_debug.log` (truncated on every startup)
+//! - Log file path: `/tmp/nextdesk_debug.log` on macOS, temp dir on other OSes
 //! - Default level: INFO
 //! - Override via `RUST_LOG` env var
 //!
@@ -23,7 +23,17 @@ use std::sync::Mutex;
 
 /// Path to the rotating debug log file.
 pub fn log_file_path() -> PathBuf {
-    PathBuf::from("/tmp").join("nextdesk_debug.log")
+    #[cfg(target_os = "macos")]
+    {
+        return PathBuf::from("/tmp").join("nextdesk_debug.log");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::temp_dir()
+            .join("NextDesk")
+            .join("nextdesk_debug.log")
+    }
 }
 
 /// A writer that fans out to both a file and stderr.
@@ -63,6 +73,17 @@ impl Write for FanoutWriter {
 /// Initialize the global logger. Call once from `lib.rs::run()`.
 pub fn init() {
     let path = log_file_path();
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "[logging] Failed to create log directory {}: {}",
+                parent.display(),
+                e
+            );
+            return;
+        }
+    }
+
     // Truncate on startup so each session starts clean.
     let file = match File::create(&path) {
         Ok(f) => f,
