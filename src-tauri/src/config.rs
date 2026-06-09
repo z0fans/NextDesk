@@ -12,6 +12,7 @@ const SERVER_GLOBAL_GROUP: &str = "🖥 Server-Global";
 const AUTO_AMERICAS_GROUP: &str = "⚡ Auto-Americas";
 const AUTO_ASIA_GROUP: &str = "⚡ Auto-Asia";
 const AUTO_GLOBAL_GROUP: &str = "⚡ Auto-Global";
+pub(crate) const PROXY_DELAY_TEST_URL: &str = "http://cp.cloudflare.com/generate_204";
 const DEFAULT_RUNTIME_FRONTMATTER: &str = r#"
 port: 17890
 socks-port: 17897
@@ -263,7 +264,7 @@ fn proxy_group_to_yaml(group: &ProxyGroup) -> serde_yaml::Value {
         ),
     );
     if group.group_type == "fallback" {
-        map.insert(ykey("url"), yval("http://www.gstatic.com/generate_204"));
+        map.insert(ykey("url"), yval(PROXY_DELAY_TEST_URL));
         map.insert(
             ykey("interval"),
             serde_yaml::Value::Number(serde_yaml::Number::from(240)),
@@ -596,8 +597,8 @@ mod tests {
         build_rdp_runtime_proxy_groups, ensure_port_rule, ensure_runtime_network_config,
         generate_clash_config, generate_clash_config_from_subscription, get_user_config_dir,
         is_selectable_proxy_name, patch_runtime_ports, preferred_rdp_catch_all_group,
-        real_proxy_names_from_yaml, ykey, RuntimePorts, SERVER_AMERICAS_GROUP, SERVER_ASIA_GROUP,
-        SERVER_GLOBAL_GROUP,
+        proxy_group_to_yaml, real_proxy_names_from_yaml, ykey, RuntimePorts, PROXY_DELAY_TEST_URL,
+        SERVER_AMERICAS_GROUP, SERVER_ASIA_GROUP, SERVER_GLOBAL_GROUP,
     };
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -715,6 +716,29 @@ mod tests {
                 .expect("expected RDP server group");
             assert_eq!(group.proxies.last().map(String::as_str), Some("DIRECT"));
         }
+    }
+
+    #[test]
+    fn fallback_groups_use_cloudflare_delay_url() {
+        let groups = build_rdp_runtime_proxy_groups(&[
+            "🇺🇸 US Server Only 01".to_string(),
+            "🇺🇸 US Server Only 02".to_string(),
+        ]);
+        let fallback = groups
+            .iter()
+            .find(|group| group.group_type == "fallback")
+            .expect("runtime groups should include fallback groups");
+        let yaml = proxy_group_to_yaml(fallback);
+        let map = yaml.as_mapping().expect("group yaml should be a map");
+
+        assert_eq!(
+            map.get(&ykey("url")).and_then(serde_yaml::Value::as_str),
+            Some(PROXY_DELAY_TEST_URL)
+        );
+        assert_ne!(
+            map.get(&ykey("url")).and_then(serde_yaml::Value::as_str),
+            Some("http://www.gstatic.com/generate_204")
+        );
     }
 
     #[test]

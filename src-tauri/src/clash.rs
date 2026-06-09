@@ -6,7 +6,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::{Child, Command};
 
-use crate::config::{get_log_dir, get_user_config_dir};
+use crate::config::{get_log_dir, get_user_config_dir, PROXY_DELAY_TEST_URL};
 
 const PROXY_ENV_VARS: &[&str] = &[
     "HTTP_PROXY",
@@ -18,6 +18,8 @@ const PROXY_ENV_VARS: &[&str] = &[
     "all_proxy",
     "no_proxy",
 ];
+const PROXY_DELAY_TEST_URLS: &[&str] =
+    &[PROXY_DELAY_TEST_URL, "http://www.gstatic.com/generate_204"];
 
 fn http_client() -> Client {
     Client::builder()
@@ -353,10 +355,7 @@ pub async fn test_group_delays(
     eprintln!("[delay] Testing group: {group_name}, url: {group_url}");
     let group_resp = client
         .get(&group_url)
-        .query(&[
-            ("url", "http://www.gstatic.com/generate_204"),
-            ("timeout", "5000"),
-        ])
+        .query(&[("url", PROXY_DELAY_TEST_URL), ("timeout", "5000")])
         .send()
         .await;
 
@@ -415,31 +414,34 @@ pub async fn test_group_delays(
                 .unwrap_or_default();
             let encoded = encode_proxy_name(&name);
             let url = format!("{base}/proxies/{encoded}/delay");
-            let resp = client
-                .get(&url)
-                .query(&[
-                    ("url", "http://www.gstatic.com/generate_204"),
-                    ("timeout", "5000"),
-                ])
-                .send()
-                .await;
-            let delay = match resp {
-                Ok(r) if r.status().is_success() => r
-                    .json::<Value>()
-                    .await
-                    .ok()
-                    .and_then(|d| d.get("delay").and_then(|v| v.as_i64()))
-                    .map(normalize_delay)
-                    .unwrap_or(-1),
-                Ok(r) => {
-                    eprintln!("[delay] {} => HTTP {}", name, r.status());
-                    -1
+            let mut delay = -1;
+            for test_url in PROXY_DELAY_TEST_URLS {
+                let resp = client
+                    .get(&url)
+                    .query(&[("url", *test_url), ("timeout", "5000")])
+                    .send()
+                    .await;
+                delay = match resp {
+                    Ok(r) if r.status().is_success() => r
+                        .json::<Value>()
+                        .await
+                        .ok()
+                        .and_then(|d| d.get("delay").and_then(|v| v.as_i64()))
+                        .map(normalize_delay)
+                        .unwrap_or(-1),
+                    Ok(r) => {
+                        eprintln!("[delay] {} via {} => HTTP {}", name, test_url, r.status());
+                        -1
+                    }
+                    Err(e) => {
+                        eprintln!("[delay] {} via {} => error: {}", name, test_url, e);
+                        -1
+                    }
+                };
+                if delay > 0 {
+                    break;
                 }
-                Err(e) => {
-                    eprintln!("[delay] {} => error: {}", name, e);
-                    -1
-                }
-            };
+            }
             (name, delay)
         }));
     }
