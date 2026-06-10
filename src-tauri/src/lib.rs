@@ -23,7 +23,7 @@ mod windows_virtual_files;
 
 use serde_json::Value;
 use state::{AppState, RunMode, Server};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, TcpListener, UdpSocket};
 use tauri::{AppHandle, Manager, State};
 
@@ -595,37 +595,64 @@ async fn switch_proxy(
     Ok(clash::switch_proxy(&api, &group_name, &proxy_name).await)
 }
 
+fn selectable_server_names(app_state: &AppState) -> HashSet<String> {
+    app_state
+        .servers
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|server| config::is_selectable_proxy_name(&server.name))
+        .map(|server| server.name.clone())
+        .collect()
+}
+
+fn state_group_members(group_name: &str, app_state: &AppState) -> Vec<String> {
+    let groups = app_state.proxy_groups.lock().unwrap();
+    groups
+        .iter()
+        .find(|group| group.name == group_name)
+        .map(|group| group.proxies.clone())
+        .unwrap_or_default()
+}
+
+fn real_group_proxies(members: &[String], server_names: &HashSet<String>) -> Vec<String> {
+    members
+        .iter()
+        .filter(|proxy| server_names.contains(*proxy))
+        .cloned()
+        .collect()
+}
+
 #[tauri::command]
 async fn test_group_delays(
     group_name: String,
     app_state: State<'_, AppState>,
 ) -> Result<HashMap<String, i64>, String> {
     let api = app_state.clash_api_base.lock().unwrap().clone();
-
-    let proxies = {
-        let groups = app_state.proxy_groups.lock().unwrap();
-        let server_names: std::collections::HashSet<String> = app_state
-            .servers
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|s| config::is_selectable_proxy_name(&s.name))
-            .map(|s| s.name.clone())
-            .collect();
-        groups
-            .iter()
-            .find(|g| g.name == group_name)
-            .map(|g| {
-                g.proxies
-                    .iter()
-                    .filter(|proxy| server_names.contains(*proxy))
-                    .cloned()
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_default()
-    };
+    let server_names = selectable_server_names(app_state.inner());
+    let state_members = state_group_members(&group_name, app_state.inner());
+    let members = clash::get_proxy_group_members(&api, &group_name)
+        .await
+        .unwrap_or(state_members);
+    let proxies = real_group_proxies(&members, &server_names);
 
     Ok(clash::test_group_delays(&api, &group_name, &proxies).await)
+}
+
+#[tauri::command]
+async fn get_proxy_plane_diagnostics(
+    group_name: String,
+    app_state: State<'_, AppState>,
+) -> Result<clash::ProxyPlaneDiagnostics, String> {
+    let api = app_state.clash_api_base.lock().unwrap().clone();
+    let server_names = selectable_server_names(app_state.inner());
+    let state_members = state_group_members(&group_name, app_state.inner());
+    let members = clash::get_proxy_group_members(&api, &group_name)
+        .await
+        .unwrap_or(state_members);
+    let proxies = real_group_proxies(&members, &server_names);
+
+    Ok(clash::get_proxy_plane_diagnostics(&api, members.len(), &proxies).await)
 }
 
 #[tauri::command]
@@ -1416,6 +1443,7 @@ pub fn run() {
             get_proxy_groups,
             switch_proxy,
             test_group_delays,
+            get_proxy_plane_diagnostics,
             test_servers_connectivity,
             get_connections,
             get_clash_log,

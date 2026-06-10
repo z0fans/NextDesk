@@ -12,7 +12,7 @@ const SERVER_GLOBAL_GROUP: &str = "🖥 Server-Global";
 const AUTO_AMERICAS_GROUP: &str = "⚡ Auto-Americas";
 const AUTO_ASIA_GROUP: &str = "⚡ Auto-Asia";
 const AUTO_GLOBAL_GROUP: &str = "⚡ Auto-Global";
-pub(crate) const PROXY_DELAY_TEST_URL: &str = "http://cp.cloudflare.com/generate_204";
+pub(crate) const PROXY_DELAY_TEST_URL: &str = "http://www.gstatic.com/generate_204";
 const DEFAULT_RUNTIME_FRONTMATTER: &str = r#"
 port: 17890
 socks-port: 17897
@@ -719,7 +719,12 @@ mod tests {
     }
 
     #[test]
-    fn fallback_groups_use_cloudflare_delay_url() {
+    fn default_delay_url_matches_flclash_baseline() {
+        assert_eq!(PROXY_DELAY_TEST_URL, "http://www.gstatic.com/generate_204");
+    }
+
+    #[test]
+    fn fallback_groups_use_gstatic_delay_url() {
         let groups = build_rdp_runtime_proxy_groups(&[
             "🇺🇸 US Server Only 01".to_string(),
             "🇺🇸 US Server Only 02".to_string(),
@@ -735,7 +740,7 @@ mod tests {
             map.get(&ykey("url")).and_then(serde_yaml::Value::as_str),
             Some(PROXY_DELAY_TEST_URL)
         );
-        assert_ne!(
+        assert_eq!(
             map.get(&ykey("url")).and_then(serde_yaml::Value::as_str),
             Some("http://www.gstatic.com/generate_204")
         );

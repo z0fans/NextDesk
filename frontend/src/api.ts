@@ -40,6 +40,31 @@ export interface ProxyGroup {
   now?: string;
 }
 
+export interface ProxyDelayAttempt {
+  url: string;
+  status: string;
+  delay?: number | null;
+  error?: string | null;
+}
+
+export interface ProxyDelayDetail {
+  name: string;
+  delay: number;
+  url?: string | null;
+  status: 'ok' | 'failed' | string;
+  error?: string | null;
+  attempts: ProxyDelayAttempt[];
+}
+
+export interface ProxyPlaneDiagnostics {
+  apiBase: string;
+  apiReady: boolean;
+  proxyCount: number;
+  realProxyCount: number;
+  delayUrls: string[];
+  details: ProxyDelayDetail[];
+}
+
 export interface SubscriptionResult {
   success: boolean;
   error: string | null;
@@ -129,6 +154,12 @@ export const api = {
   testGroupDelays: (groupName: string) =>
     invoke<Record<string, number>>(
       'test_group_delays',
+      { groupName },
+    ),
+
+  getProxyPlaneDiagnostics: (groupName: string) =>
+    invoke<ProxyPlaneDiagnostics>(
+      'get_proxy_plane_diagnostics',
       { groupName },
     ),
 

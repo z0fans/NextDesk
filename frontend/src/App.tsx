@@ -70,7 +70,7 @@ function AppContent() {
   const { t } = useTranslation();
   const [activeTab, setActiveTab] = useState<'dashboard' | 'servers' | 'proxy' | 'logs' | 'settings' | 'rdp'>('dashboard');
   const [status, setStatus] = useState<EngineStatus>({ clash: false, rdp_proxy_port: 8765 });
-  const [, setServers] = useState<Server[]>([]);
+  const [servers, setServers] = useState<Server[]>([]);
   const [loading, setLoading] = useState(false);
   const [subUrl, setSubUrl] = useState('');
   const [updatingSub, setUpdatingSub] = useState(false);
@@ -237,13 +237,36 @@ function AppContent() {
     if (expandedGroupNames.length === 0) {
       return;
     }
-    
+
+    const realProxyNames = new Set(servers.map(server => server.name));
+    const setGroupDelayState = (groupName: string, value: number) => {
+      const group = proxyGroups.find(item => item.name === groupName);
+      if (!group) {
+        return;
+      }
+      const entries = group.proxies
+        .filter(proxy => realProxyNames.has(proxy));
+      if (entries.length === 0) {
+        return;
+      }
+      setNodeDelays(prev => ({
+        ...prev,
+        ...Object.fromEntries(entries.map(proxy => [proxy, value])),
+      }));
+    };
+
     setTestingConnectivity(true);
     try {
       await ensureEngineRunningForDelayTest();
       for (const groupName of expandedGroupNames) {
-        const delays = await api.testGroupDelays(groupName);
-        setNodeDelays(prev => ({ ...prev, ...delays }));
+        setGroupDelayState(groupName, 0);
+        try {
+          const delays = await api.testGroupDelays(groupName);
+          setNodeDelays(prev => ({ ...prev, ...delays }));
+        } catch (error) {
+          setGroupDelayState(groupName, -1);
+          console.error(`Failed to test connectivity for ${groupName}`, error);
+        }
       }
     } catch (error) {
       console.error('Failed to test connectivity', error);
@@ -946,12 +969,14 @@ function AppContent() {
                         <div className="bg-muted/20 p-4 border-t border-border grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-2.5">
                           {group.proxies.map(proxy => {
                             const isSelected = selectedProxy === proxy;
-                            const delay = nodeDelays[proxy];
-                            const hasDelay = delay !== undefined;
-                            const isTimeout = delay === -1;
                             const isSubGroup = proxyGroups.some(g => g.name === proxy);
+                            const delay = isSubGroup ? undefined : nodeDelays[proxy];
+                            const hasDelay = delay !== undefined;
+                            const isTesting = delay === 0;
+                            const isTimeout = delay === -1;
                             const getDelayColor = () => {
                               if (!hasDelay) return '';
+                              if (isTesting) return 'text-cyan-400';
                               if (isTimeout) return 'text-red-400';
                               if (delay < 100) return 'text-emerald-400';
                               if (delay < 300) return 'text-yellow-400';
@@ -959,6 +984,7 @@ function AppContent() {
                             };
                             const getDelayText = () => {
                               if (!hasDelay) return null;
+                              if (isTesting) return '...';
                               if (isTimeout) return '--';
                               return `${delay}ms`;
                             };

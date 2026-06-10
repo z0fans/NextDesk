@@ -1,4 +1,5 @@
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,8 +19,41 @@ const PROXY_ENV_VARS: &[&str] = &[
     "all_proxy",
     "no_proxy",
 ];
-const PROXY_DELAY_TEST_URLS: &[&str] =
-    &[PROXY_DELAY_TEST_URL, "http://www.gstatic.com/generate_204"];
+const PROXY_DELAY_TEST_URLS: &[&str] = &[
+    PROXY_DELAY_TEST_URL,
+    "http://cp.cloudflare.com/generate_204",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyDelayAttempt {
+    pub url: String,
+    pub status: String,
+    pub delay: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyDelayDetail {
+    pub name: String,
+    pub delay: i64,
+    pub url: Option<String>,
+    pub status: String,
+    pub error: Option<String>,
+    pub attempts: Vec<ProxyDelayAttempt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPlaneDiagnostics {
+    pub api_base: String,
+    pub api_ready: bool,
+    pub proxy_count: usize,
+    pub real_proxy_count: usize,
+    pub delay_urls: Vec<String>,
+    pub details: Vec<ProxyDelayDetail>,
+}
 
 fn http_client() -> Client {
     Client::builder()
@@ -41,41 +75,37 @@ fn normalize_delay(delay: i64) -> i64 {
     }
 }
 
-fn extract_delay_from_proxy_info(info: &Value) -> Option<i64> {
-    if let Some(delay) = info
-        .get("history")
-        .and_then(|v| v.as_array())
-        .and_then(|items| items.last())
-        .and_then(|entry| entry.get("delay"))
-        .and_then(|v| v.as_i64())
-    {
-        return Some(normalize_delay(delay));
-    }
-
-    match info.get("alive").and_then(|v| v.as_bool()) {
-        Some(false) => Some(-1),
-        _ => None,
-    }
-}
-
-fn merge_delays_with_snapshot(
-    results: &mut std::collections::HashMap<String, i64>,
-    proxies: &[String],
-    snapshot: &Value,
-) {
-    let Some(proxy_map) = snapshot.get("proxies").and_then(|v| v.as_object()) else {
-        return;
-    };
-
-    for proxy in proxies {
-        if results.contains_key(proxy) {
-            continue;
+impl ProxyDelayDetail {
+    fn success(name: &str, url: &str, delay: i64, attempts: Vec<ProxyDelayAttempt>) -> Self {
+        Self {
+            name: name.to_string(),
+            delay: normalize_delay(delay),
+            url: Some(url.to_string()),
+            status: "ok".to_string(),
+            error: None,
+            attempts,
         }
-        let Some(info) = proxy_map.get(proxy) else {
-            continue;
-        };
-        if let Some(delay) = extract_delay_from_proxy_info(info) {
-            results.insert(proxy.clone(), delay);
+    }
+
+    fn failed(name: &str, attempts: Vec<ProxyDelayAttempt>) -> Self {
+        let error = attempts
+            .iter()
+            .map(|attempt| {
+                let reason = attempt
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| attempt.status.clone());
+                format!("{}: {reason}", attempt.url)
+            })
+            .collect::<Vec<String>>()
+            .join("; ");
+        Self {
+            name: name.to_string(),
+            delay: -1,
+            url: None,
+            status: "failed".to_string(),
+            error: Some(error),
+            attempts,
         }
     }
 }
@@ -85,6 +115,126 @@ async fn fetch_proxies_snapshot(api_base: &str) -> Option<Value> {
     let url = format!("{api_base}/proxies");
     let resp = client.get(&url).send().await.ok()?;
     resp.json::<Value>().await.ok()
+}
+
+pub async fn get_proxy_group_members(api_base: &str, group_name: &str) -> Option<Vec<String>> {
+    let client = http_client();
+    let encoded = encode_proxy_name(group_name);
+    let url = format!("{api_base}/proxies/{encoded}");
+    let resp = client.get(&url).send().await.ok()?;
+    let data = resp.json::<Value>().await.ok()?;
+    data.get("all")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect::<Vec<String>>()
+        })
+}
+
+async fn test_proxy_delay_detail(api_base: &str, proxy_name: &str) -> ProxyDelayDetail {
+    let client = http_client();
+    let encoded = encode_proxy_name(proxy_name);
+    let endpoint = format!("{api_base}/proxies/{encoded}/delay");
+    let mut attempts = Vec::new();
+
+    for test_url in PROXY_DELAY_TEST_URLS {
+        let resp = client
+            .get(&endpoint)
+            .query(&[("url", *test_url), ("timeout", "5000")])
+            .send()
+            .await;
+
+        match resp {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<Value>().await {
+                    Ok(payload) => {
+                        let raw_delay = payload.get("delay").and_then(|v| v.as_i64());
+                        let normalized = raw_delay.map(normalize_delay);
+                        if let Some(delay) = normalized.filter(|delay| *delay > 0) {
+                            attempts.push(ProxyDelayAttempt {
+                                url: (*test_url).to_string(),
+                                status: "ok".to_string(),
+                                delay: Some(delay),
+                                error: None,
+                            });
+                            return ProxyDelayDetail::success(
+                                proxy_name, test_url, delay, attempts,
+                            );
+                        }
+
+                        let error = match raw_delay {
+                            Some(0) => "delay returned 0".to_string(),
+                            Some(delay) => format!("delay returned {delay}"),
+                            None => "missing delay".to_string(),
+                        };
+                        attempts.push(ProxyDelayAttempt {
+                            url: (*test_url).to_string(),
+                            status: "invalid_delay".to_string(),
+                            delay: raw_delay,
+                            error: Some(error),
+                        });
+                    }
+                    Err(error) => {
+                        attempts.push(ProxyDelayAttempt {
+                            url: (*test_url).to_string(),
+                            status: "invalid_json".to_string(),
+                            delay: None,
+                            error: Some(error.to_string()),
+                        });
+                    }
+                }
+            }
+            Ok(response) => {
+                attempts.push(ProxyDelayAttempt {
+                    url: (*test_url).to_string(),
+                    status: "http_error".to_string(),
+                    delay: None,
+                    error: Some(format!("HTTP {}", response.status())),
+                });
+            }
+            Err(error) => {
+                attempts.push(ProxyDelayAttempt {
+                    url: (*test_url).to_string(),
+                    status: "request_error".to_string(),
+                    delay: None,
+                    error: Some(error.to_string()),
+                });
+            }
+        }
+    }
+
+    ProxyDelayDetail::failed(proxy_name, attempts)
+}
+
+pub async fn test_group_delay_details(api_base: &str, proxies: &[String]) -> Vec<ProxyDelayDetail> {
+    let mut handles = Vec::with_capacity(proxies.len());
+    for proxy in proxies {
+        let api_base = api_base.to_string();
+        let proxy_name = proxy.clone();
+        handles.push((
+            proxy.clone(),
+            tokio::spawn(async move { test_proxy_delay_detail(&api_base, &proxy_name).await }),
+        ));
+    }
+
+    let mut details = Vec::with_capacity(handles.len());
+    for (proxy_name, handle) in handles {
+        match handle.await {
+            Ok(detail) => details.push(detail),
+            Err(error) => details.push(ProxyDelayDetail::failed(
+                &proxy_name,
+                vec![ProxyDelayAttempt {
+                    url: "internal".to_string(),
+                    status: "task_error".to_string(),
+                    delay: None,
+                    error: Some(error.to_string()),
+                }],
+            )),
+        }
+    }
+    details
 }
 
 /// Trigger geodata update on external Clash
@@ -342,116 +492,34 @@ async fn close_rdp_connections(api_base: &str, group_name: &str) {
 /// Test delays for all proxies in a group
 pub async fn test_group_delays(
     api_base: &str,
-    group_name: &str,
+    _group_name: &str,
     proxies: &[String],
 ) -> std::collections::HashMap<String, i64> {
-    let snapshot = fetch_proxies_snapshot(api_base).await;
-    let mut results = std::collections::HashMap::new();
+    test_group_delay_details(api_base, proxies)
+        .await
+        .into_iter()
+        .map(|detail| (detail.name, detail.delay))
+        .collect()
+}
 
-    // Try group delay endpoint first (mihomo)
-    let client = http_client();
-    let encoded_group = encode_proxy_name(group_name);
-    let group_url = format!("{api_base}/group/{encoded_group}/delay");
-    eprintln!("[delay] Testing group: {group_name}, url: {group_url}");
-    let group_resp = client
-        .get(&group_url)
-        .query(&[("url", PROXY_DELAY_TEST_URL), ("timeout", "5000")])
-        .send()
-        .await;
-
-    if let Ok(resp) = group_resp {
-        eprintln!("[delay] Group response status: {}", resp.status());
-        if resp.status().is_success() {
-            if let Ok(data) = resp
-                .json::<std::collections::HashMap<String, Value>>()
-                .await
-            {
-                for (name, val) in &data {
-                    let delay = val
-                        .as_i64()
-                        .or_else(|| val.get("delay").and_then(|d| d.as_i64()))
-                        .map(normalize_delay)
-                        .unwrap_or(-1);
-                    results.insert(name.clone(), delay);
-                }
-            }
-        }
+pub async fn get_proxy_plane_diagnostics(
+    api_base: &str,
+    proxy_count: usize,
+    proxies: &[String],
+) -> ProxyPlaneDiagnostics {
+    let api_ready = fetch_proxies_snapshot(api_base).await.is_some();
+    let details = test_group_delay_details(api_base, proxies).await;
+    ProxyPlaneDiagnostics {
+        api_base: api_base.to_string(),
+        api_ready,
+        proxy_count,
+        real_proxy_count: proxies.len(),
+        delay_urls: PROXY_DELAY_TEST_URLS
+            .iter()
+            .map(|url| (*url).to_string())
+            .collect(),
+        details,
     }
-
-    if let Some(snapshot) = snapshot.as_ref() {
-        merge_delays_with_snapshot(&mut results, proxies, snapshot);
-    }
-
-    eprintln!(
-        "[delay] Merged results: {}/{} nodes",
-        results.len(),
-        proxies.len()
-    );
-    if results.len() == proxies.len() {
-        return results;
-    }
-
-    let missing: Vec<String> = proxies
-        .iter()
-        .filter(|proxy| !results.contains_key(*proxy))
-        .cloned()
-        .collect();
-
-    // Fallback: test unresolved proxies individually
-    eprintln!(
-        "[delay] Fallback: testing {} unresolved proxies individually",
-        missing.len()
-    );
-    let mut handles = vec![];
-    for proxy in missing {
-        let base = api_base.to_string();
-        let name = proxy;
-        handles.push(tokio::spawn(async move {
-            let client = Client::builder()
-                .timeout(Duration::from_secs(10))
-                .no_proxy()
-                .build()
-                .unwrap_or_default();
-            let encoded = encode_proxy_name(&name);
-            let url = format!("{base}/proxies/{encoded}/delay");
-            let mut delay = -1;
-            for test_url in PROXY_DELAY_TEST_URLS {
-                let resp = client
-                    .get(&url)
-                    .query(&[("url", *test_url), ("timeout", "5000")])
-                    .send()
-                    .await;
-                delay = match resp {
-                    Ok(r) if r.status().is_success() => r
-                        .json::<Value>()
-                        .await
-                        .ok()
-                        .and_then(|d| d.get("delay").and_then(|v| v.as_i64()))
-                        .map(normalize_delay)
-                        .unwrap_or(-1),
-                    Ok(r) => {
-                        eprintln!("[delay] {} via {} => HTTP {}", name, test_url, r.status());
-                        -1
-                    }
-                    Err(e) => {
-                        eprintln!("[delay] {} via {} => error: {}", name, test_url, e);
-                        -1
-                    }
-                };
-                if delay > 0 {
-                    break;
-                }
-            }
-            (name, delay)
-        }));
-    }
-
-    for handle in handles {
-        if let Ok((name, delay)) = handle.await {
-            results.insert(name, delay);
-        }
-    }
-    results
 }
 
 /// Get current connections
@@ -492,14 +560,14 @@ pub fn get_clash_log() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     #[cfg(not(target_os = "windows"))]
     use std::fs;
 
-    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        extract_delay_from_proxy_info, merge_delays_with_snapshot, prepare_runtime_engine_binary,
+        get_proxy_group_members, prepare_runtime_engine_binary, test_proxy_delay_detail,
+        ProxyDelayAttempt, ProxyDelayDetail, PROXY_DELAY_TEST_URLS,
     };
 
     #[cfg(not(target_os = "windows"))]
@@ -516,50 +584,157 @@ mod tests {
     }
 
     #[test]
-    fn merges_partial_group_results_with_snapshot_failures() {
-        let proxies = vec!["US".to_string(), "HK".to_string(), "JP".to_string()];
-        let mut results = HashMap::from([("HK".to_string(), 91)]);
-        let snapshot = json!({
-            "proxies": {
-                "US": {
-                    "alive": false,
-                    "history": [{"delay": 0}]
-                },
-                "HK": {
-                    "alive": true,
-                    "history": [{"delay": 91}]
-                },
-                "JP": {
-                    "alive": true,
-                    "history": []
-                }
-            }
-        });
-
-        merge_delays_with_snapshot(&mut results, &proxies, &snapshot);
-
-        assert_eq!(results.get("US"), Some(&-1));
-        assert_eq!(results.get("HK"), Some(&91));
-        assert_eq!(results.get("JP"), None);
+    fn delay_url_queue_prefers_gstatic_then_cloudflare() {
+        assert_eq!(PROXY_DELAY_TEST_URLS.len(), 2);
+        assert_eq!(
+            PROXY_DELAY_TEST_URLS[0],
+            "http://www.gstatic.com/generate_204"
+        );
+        assert_eq!(
+            PROXY_DELAY_TEST_URLS[1],
+            "http://cp.cloudflare.com/generate_204"
+        );
     }
 
     #[test]
-    fn extracts_delay_from_proxy_snapshot_history() {
-        let success = json!({
-            "alive": true,
-            "history": [{"delay": 42}]
-        });
-        let failed = json!({
-            "alive": false,
-            "history": [{"delay": 0}]
-        });
-        let pending = json!({
-            "alive": true,
-            "history": []
+    fn proxy_delay_detail_failed_keeps_per_url_diagnostics() {
+        let detail = ProxyDelayDetail::failed(
+            "node-a",
+            vec![
+                ProxyDelayAttempt {
+                    url: "http://www.gstatic.com/generate_204".to_string(),
+                    status: "request_error".to_string(),
+                    delay: None,
+                    error: Some("dns failed".to_string()),
+                },
+                ProxyDelayAttempt {
+                    url: "http://cp.cloudflare.com/generate_204".to_string(),
+                    status: "http_error".to_string(),
+                    delay: None,
+                    error: Some("HTTP 503 Service Unavailable".to_string()),
+                },
+            ],
+        );
+
+        assert_eq!(detail.name, "node-a");
+        assert_eq!(detail.delay, -1);
+        assert_eq!(detail.status, "failed");
+        assert_eq!(detail.attempts.len(), 2);
+        assert_eq!(
+            detail.attempts[0].url,
+            "http://www.gstatic.com/generate_204"
+        );
+        assert_eq!(detail.attempts[0].status, "request_error");
+        assert_eq!(detail.attempts[1].status, "http_error");
+        assert!(detail
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("dns failed"));
+    }
+
+    #[tokio::test]
+    async fn per_node_delay_falls_back_to_cloudflare_after_gstatic_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test listener should expose local addr");
+
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("test server should accept client");
+                let mut buf = [0_u8; 4096];
+                let n = stream
+                    .read(&mut buf)
+                    .await
+                    .expect("test server should read request");
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let response = if request.contains("www.gstatic.com") {
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else if request.contains("cp.cloudflare.com") {
+                    let body = r#"{"delay":123}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    let body = r#"{"error":"unexpected url"}"#;
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("test server should write response");
+            }
         });
 
-        assert_eq!(extract_delay_from_proxy_info(&success), Some(42));
-        assert_eq!(extract_delay_from_proxy_info(&failed), Some(-1));
-        assert_eq!(extract_delay_from_proxy_info(&pending), None);
+        let detail = test_proxy_delay_detail(&format!("http://{addr}"), "US Server Only 01").await;
+        server.await.expect("test server should finish");
+
+        assert_eq!(detail.status, "ok");
+        assert_eq!(detail.delay, 123);
+        assert_eq!(
+            detail.url.as_deref(),
+            Some("http://cp.cloudflare.com/generate_204")
+        );
+        assert_eq!(detail.attempts.len(), 2);
+        assert_eq!(detail.attempts[0].status, "http_error");
+        assert_eq!(detail.attempts[1].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn proxy_group_members_come_from_runtime_all_list() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test listener should expose local addr");
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("test server should accept client");
+            let mut buf = [0_u8; 4096];
+            let _ = stream
+                .read(&mut buf)
+                .await
+                .expect("test server should read request");
+            let body = r#"{"all":["⚡ Auto-Americas","🇺🇸 US Server Only 01","DIRECT"]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("test server should write response");
+        });
+
+        let members = get_proxy_group_members(&format!("http://{addr}"), "🖥 Server-Americas")
+            .await
+            .expect("runtime group should expose all members");
+        server.await.expect("test server should finish");
+
+        assert_eq!(
+            members,
+            vec![
+                "⚡ Auto-Americas".to_string(),
+                "🇺🇸 US Server Only 01".to_string(),
+                "DIRECT".to_string()
+            ]
+        );
     }
 }
