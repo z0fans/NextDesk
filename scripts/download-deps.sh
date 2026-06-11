@@ -6,10 +6,10 @@
 #   aarch64-apple-darwin      - macOS ARM
 #   x86_64-apple-darwin       - macOS Intel
 #   universal-apple-darwin    - macOS Universal (both archs)
-#   x86_64-pc-windows-msvc    - Windows x64
+#   x86_64-pc-windows-msvc    - Windows x64 app with x64 + ARM64 cores
 set -euo pipefail
 
-MIHOMO_VERSION="v1.19.21"
+MIHOMO_VERSION="${MIHOMO_VERSION:-v1.19.27}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="$SCRIPT_DIR/../.backend/bin"
 mkdir -p "$BIN_DIR"
@@ -41,6 +41,16 @@ download_mihomo() {
       curl -fSL "$url" -o "$tmpzip"
       unzip -o "$tmpzip" -d "$(dirname "$tmpzip")"
       mv "$(dirname "$tmpzip")/mihomo-windows-amd64.exe" "$output"
+      rm -f "$tmpzip"
+      ;;
+    windows-arm64)
+      url="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-windows-arm64-${MIHOMO_VERSION}.zip"
+      echo "Downloading mihomo ${MIHOMO_VERSION} for Windows ARM64..."
+      local tmpzip
+      tmpzip="$(mktemp).zip"
+      curl -fSL "$url" -o "$tmpzip"
+      unzip -o "$tmpzip" -d "$(dirname "$tmpzip")"
+      mv "$(dirname "$tmpzip")/mihomo-windows-arm64.exe" "$output"
       rm -f "$tmpzip"
       ;;
     *)
@@ -81,7 +91,9 @@ case "$TARGET" in
     echo "  -> Universal Binary saved to $BIN_DIR/nextdesk-core"
     ;;
   x86_64-pc-windows-msvc)
-    download_mihomo "windows-amd64" "$BIN_DIR/nextdesk-core.exe"
+    download_mihomo "windows-amd64" "$BIN_DIR/nextdesk-core-amd64.exe"
+    download_mihomo "windows-arm64" "$BIN_DIR/nextdesk-core-arm64.exe"
+    cp "$BIN_DIR/nextdesk-core-amd64.exe" "$BIN_DIR/nextdesk-core.exe"
     ;;
   *)
     echo "ERROR: Unsupported target: $TARGET" >&2
