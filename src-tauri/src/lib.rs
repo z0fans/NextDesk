@@ -623,12 +623,37 @@ fn real_group_proxies(members: &[String], server_names: &HashSet<String>) -> Vec
         .collect()
 }
 
+fn should_start_engine_for_proxy_api(api_base: &str, api_ready: bool) -> bool {
+    api_base.trim().is_empty() || !api_ready
+}
+
+async fn ensure_proxy_api_ready(app_state: &AppState) -> Result<String, String> {
+    let api = app_state.clash_api_base.lock().unwrap().clone();
+    let api_ready = !api.trim().is_empty() && clash_api_ready(&api).await;
+    if !should_start_engine_for_proxy_api(&api, api_ready) {
+        return Ok(api);
+    }
+
+    log::info!("[proxy-api] Clash API unavailable before node delay test; starting engine");
+    start_engine_inner(app_state).await?;
+
+    let api = app_state.clash_api_base.lock().unwrap().clone();
+    if api.trim().is_empty() {
+        return Err("Internal Clash API is unavailable after engine start".into());
+    }
+    if !clash_api_ready(&api).await {
+        return Err("Internal Clash API is not ready after engine start".into());
+    }
+
+    Ok(api)
+}
+
 #[tauri::command]
 async fn test_group_delays(
     group_name: String,
     app_state: State<'_, AppState>,
 ) -> Result<HashMap<String, i64>, String> {
-    let api = app_state.clash_api_base.lock().unwrap().clone();
+    let api = ensure_proxy_api_ready(app_state.inner()).await?;
     let server_names = selectable_server_names(app_state.inner());
     let state_members = state_group_members(&group_name, app_state.inner());
     let members = clash::get_proxy_group_members(&api, &group_name)
@@ -644,7 +669,7 @@ async fn get_proxy_plane_diagnostics(
     group_name: String,
     app_state: State<'_, AppState>,
 ) -> Result<clash::ProxyPlaneDiagnostics, String> {
-    let api = app_state.clash_api_base.lock().unwrap().clone();
+    let api = ensure_proxy_api_ready(app_state.inner()).await?;
     let server_names = selectable_server_names(app_state.inner());
     let state_members = state_group_members(&group_name, app_state.inner());
     let members = clash::get_proxy_group_members(&api, &group_name)
@@ -1505,7 +1530,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::is_private_or_reserved_host;
+    use super::{is_private_or_reserved_host, should_start_engine_for_proxy_api};
 
     #[test]
     fn rdp_engine_guard_treats_private_targets_as_direct() {
@@ -1518,5 +1543,18 @@ mod tests {
     fn rdp_engine_guard_treats_public_targets_as_proxy_required() {
         assert!(!is_private_or_reserved_host("68.64.138.254"));
         assert!(!is_private_or_reserved_host("example.com"));
+    }
+
+    #[test]
+    fn node_delay_test_starts_engine_when_proxy_api_is_unavailable() {
+        assert!(should_start_engine_for_proxy_api("", false));
+        assert!(should_start_engine_for_proxy_api(
+            "http://127.0.0.1:17891",
+            false
+        ));
+        assert!(!should_start_engine_for_proxy_api(
+            "http://127.0.0.1:17891",
+            true
+        ));
     }
 }
