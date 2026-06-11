@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { 
   LayoutDashboard, 
@@ -83,6 +83,7 @@ function AppContent() {
   const [subMessage, setSubMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [proxyGroups, setProxyGroups] = useState<ProxyGroup[]>([]);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const autoExpandedGroupsRef = useRef(false);
   const [selectedProxies, setSelectedProxies] = useState<Record<string, string>>({});
   const [testingConnectivity, setTestingConnectivity] = useState(false);
   const [nodeDelays, setNodeDelays] = useState<Record<string, number>>({});
@@ -176,6 +177,16 @@ function AppContent() {
         });
         return changed ? next : prev;
       });
+
+      if (!autoExpandedGroupsRef.current) {
+        const selectableGroups = proxyGroups
+          .filter(group => group.type.toLowerCase().includes('select'))
+          .map(group => group.name);
+        if (selectableGroups.length > 0) {
+          autoExpandedGroupsRef.current = true;
+          setExpandedGroups(new Set(selectableGroups));
+        }
+      }
     }
   }, [proxyGroups]);
 
@@ -233,12 +244,19 @@ function AppContent() {
   };
 
   const handleTestConnectivity = async () => {
+    const realProxyNames = new Set(servers.map(server => server.name));
     const expandedGroupNames = Array.from(expandedGroups);
-    if (expandedGroupNames.length === 0) {
+    const targetGroupNames = expandedGroupNames.length > 0
+      ? expandedGroupNames
+      : proxyGroups
+        .filter(group => group.type.toLowerCase().includes('select'))
+        .filter(group => group.proxies.some(proxy => realProxyNames.has(proxy)))
+        .map(group => group.name);
+
+    if (targetGroupNames.length === 0) {
       return;
     }
 
-    const realProxyNames = new Set(servers.map(server => server.name));
     const setGroupDelayState = (groupName: string, value: number) => {
       const group = proxyGroups.find(item => item.name === groupName);
       if (!group) {
@@ -258,7 +276,7 @@ function AppContent() {
     setTestingConnectivity(true);
     try {
       await ensureEngineRunningForDelayTest();
-      for (const groupName of expandedGroupNames) {
+      for (const groupName of targetGroupNames) {
         setGroupDelayState(groupName, 0);
         try {
           const delays = await api.testGroupDelays(groupName);
@@ -624,12 +642,12 @@ function AppContent() {
                 variant="outline" 
                 size="icon" 
                 onClick={handleTestConnectivity}
-                disabled={testingConnectivity || expandedGroups.size === 0}
+                disabled={testingConnectivity || proxyGroups.length === 0}
                 className={cn(
                   "rounded-full h-10 w-10 border-input bg-card hover:bg-accent hover:border-accent",
                   testingConnectivity ? "text-yellow-500" : "text-muted-foreground hover:text-yellow-400"
                 )}
-                title={expandedGroups.size === 0 ? t('expandGroupFirst') : t('testNodeDelays')}
+                title={proxyGroups.length === 0 ? t('expandGroupFirst') : t('testNodeDelays')}
               >
                 <Zap className={cn("h-4 w-4", testingConnectivity && "animate-pulse")} />
               </Button>
