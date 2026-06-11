@@ -18,7 +18,7 @@ on:
           - windows
 
 env:
-  MIHOMO_VERSION: v1.19.27
+  MIHOMO_VERSION: v1.19.21
   VITE_NEXTDESK_RDP_ENGINE: official-web
 
 jobs:

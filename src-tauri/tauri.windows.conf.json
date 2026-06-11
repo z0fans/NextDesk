@@ -1,9 +1,7 @@
 {
   "bundle": {
     "resources": {
-      "../.backend/bin/nextdesk-core.exe": "bin/nextdesk-core.exe",
-      "../.backend/bin/nextdesk-core-amd64.exe": "bin/nextdesk-core-amd64.exe",
-      "../.backend/bin/nextdesk-core-arm64.exe": "bin/nextdesk-core-arm64.exe"
+      "../.backend/bin/nextdesk-core.exe": "bin/nextdesk-core.exe"
     },
     "windows": {
       "webviewInstallMode": {

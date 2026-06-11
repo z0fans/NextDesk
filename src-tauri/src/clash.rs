@@ -252,7 +252,11 @@ pub async fn trigger_geodata_update(api_base: &str) {
 pub async fn start_clash_process() -> Result<Child, String> {
     let bin_dir = get_bin_dir();
     eprintln!("[clash] bin_dir: {}", bin_dir.display());
-    let binary_name = engine_binary_name(&bin_dir);
+    let binary_name = if cfg!(target_os = "windows") {
+        "nextdesk-core.exe"
+    } else {
+        "nextdesk-core"
+    };
     let mihomo_path = bin_dir.join(binary_name);
     if !mihomo_path.exists() {
         return Err(format!(
@@ -314,73 +318,6 @@ pub async fn start_clash_process() -> Result<Child, String> {
     let child = cmd.spawn().map_err(|e| format!("Spawn failed: {e}"))?;
 
     Ok(child)
-}
-
-fn engine_binary_name(bin_dir: &Path) -> &'static str {
-    if !cfg!(target_os = "windows") {
-        return "nextdesk-core";
-    }
-
-    let preferred = windows_engine_binary_name();
-    if bin_dir.join(preferred).exists() {
-        return preferred;
-    }
-
-    if bin_dir.join("nextdesk-core-amd64.exe").exists() {
-        return "nextdesk-core-amd64.exe";
-    }
-
-    "nextdesk-core.exe"
-}
-
-#[cfg(target_os = "windows")]
-fn windows_engine_binary_name() -> &'static str {
-    windows_engine_binary_name_for_native_arch(windows_native_arch())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn windows_engine_binary_name() -> &'static str {
-    "nextdesk-core"
-}
-
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn windows_engine_binary_name_for_native_arch(native_arch: Option<&str>) -> &'static str {
-    match native_arch {
-        Some("arm64") => "nextdesk-core-arm64.exe",
-        Some("amd64") => "nextdesk-core-amd64.exe",
-        _ => "nextdesk-core.exe",
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn windows_native_arch() -> Option<&'static str> {
-    use windows::Win32::System::SystemInformation::{
-        GetNativeSystemInfo, PROCESSOR_ARCHITECTURE_AMD64, PROCESSOR_ARCHITECTURE_ARM64,
-        SYSTEM_INFO,
-    };
-
-    let mut info = SYSTEM_INFO::default();
-    unsafe {
-        GetNativeSystemInfo(&mut info);
-        let arch = info.Anonymous.Anonymous.wProcessorArchitecture;
-        if arch == PROCESSOR_ARCHITECTURE_ARM64 {
-            return Some("arm64");
-        }
-        if arch == PROCESSOR_ARCHITECTURE_AMD64 {
-            return Some("amd64");
-        }
-    }
-
-    let arch = std::env::var("PROCESSOR_ARCHITEW6432")
-        .or_else(|_| std::env::var("PROCESSOR_ARCHITECTURE"))
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    match arch.as_str() {
-        "arm64" => Some("arm64"),
-        "amd64" | "x86_64" => Some("amd64"),
-        _ => None,
-    }
 }
 
 fn prepare_runtime_engine_binary(source: &Path) -> Result<PathBuf, String> {
@@ -630,8 +567,7 @@ mod tests {
 
     use super::{
         get_proxy_group_members, prepare_runtime_engine_binary, test_proxy_delay_detail,
-        windows_engine_binary_name_for_native_arch, ProxyDelayAttempt, ProxyDelayDetail,
-        PROXY_DELAY_TEST_URLS,
+        ProxyDelayAttempt, ProxyDelayDetail, PROXY_DELAY_TEST_URLS,
     };
 
     #[cfg(not(target_os = "windows"))]
@@ -657,26 +593,6 @@ mod tests {
         assert_eq!(
             PROXY_DELAY_TEST_URLS[1],
             "http://cp.cloudflare.com/generate_204"
-        );
-    }
-
-    #[test]
-    fn windows_engine_binary_name_tracks_native_arch() {
-        assert_eq!(
-            windows_engine_binary_name_for_native_arch(Some("arm64")),
-            "nextdesk-core-arm64.exe"
-        );
-        assert_eq!(
-            windows_engine_binary_name_for_native_arch(Some("amd64")),
-            "nextdesk-core-amd64.exe"
-        );
-        assert_eq!(
-            windows_engine_binary_name_for_native_arch(Some("unknown")),
-            "nextdesk-core.exe"
-        );
-        assert_eq!(
-            windows_engine_binary_name_for_native_arch(None),
-            "nextdesk-core.exe"
         );
     }
 
