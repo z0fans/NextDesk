@@ -368,15 +368,8 @@ async fn stop_engine(app_state: State<'_, AppState>) -> Result<bool, String> {
 
 #[tauri::command]
 fn get_status(app_state: State<'_, AppState>) -> Result<Value, String> {
-    let clash_running = {
-        let proc = app_state.clash_process.lock().unwrap();
-        if let Some(ref child) = *proc {
-            child.id().is_some()
-        } else {
-            // Check reuse mode
-            *app_state.reuse_mode.lock().unwrap()
-        }
-    };
+    let clash_running =
+        internal_engine_running(app_state.inner()) || *app_state.reuse_mode.lock().unwrap();
     let rdp_port = *app_state.rdp_proxy_port.lock().unwrap();
     let rdp_proxy_error = app_state.rdp_proxy_error.lock().unwrap().clone();
     Ok(serde_json::json!({
@@ -1530,7 +1523,11 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_private_or_reserved_host, should_start_engine_for_proxy_api};
+    use super::{
+        internal_engine_running, is_private_or_reserved_host, should_start_engine_for_proxy_api,
+    };
+    use crate::state::AppState;
+    use std::process::Stdio;
 
     #[test]
     fn rdp_engine_guard_treats_private_targets_as_direct() {
@@ -1556,5 +1553,35 @@ mod tests {
             "http://127.0.0.1:17891",
             true
         ));
+    }
+
+    #[tokio::test]
+    async fn exited_internal_engine_is_not_reported_running() {
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = tokio::process::Command::new("cmd");
+            command.args(["/C", "exit", "0"]);
+            command
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let mut command = {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", "exit 0"]);
+            command
+        };
+
+        let child = command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn short-lived child");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let state = AppState::default();
+        *state.clash_process.lock().unwrap() = Some(child);
+
+        assert!(!internal_engine_running(&state));
+        assert!(state.clash_process.lock().unwrap().is_none());
     }
 }

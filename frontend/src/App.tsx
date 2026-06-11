@@ -611,7 +611,7 @@ function AppContent() {
         </div>
       </aside>
 
-      <main className={cn("flex-1 h-screen bg-background transition-all duration-300 overflow-hidden", sidebarCollapsed ? "md:ml-16" : "md:ml-48")}>
+      <main className="flex-1 min-w-0 h-screen bg-background transition-all duration-300 overflow-hidden">
         <div className={cn(
           activeTab === 'rdp'
             ? "h-full flex flex-col"
@@ -644,7 +644,8 @@ function AppContent() {
                 onClick={handleTestConnectivity}
                 disabled={testingConnectivity || proxyGroups.length === 0}
                 className={cn(
-                  "rounded-full h-10 w-10 border-input bg-card hover:bg-accent hover:border-accent",
+                  "rounded-full h-10 w-10 shrink-0 border-input bg-card hover:bg-accent hover:border-accent",
+                  "fixed top-20 right-4 z-40 sm:top-8 sm:right-8",
                   testingConnectivity ? "text-yellow-500" : "text-muted-foreground hover:text-yellow-400"
                 )}
                 title={proxyGroups.length === 0 ? t('expandGroupFirst') : t('testNodeDelays')}
