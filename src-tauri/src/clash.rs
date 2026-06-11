@@ -252,12 +252,20 @@ pub async fn trigger_geodata_update(api_base: &str) {
 pub async fn start_clash_process() -> Result<Child, String> {
     let bin_dir = get_bin_dir();
     eprintln!("[clash] bin_dir: {}", bin_dir.display());
-    let binary_name = if cfg!(target_os = "windows") {
-        "nextdesk-core.exe"
+    let mihomo_path = if cfg!(target_os = "windows") {
+        let native_arch = detect_windows_native_arch();
+        let binary_name =
+            select_existing_windows_engine(native_arch, |name| bin_dir.join(name).exists())
+                .ok_or_else(|| {
+                    format!(
+                        "Engine binary not found for Windows {native_arch:?}: {}",
+                        windows_engine_candidates(native_arch).join(", ")
+                    )
+                })?;
+        bin_dir.join(binary_name)
     } else {
-        "nextdesk-core"
+        bin_dir.join("nextdesk-core")
     };
-    let mihomo_path = bin_dir.join(binary_name);
     if !mihomo_path.exists() {
         return Err(format!(
             "Engine binary not found: {}",
@@ -318,6 +326,59 @@ pub async fn start_clash_process() -> Result<Child, String> {
     let child = cmd.spawn().map_err(|e| format!("Spawn failed: {e}"))?;
 
     Ok(child)
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WindowsNativeArch {
+    Amd64,
+    Arm64,
+    Other,
+}
+
+pub(crate) fn windows_engine_candidates(native_arch: WindowsNativeArch) -> Vec<&'static str> {
+    match native_arch {
+        WindowsNativeArch::Arm64 => vec!["nextdesk-core-arm64.exe", "nextdesk-core.exe"],
+        WindowsNativeArch::Amd64 => vec!["nextdesk-core-amd64.exe", "nextdesk-core.exe"],
+        WindowsNativeArch::Other => vec!["nextdesk-core.exe"],
+    }
+}
+
+pub(crate) fn select_existing_windows_engine<F>(
+    native_arch: WindowsNativeArch,
+    mut exists: F,
+) -> Option<&'static str>
+where
+    F: FnMut(&str) -> bool,
+{
+    windows_engine_candidates(native_arch)
+        .into_iter()
+        .find(|name| exists(name))
+}
+
+#[cfg(target_os = "windows")]
+fn detect_windows_native_arch() -> WindowsNativeArch {
+    use windows::Win32::System::SystemInformation::{
+        GetNativeSystemInfo, PROCESSOR_ARCHITECTURE_AMD64, PROCESSOR_ARCHITECTURE_ARM64,
+        SYSTEM_INFO,
+    };
+
+    let mut info = SYSTEM_INFO::default();
+    unsafe { GetNativeSystemInfo(&mut info) };
+    let arch = unsafe { info.Anonymous.Anonymous.wProcessorArchitecture };
+
+    if arch == PROCESSOR_ARCHITECTURE_ARM64 {
+        WindowsNativeArch::Arm64
+    } else if arch == PROCESSOR_ARCHITECTURE_AMD64 {
+        WindowsNativeArch::Amd64
+    } else {
+        WindowsNativeArch::Other
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn detect_windows_native_arch() -> WindowsNativeArch {
+    WindowsNativeArch::Other
 }
 
 fn prepare_runtime_engine_binary(source: &Path) -> Result<PathBuf, String> {
@@ -566,8 +627,9 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        get_proxy_group_members, prepare_runtime_engine_binary, test_proxy_delay_detail,
-        ProxyDelayAttempt, ProxyDelayDetail, PROXY_DELAY_TEST_URLS,
+        get_proxy_group_members, prepare_runtime_engine_binary, select_existing_windows_engine,
+        test_proxy_delay_detail, windows_engine_candidates, ProxyDelayAttempt, ProxyDelayDetail,
+        WindowsNativeArch, PROXY_DELAY_TEST_URLS,
     };
 
     #[cfg(not(target_os = "windows"))]
@@ -594,6 +656,31 @@ mod tests {
             PROXY_DELAY_TEST_URLS[1],
             "http://cp.cloudflare.com/generate_204"
         );
+    }
+
+    #[test]
+    fn windows_arm64_hosts_prefer_arm64_engine() {
+        assert_eq!(
+            windows_engine_candidates(WindowsNativeArch::Arm64),
+            vec!["nextdesk-core-arm64.exe", "nextdesk-core.exe"]
+        );
+    }
+
+    #[test]
+    fn windows_amd64_hosts_prefer_amd64_engine() {
+        assert_eq!(
+            windows_engine_candidates(WindowsNativeArch::Amd64),
+            vec!["nextdesk-core-amd64.exe", "nextdesk-core.exe"]
+        );
+    }
+
+    #[test]
+    fn windows_engine_selection_falls_back_to_legacy_name() {
+        let selected = select_existing_windows_engine(WindowsNativeArch::Arm64, |name| {
+            name == "nextdesk-core.exe"
+        });
+
+        assert_eq!(selected, Some("nextdesk-core.exe"));
     }
 
     #[test]

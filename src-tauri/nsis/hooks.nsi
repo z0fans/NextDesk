@@ -4,6 +4,8 @@
   ; match that wildcard reliably. PowerShell Get-Process does.
   nsExec::ExecToLog 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-Process -Name nextdesk-core-* -ErrorAction SilentlyContinue | Stop-Process -Force"'
   nsExec::ExecToLog 'taskkill /F /T /IM nextdesk-core.exe'
+  nsExec::ExecToLog 'taskkill /F /T /IM nextdesk-core-amd64.exe'
+  nsExec::ExecToLog 'taskkill /F /T /IM nextdesk-core-arm64.exe'
   nsExec::ExecToLog 'taskkill /F /T /IM nextdesk.exe'
 !macroend
 
@@ -11,6 +13,8 @@
   ; Add Windows Firewall rule for NextDesk core engine
   nsExec::ExecToLog 'netsh advfirewall firewall delete rule name="NextDesk Core"'
   nsExec::ExecToLog 'netsh advfirewall firewall add rule name="NextDesk Core" dir=in action=allow program="$INSTDIR\bin\nextdesk-core.exe" enable=yes profile=any'
+  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="NextDesk Core" dir=in action=allow program="$INSTDIR\bin\nextdesk-core-amd64.exe" enable=yes profile=any'
+  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="NextDesk Core" dir=in action=allow program="$INSTDIR\bin\nextdesk-core-arm64.exe" enable=yes profile=any'
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
@@ -18,6 +22,8 @@
   ; are named nextdesk-core-<parent-pid>-<timestamp>.exe.
   nsExec::ExecToLog 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Get-Process -Name nextdesk-core-* -ErrorAction SilentlyContinue | Stop-Process -Force"'
   nsExec::ExecToLog 'taskkill /F /T /IM nextdesk-core.exe'
+  nsExec::ExecToLog 'taskkill /F /T /IM nextdesk-core-amd64.exe'
+  nsExec::ExecToLog 'taskkill /F /T /IM nextdesk-core-arm64.exe'
   nsExec::ExecToLog 'taskkill /F /T /IM nextdesk.exe'
 !macroend
 
