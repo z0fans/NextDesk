@@ -55,9 +55,12 @@ function createLogger() {
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
   let initialized = false;
 
-  // Default minimum log level — hides debug spam
+  // Default minimum log level.
+  // Dev keeps rich diagnostics. Production keeps only warnings/errors by default
+  // so RDP rendering hot paths do not spend time formatting or persisting logs.
   // Override at runtime: window.__RDP_LOG_LEVEL = 'debug'
-  const DEFAULT_MIN_LEVEL: RdpLogLevel = 'info';
+  const DEFAULT_MIN_LEVEL: RdpLogLevel = import.meta.env.DEV ? 'info' : 'warn';
+  const DEFAULT_FILE_MIN_LEVEL: RdpLogLevel = import.meta.env.DEV ? 'debug' : 'warn';
 
   // Module → console color mapping
   const MODULE_COLORS: Record<RdpLogModule, string> = {
@@ -109,6 +112,14 @@ function createLogger() {
     return LEVEL_PRIORITY[level] >= LEVEL_PRIORITY[minLevel];
   }
 
+  /** Check if a log should be persisted to disk. */
+  function shouldPersist(level: RdpLogLevel): boolean {
+    const minLevel = (
+      (window as any).__RDP_LOG_FILE_LEVEL || DEFAULT_FILE_MIN_LEVEL
+    ) as RdpLogLevel;
+    return LEVEL_PRIORITY[level] >= LEVEL_PRIORITY[minLevel];
+  }
+
   /** Check if module is in the filter (if set) */
   function moduleAllowed(module: RdpLogModule): boolean {
     const filter = (window as any).__RDP_LOG_MODULES as string | undefined;
@@ -146,6 +157,11 @@ function createLogger() {
     msg: string,
     data?: any,
   ) {
+    const print = shouldPrint(level) && moduleAllowed(module);
+    const persist = shouldPersist(level);
+    const keepRing = import.meta.env.DEV || print || persist;
+    if (!keepRing) return;
+
     init();
 
     const ts = new Date().toISOString();
@@ -159,7 +175,7 @@ function createLogger() {
     ring.push(entry);
 
     // Console output — respect level + module filter
-    if (shouldPrint(level) && moduleAllowed(module)) {
+    if (print) {
       const color = MODULE_COLORS[module];
       const tag = `%c[${module}]`;
       const method = LEVEL_METHODS[level];
@@ -174,12 +190,13 @@ function createLogger() {
       }
     }
 
-    // Always batch for file write (file gets everything)
-    batch.push(entry);
-    if (batch.length >= BATCH_SIZE) {
-      doFlush();
-    } else {
-      scheduleFlush();
+    if (persist) {
+      batch.push(entry);
+      if (batch.length >= BATCH_SIZE) {
+        doFlush();
+      } else {
+        scheduleFlush();
+      }
     }
   }
 

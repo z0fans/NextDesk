@@ -32,6 +32,7 @@ import {
 import {
   isNativeRdpMode,
   isOfficialIronRdpWebMode,
+  parseRdpBooleanFlag,
   resolveOfficialWebFeatureFlags,
   resolveRdpEngineMode,
 } from '@/rdp/engine-flags';
@@ -67,6 +68,11 @@ const NATIVE_CONNECT_RESIZE_COOLDOWN_MS = 2500;
 const CANVAS_SIZE_DEBUG_LOG_MS = 5000;
 const PUBLIC_NATIVE_MAX_DESKTOP_WIDTH = 1920;
 const PUBLIC_NATIVE_MAX_DESKTOP_HEIGHT = 1080;
+const ENABLE_RDP_FRAME_DIAGNOSTICS = import.meta.env.DEV || parseRdpBooleanFlag(
+  readRdpRuntimeStorageFlag('nextdesk_rdp_frame_diagnostics') ??
+  readRdpRuntimeEnvFlag('VITE_NEXTDESK_RDP_FRAME_DIAGNOSTICS'),
+  false,
+);
 
 type NativeResizeSize = { w: number; h: number };
 type NativeResizePending = NativeResizeSize & { sentAt: number };
@@ -575,6 +581,7 @@ export function RdpManager({
   }, []);
 
   const startNativeFpsCounter = useCallback((tabId: string) => {
+    if (!ENABLE_RDP_FRAME_DIAGNOSTICS) return;
     stopFpsCounter();
     fpsTabIdRef.current = tabId;
     fpsCountRef.current = 0;
@@ -587,6 +594,30 @@ export function RdpManager({
       setRdpStats(prev => (prev.fps === fps ? prev : { ...prev, fps }));
     }, 1000);
   }, [isNativeTabRenderable, stopFpsCounter]);
+
+  const startOfficialWebFpsCounter = useCallback((tabId: string, canvas: HTMLCanvasElement) => {
+    if (!ENABLE_RDP_FRAME_DIAGNOSTICS) return;
+
+    stopFpsCounter();
+    const gl = canvas.getContext('webgl2');
+    if (gl && !(gl as any).__nextdesk_patched) {
+      const origTexSubImage2D = gl.texSubImage2D.bind(gl);
+      gl.texSubImage2D = function (...args: any[]) {
+        (globalThis as any).__nextdesk_fps_count = ((globalThis as any).__nextdesk_fps_count || 0) + 1;
+        return (origTexSubImage2D as any)(...args);
+      } as any;
+      (gl as any).__nextdesk_patched = true;
+    }
+
+    (globalThis as any).__nextdesk_fps_count = 0;
+    fpsTabIdRef.current = tabId;
+    fpsIntervalRef.current = setInterval(() => {
+      const fps = (globalThis as any).__nextdesk_fps_count || 0;
+      (globalThis as any).__nextdesk_fps_count = 0;
+      if (fpsTabIdRef.current !== tabId) return;
+      setRdpStats(prev => (prev.fps === fps ? prev : { ...prev, fps }));
+    }, 1000);
+  }, [stopFpsCounter]);
 
   const forgetNativeResizeState = useCallback((tabId: string) => {
     nativeResolutionByTabRef.current.delete(tabId);
@@ -1497,8 +1528,6 @@ export function RdpManager({
         },
       });
 
-      // FPS counter: init counter (monkey-patch applied after connect when WebGL2 ctx exists)
-      (globalThis as any).__nextdesk_fps_count = 0;
       stopFpsCounter();
 
       if (server.domain) builder.serverDomain(server.domain);
@@ -2054,27 +2083,7 @@ export function RdpManager({
       rdpLog.info('connection', `negotiated resolution: ${negotiated.width} x ${negotiated.height} (requested ${w} x ${h})`);
       setRdpStats(prev => ({ ...prev, resolution: `${negotiated.width}×${negotiated.height}`, status: 'connected' }));
 
-      // FPS counter: monkey-patch WebGL2 texSubImage2D to count frame uploads.
-      // Must happen AFTER connect() since WASM creates the WebGL2 context during connect.
-      const fpsCanvas2 = canvasRefs.current.get(tabId);
-      if (fpsCanvas2) {
-        const gl = fpsCanvas2.getContext('webgl2');
-        if (gl && !(gl as any).__nextdesk_patched) {
-          const origTexSubImage2D = gl.texSubImage2D.bind(gl);
-          gl.texSubImage2D = function (...args: any[]) {
-            (globalThis as any).__nextdesk_fps_count = ((globalThis as any).__nextdesk_fps_count || 0) + 1;
-            return (origTexSubImage2D as any)(...args);
-          } as any;
-          (gl as any).__nextdesk_patched = true;
-        }
-      }
-
-      fpsIntervalRef.current = setInterval(() => {
-        const fps = (globalThis as any).__nextdesk_fps_count || 0;
-        (globalThis as any).__nextdesk_fps_count = 0;
-        setRdpStats(prev => ({ ...prev, fps }));
-      }, 1000);
-      fpsTabIdRef.current = tabId;
+      startOfficialWebFpsCounter(tabId, canvas);
 
       // Try dynamic resize first (may not work if DVC not ready)
       setTimeout(() => {
@@ -2159,7 +2168,7 @@ export function RdpManager({
         store.updateTabStatus(tabId, 'error', friendlyRdpError(raw, t));
       }
     }
-  }, [store, proxyPort, getCanvasSize, ensureH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, startNativeFpsCounter, stopFpsCounter, updateNativeResolution]);
+  }, [store, proxyPort, getCanvasSize, ensureH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, startNativeFpsCounter, startOfficialWebFpsCounter, stopFpsCounter, updateNativeResolution]);
   connectSessionRef.current = connectSession;
 
   // ── Auto-reconnect with exponential backoff ──
