@@ -18,6 +18,8 @@ import { api } from '@/api';
 import { useNativeRdp, connectFrameWebSocket, type NativeBitmapFrameInfo, type NativeGfxH264Frame } from '@/hooks/useNativeRdp';
 import { drawDecodedH264FrameToOverlay } from '@/lib/h264-overlay';
 import { friendlyRdpError, isNonRecoverableRdpError } from '@/lib/rdp-errors';
+import { captureConnectedTabThumbnails } from '@/lib/rdp-thumbnails';
+import type { ViewMode } from '@/lib/rdp-types';
 import {
   RDP_FILE_MIME,
   addClipboardFiles,
@@ -30,9 +32,19 @@ import {
 import {
   isNativeRdpMode,
   isOfficialIronRdpWebMode,
-  parseRdpBooleanFlag,
+  resolveOfficialWebFeatureFlags,
   resolveRdpEngineMode,
-} from '@/lib/rdp-engine';
+} from '@/rdp/engine-flags';
+import { GfxSurfaceCompositor } from '@/rdp/gfx-compositor';
+import { describeOfficialWebGfxFallback, type OfficialWebGfxFallbackInput } from '@/rdp/gfx-fallback';
+import {
+  applyIronRdpCliprdrFileCallbacks,
+  applyIronRdpDisplayControlExtension,
+  applyIronRdpGfxH264Callback,
+  applyIronRdpRdpsndAudioCallback,
+  applyIronRdpRdpdrDriveSharingExtensions,
+  applyIronRdpTextClipboardCallbacks,
+} from '@/rdp/ironrdp-web-engine';
 
 /**
  * RDP engine mode.
@@ -40,35 +52,21 @@ import {
  */
 const RDP_ENGINE_MODE = resolveRdpEngineMode();
 const USE_NATIVE_RDP = isNativeRdpMode(RDP_ENGINE_MODE);
+if (USE_NATIVE_RDP) {
+  rdpLog.warn('native', 'Native RDP engine is running in experimental mode');
+}
 const USE_OFFICIAL_IRONRDP_WEB = isOfficialIronRdpWebMode(RDP_ENGINE_MODE);
 const USE_NATIVE_GFX_H264 = USE_NATIVE_RDP;
-const OFFICIAL_WEB_ENABLE_AUDIO = resolveRdpRuntimeBooleanFlag(
-  'nextdesk_official_web_audio',
-  'VITE_NEXTDESK_OFFICIAL_WEB_AUDIO',
-  false,
-);
-const OFFICIAL_WEB_ENABLE_GFX = resolveRdpRuntimeBooleanFlag(
-  'nextdesk_official_web_gfx',
-  'VITE_NEXTDESK_OFFICIAL_WEB_GFX',
-  false,
-);
-const OFFICIAL_WEB_ENABLE_FILE_TRANSFER = resolveRdpRuntimeBooleanFlag(
-  'nextdesk_official_web_file_transfer',
-  'VITE_NEXTDESK_OFFICIAL_WEB_FILE_TRANSFER',
-  false,
-);
-const OFFICIAL_WEB_ENABLE_DISPLAY_CONTROL = resolveRdpRuntimeBooleanFlag(
-  'nextdesk_official_web_display_control',
-  'VITE_NEXTDESK_OFFICIAL_WEB_DISPLAY_CONTROL',
-  true,
-);
+const OFFICIAL_WEB_FEATURES = resolveOfficialWebFeatureFlags((storageKey, envKey) => {
+  if (storageKey) return readRdpRuntimeStorageFlag(storageKey);
+  return readRdpRuntimeEnvFlag(envKey);
+});
 const ADAPTIVE_RESIZE_DEBOUNCE_MS = 800;
 const ADAPTIVE_RESIZE_THRESHOLD_PX = 20;
 const NATIVE_CONNECT_RESIZE_COOLDOWN_MS = 2500;
 const CANVAS_SIZE_DEBUG_LOG_MS = 5000;
 const PUBLIC_NATIVE_MAX_DESKTOP_WIDTH = 1920;
 const PUBLIC_NATIVE_MAX_DESKTOP_HEIGHT = 1080;
-const THUMBNAIL_CAPTURE_INTERVAL_MS = 10000;
 
 type NativeResizeSize = { w: number; h: number };
 type NativeResizePending = NativeResizeSize & { sentAt: number };
@@ -94,19 +92,6 @@ function readRdpRuntimeStorageFlag(storageKey: string): string | null {
   } catch {
     return null;
   }
-}
-
-function resolveRdpRuntimeBooleanFlag(
-  storageKey: string,
-  envKey: string,
-  defaultValue: boolean,
-): boolean {
-  const fromStorage = readRdpRuntimeStorageFlag(storageKey);
-  if (fromStorage !== null) {
-    return parseRdpBooleanFlag(fromStorage, defaultValue);
-  }
-
-  return parseRdpBooleanFlag(readRdpRuntimeEnvFlag(envKey), defaultValue);
 }
 
 function normalizeNativeDesktopSize(w: number, h: number): { w: number; h: number } {
@@ -167,6 +152,13 @@ function normalizeNativeDesktopSizeForHost(
 
 function canUseNativeDynamicResizeForHost(host?: string): boolean {
   return isPrivateOrReservedRdpHost(host);
+}
+
+function resolveOfficialWebVisualQualityForHost(host?: string): 'rich' | 'balanced' {
+  // Users expect the remote desktop to match what Windows shows locally.
+  // `balanced` disables wallpaper/theming and makes the desktop look black.
+  void host;
+  return 'rich';
 }
 
 function isCanvasActuallyVisible(canvas: HTMLCanvasElement | null | undefined): boolean {
@@ -384,6 +376,7 @@ interface WasmSession {
   run(): Promise<any>;
   applyInputs(t: any): void;
   desktopSize(): { width: number; height: number };
+  invokeExtension(ext: any): any;
   resize(w: number, h: number, scale_factor?: number | null, physical_width?: number | null, physical_height?: number | null): void;
   onClipboardPaste(content: WasmClipboardData): Promise<void>;
   shutdown(): void;
@@ -455,6 +448,11 @@ export function RdpManager({
   // to display decoded VideoFrames without context-type conflicts.
   const decodeWorkerRef = useRef<Worker | null>(null);
   const h264OverlayRefs = useRef<Map<string, HTMLCanvasElement>>(new Map());
+  const gfxCompositorRefs = useRef<Map<string, GfxSurfaceCompositor>>(new Map());
+  const officialWebGfxDisabledByFallbackRef = useRef<Set<string>>(new Set());
+  const officialWebGfxFallbackInFlightRef = useRef<Set<string>>(new Set());
+  const officialWebH264FrameCountRef = useRef<Map<string, number>>(new Map());
+  const officialWebClearCodecPatchCountRef = useRef<Map<string, number>>(new Map());
 
   const cleanupH264Worker = useCallback((tabId?: string) => {
     if (decodeWorkerRef.current) {
@@ -465,6 +463,7 @@ export function RdpManager({
     if (tabId) {
       const overlay = h264OverlayRefs.current.get(tabId);
       if (overlay) overlay.style.opacity = '0';
+      gfxCompositorRefs.current.delete(tabId);
     }
   }, []);
 
@@ -484,9 +483,14 @@ export function RdpManager({
         const msg = e.data;
         if (msg.type === 'frame') {
           const frame = msg.frame as VideoFrame;
-          const overlay = h264OverlayRefs.current.get(tabId);
-          if (overlay) {
-            drawDecodedH264FrameToOverlay(overlay, frame, msg.rect);
+          const compositor = gfxCompositorRefs.current.get(tabId);
+          if (compositor && msg.rect) {
+            compositor.drawVideoFrame(Number(msg.surfaceId ?? 0), frame, msg.rect);
+          } else {
+            const overlay = h264OverlayRefs.current.get(tabId);
+            if (overlay) {
+              drawDecodedH264FrameToOverlay(overlay, frame, msg.rect);
+            }
           }
           frame.close();
         } else if (msg.type === 'error') {
@@ -922,6 +926,7 @@ export function RdpManager({
 
       // ── Native RDP mode: connect via Rust backend ──
       if (USE_NATIVE_RDP) {
+        rdpLog.warn('native', 'Using experimental native RDP path instead of IronRDP official-web');
         cleanupNativeFrameStream(tabId);
         rdpLog.info('native', 'native.connect.request', {
           attemptId,
@@ -939,6 +944,7 @@ export function RdpManager({
                   type: 'decode',
                   data: frame.data,
                   timestamp: performance.now() * 1000,
+                  surfaceId: 0,
                   rect: {
                     left: frame.left,
                     top: frame.top,
@@ -1054,6 +1060,9 @@ export function RdpManager({
         throw new Error('RDP local proxy is unavailable: 127.0.0.1:18765 is not bound');
       }
 
+      const officialWebGfxDisabledByFallback = officialWebGfxDisabledByFallbackRef.current.has(tabId);
+      const officialWebGfxEnabled = OFFICIAL_WEB_FEATURES.gfx && !officialWebGfxDisabledByFallback;
+
       rdpLog.info('connection', 'official ironrdp web connect request', {
         attemptId,
         tabId,
@@ -1062,15 +1071,20 @@ export function RdpManager({
         proxyPort: currentProxyPort,
         width: w,
         height: h,
+        visualQuality: resolveOfficialWebVisualQualityForHost(server.host),
         officialWebFeatures: {
-          audio: OFFICIAL_WEB_ENABLE_AUDIO,
-          gfx: OFFICIAL_WEB_ENABLE_GFX,
-          fileTransfer: OFFICIAL_WEB_ENABLE_FILE_TRANSFER,
-          displayControl: OFFICIAL_WEB_ENABLE_DISPLAY_CONTROL,
+          audio: OFFICIAL_WEB_FEATURES.audio,
+          gfx: officialWebGfxEnabled,
+          gfxRequested: OFFICIAL_WEB_FEATURES.gfxRequested,
+          gfxForce: OFFICIAL_WEB_FEATURES.gfxForce,
+          gfxDisabledByFallback: officialWebGfxDisabledByFallback,
+          fileTransfer: OFFICIAL_WEB_FEATURES.fileTransfer,
+          displayControl: OFFICIAL_WEB_FEATURES.displayControl,
         },
       });
 
       const wasm = await loadWasm();
+      const visualQuality = resolveOfficialWebVisualQualityForHost(server.host);
 
       const size = new wasm.DesktopSize(w, h);
       const builder = new wasm.SessionBuilder()
@@ -1080,6 +1094,7 @@ export function RdpManager({
         .username(server.username)
         .password(server.password)
         .desktopSize(size)
+        .extension(new wasm.Extension('visual_quality', visualQuality))
         .renderCanvas(canvas)
         .setCursorStyleCallback(
           (kind: string, data?: string, hx?: number, hy?: number) => {
@@ -1104,8 +1119,10 @@ export function RdpManager({
             fpsCountRef.current++;
             setRdpStats(prev => ({ ...prev, resolution: `${cw}×${ch}` }));
           }
-        })
-        .remoteClipboardChangedCallback((data: WasmClipboardData) => {
+        });
+
+      applyIronRdpTextClipboardCallbacks(builder, {
+        remoteClipboardChanged: (data: WasmClipboardData) => {
           cblog('[clipboard] ▶ remoteClipboardChangedCallback FIRED');
           advertisedClipboardRef.current.delete(tabId);
           forceClipboardReadInFlightRef.current.delete(tabId);
@@ -1168,8 +1185,8 @@ export function RdpManager({
               }
             }
           } catch (e) { cblog('[clipboard] Read remote data error:', e); }
-        })
-        .forceClipboardUpdateCallback(() => {
+        },
+        forceClipboardUpdate: () => {
           cblog('[clipboard] ▶ forceClipboardUpdateCallback FIRED (server requests data)');
           const sess = sessionRefs.current.get(tabId);
           if (!sess || !wasm) { cblog('[clipboard] forceUpdate: no session/wasm!'); return; }
@@ -1289,8 +1306,11 @@ export function RdpManager({
             .finally(() => {
               forceClipboardReadInFlightRef.current.delete(tabId);
             });
-        })
-        .fileContentsRequestCallback((request: any) => {
+        },
+      });
+
+      applyIronRdpCliprdrFileCallbacks(builder, {
+        fileContentsRequest: (request: any) => {
           // The Rust clipboard backend responds to the server request itself.
           const normalized = normalizeFileContentsRequest(request);
           if (normalized.flags === 1 || normalized.position === 0) {
@@ -1308,8 +1328,8 @@ export function RdpManager({
             delete g[timerKey];
             cblog('[file-transfer] Local→Remote transfer lock auto-released (no requests for 5s)');
           }, 5000);
-        })
-        .fileContentsResponseCallback((filesData: any) => {
+        },
+        fileContentsResponse: (filesData: any) => {
           try {
             cblog('[file-transfer] ▶ FileContentsResponse raw:', debugPayload(filesData));
             const files = normalizeTransferredFiles(filesData);
@@ -1394,8 +1414,8 @@ export function RdpManager({
               fileTransferInProgressRef.current.delete(tabId);
             }, 500);
           }
-        })
-        .fileChunkCallback((chunkInfo: any) => {
+        },
+        fileChunk: (chunkInfo: any) => {
           try {
             const { file_index, file_name, total_size, offset, data, is_last, is_last_file } = chunkInfo;
             const chunkData = data instanceof Uint8Array ? data : new Uint8Array(data);
@@ -1474,7 +1494,8 @@ export function RdpManager({
             cblog('[file-transfer] ❌ fileChunkCallback crashed:', err);
             fileTransferInProgressRef.current.delete(tabId);
           }
-        });
+        },
+      });
 
       // FPS counter: init counter (monkey-patch applied after connect when WebGL2 ctx exists)
       (globalThis as any).__nextdesk_fps_count = 0;
@@ -1513,16 +1534,6 @@ export function RdpManager({
           cblog('[rdpdr] Scanned entries:', driveEntries.length, 'from', rdpdrSharedFolder);
         } catch (e) {
           cblog('[rdpdr] Folder scan failed:', e);
-        }
-
-        builder.extension(new wasm.Extension('drive_share_name', 'NextDesk'));
-        cblog('[rdpdr] drive_share_name extension configured:', 'NextDesk');
-
-        if (driveEntries.length > 0) {
-          builder.extension(new wasm.Extension('drive_entries', JSON.stringify(driveEntries)));
-          cblog('[rdpdr] drive_entries extension configured:', driveEntries.length);
-        } else {
-          cblog('[rdpdr] Shared folder is empty or metadata scan returned no entries');
         }
 
         const capturedFolder = rdpdrSharedFolder;
@@ -1567,14 +1578,24 @@ export function RdpManager({
           rdpdrInFlightReads.set(windowKey, readPromise);
           return readPromise.then(windowData => sliceWindow(windowData));
         };
-        builder.extension(new wasm.Extension('rdpdr_read_callback', rdpdrReadCallback));
+        applyIronRdpRdpdrDriveSharingExtensions(wasm, builder, {
+          shareName: 'NextDesk',
+          driveEntries,
+          readCallback: rdpdrReadCallback,
+        });
+        cblog('[rdpdr] drive_share_name extension configured:', 'NextDesk');
+        if (driveEntries.length > 0) {
+          cblog('[rdpdr] drive_entries extension configured:', driveEntries.length);
+        } else {
+          cblog('[rdpdr] Shared folder is empty or metadata scan returned no entries');
+        }
         rdpdrEnabledRef.current.add(tabId);
         cblog('[rdpdr] RDPDR drive sharing enabled:', `NextDesk -> ${rdpdrSharedFolder}`);
       } catch (rdpdrError) {
         rdpdrEnabledRef.current.delete(tabId);
         cblog('[rdpdr] RDPDR initialization failed:', rdpdrError);
         try {
-          builder.extension(new wasm.Extension('drive_share_name', 'NextDesk'));
+          applyIronRdpRdpdrDriveSharingExtensions(wasm, builder, { shareName: 'NextDesk' });
           cblog('[rdpdr] drive_share_name fallback configured:', 'NextDesk');
         } catch {}
       }
@@ -1638,7 +1659,7 @@ export function RdpManager({
       };
       builder.extension(new wasm.Extension('cliprdr_read_callback', cliprdrReadCallback));
 
-      if (OFFICIAL_WEB_ENABLE_AUDIO) {
+      if (OFFICIAL_WEB_FEATURES.audio) {
         // Enable audio redirection via RDPSND → native cpal backend
         const audioCallback = (type: string, data: any) => {
           switch (type) {
@@ -1666,13 +1687,62 @@ export function RdpManager({
               break;
           }
         };
-        builder.extension(new wasm.Extension('audio_callback', audioCallback));
+        applyIronRdpRdpsndAudioCallback(wasm, builder, { audio: audioCallback });
         rdpLog.info('audio', 'RDPSND audio redirection enabled (native cpal backend)');
       } else {
         rdpLog.info('audio', 'official-web audio extensions disabled');
       }
 
-      if (OFFICIAL_WEB_ENABLE_GFX && typeof VideoDecoder !== 'undefined') {
+      const triggerOfficialWebGfxFallback = (input: OfficialWebGfxFallbackInput) => {
+        const decision = describeOfficialWebGfxFallback(input);
+        if (!decision.shouldFallback) return;
+        if (
+          officialWebGfxDisabledByFallbackRef.current.has(tabId) ||
+          officialWebGfxFallbackInFlightRef.current.has(tabId)
+        ) {
+          rdpLog.warn('render', 'official-web GFX fallback already active', {
+            tabId,
+            reason: decision.reason,
+            bitmapHexPrefix: input.bitmapHexPrefix,
+            payloadHexPrefix: input.payloadHexPrefix,
+          });
+          return;
+        }
+
+        officialWebGfxDisabledByFallbackRef.current.add(tabId);
+        officialWebGfxFallbackInFlightRef.current.add(tabId);
+        rdpLog.warn('render', 'official-web GFX fallback: reconnecting without GFX', {
+          tabId,
+          reason: decision.reason,
+          codec: input.codec,
+          detail: input.detail,
+          bitmapHexPrefix: input.bitmapHexPrefix,
+          payloadHexPrefix: input.payloadHexPrefix,
+        });
+
+        userDisconnectedRef.current.add(tabId);
+        cleanupH264Worker(tabId);
+        const session = sessionRefs.current.get(tabId);
+        if (session) {
+          try { session.shutdown(); } catch { /* ignore fallback shutdown errors */ }
+        }
+        connectingTabsRef.current.delete(tabId);
+        sessionRefs.current.delete(tabId);
+        store.updateTabStatus(tabId, 'connecting');
+
+        setTimeout(() => {
+          officialWebGfxFallbackInFlightRef.current.delete(tabId);
+          userDisconnectedRef.current.delete(tabId);
+          connectSessionRef.current?.(tabId);
+        }, 500);
+      };
+
+      if (officialWebGfxEnabled && typeof VideoDecoder !== 'undefined') {
+        const existingOverlay = h264OverlayRefs.current.get(tabId);
+        if (existingOverlay) {
+          gfxCompositorRefs.current.set(tabId, new GfxSurfaceCompositor(existingOverlay));
+        }
+
         try {
           const worker = new Worker(DecodeWorkerUrl, { type: 'module' });
           decodeWorkerRef.current = worker;
@@ -1682,27 +1752,235 @@ export function RdpManager({
             const msg = e.data;
             if (msg.type === 'frame') {
               const frame = msg.frame as VideoFrame;
-              const overlay = h264OverlayRefs.current.get(tabId);
-              if (overlay) {
-                drawDecodedH264FrameToOverlay(overlay, frame, msg.rect);
+              const compositor = gfxCompositorRefs.current.get(tabId);
+              if (compositor && msg.rect) {
+                compositor.drawVideoFrame(Number(msg.surfaceId ?? 0), frame, msg.rect);
+              } else {
+                const overlay = h264OverlayRefs.current.get(tabId);
+                if (overlay) {
+                  drawDecodedH264FrameToOverlay(overlay, frame, msg.rect);
+                }
               }
               frame.close();
             } else if (msg.type === 'error') {
-              rdpLog.warn('render', 'h264 worker error', { message: msg.message });
+              const detail = msg.message || 'unknown';
+              rdpLog.warn('render', 'h264 worker error', { message: detail });
+              triggerOfficialWebGfxFallback({ type: 'decode_error', detail });
             }
           };
         } catch (e) {
-          rdpLog.warn('render', 'Worker creation failed, using main-thread fallback');
+          rdpLog.warn('render', 'Worker creation failed, official-web GFX disabled for this attempt', {
+            error: String(e),
+          });
+          decodeWorkerRef.current = null;
         }
 
         const gfxCallback = (type: string, data: any) => {
+          const codec = typeof data?.codec === 'string' ? data.codec : undefined;
+          const getCompositor = () => {
+            const existing = gfxCompositorRefs.current.get(tabId);
+            if (existing) return existing;
+            const overlay = h264OverlayRefs.current.get(tabId);
+            if (!overlay) return null;
+            const compositor = new GfxSurfaceCompositor(overlay);
+            gfxCompositorRefs.current.set(tabId, compositor);
+            return compositor;
+          };
+          const compositor = getCompositor();
+
+          if (type === 'reset_graphics' && compositor) {
+            compositor.resetGraphics(Number(data?.width || 1), Number(data?.height || 1));
+            return;
+          }
+
+          if (type === 'create_surface' && compositor) {
+            compositor.createSurface(Number(data?.surfaceId), Number(data?.width || 1), Number(data?.height || 1));
+            return;
+          }
+
+          if (type === 'delete_surface' && compositor) {
+            const surfaceId = typeof data === 'number' ? data : data?.surfaceId;
+            compositor.deleteSurface(Number(surfaceId));
+            return;
+          }
+
+          if (type === 'map_surface' && compositor) {
+            compositor.mapSurface(Number(data?.surfaceId), Number(data?.x || 0), Number(data?.y || 0));
+            return;
+          }
+
+          if (type === 'end_frame' && compositor) {
+            compositor.endFrame(Number(typeof data === 'number' ? data : data?.frameId || 0));
+            return;
+          }
+
+          if (type === 'solid_fill' && compositor) {
+            compositor.solidFill(Number(data.surfaceId), {
+              left: Number(data.left ?? 0),
+              top: Number(data.top ?? 0),
+              right: Number(data.right ?? 0),
+              bottom: Number(data.bottom ?? 0),
+            }, Number(data.color ?? 0xffffffff));
+            return;
+          }
+
+          if (type === 'surface_to_surface' && compositor) {
+            compositor.surfaceToSurface(
+              Number(data.srcSurfaceId),
+              Number(data.dstSurfaceId),
+              {
+                left: Number(data.srcLeft ?? 0),
+                top: Number(data.srcTop ?? 0),
+                right: Number(data.srcRight ?? 0),
+                bottom: Number(data.srcBottom ?? 0),
+              },
+              { x: Number(data.dstX ?? 0), y: Number(data.dstY ?? 0) },
+            );
+            return;
+          }
+
+          if (type === 'surface_to_cache' && compositor) {
+            compositor.surfaceToCache(Number(data.surfaceId), Number(data.cacheSlot), {
+              left: Number(data.left ?? 0),
+              top: Number(data.top ?? 0),
+              right: Number(data.right ?? 0),
+              bottom: Number(data.bottom ?? 0),
+            });
+            return;
+          }
+
+          if (type === 'cache_to_surface' && compositor) {
+            compositor.cacheToSurface(Number(data.surfaceId), Number(data.cacheSlot), {
+              x: Number(data.dstX ?? 0),
+              y: Number(data.dstY ?? 0),
+            });
+            return;
+          }
+
+          if (type === 'evict_cache' && compositor) {
+            compositor.evictCache(Number(data.cacheSlot));
+            return;
+          }
+
+          if (type === 'gfx_codec') {
+            rdpLog.info('render', 'official-web GFX codec', {
+              codec,
+              h264: Boolean(data?.h264),
+              surfaceId: data?.surfaceId,
+              dataLen: data?.dataLen,
+              rect: {
+                left: data?.left,
+                top: data?.top,
+                right: data?.right,
+                bottom: data?.bottom,
+              },
+            });
+            return;
+          }
+
+          if (type === 'clearcodec_frame') {
+            rdpLog.info('render', 'official-web ClearCodec frame', {
+              codec,
+              surfaceId: data?.surfaceId,
+              width: data?.width,
+              height: data?.height,
+              flags: data?.flags,
+              residual: Boolean(data?.residual),
+              banding: Boolean(data?.banding),
+              subcodec: Boolean(data?.subcodec),
+              sequenceNumber: data?.sequenceNumber,
+              payloadLen: data?.payloadLen,
+              residualByteCount: data?.residualByteCount,
+              bandsByteCount: data?.bandsByteCount,
+              subcodecByteCount: data?.subcodecByteCount,
+              patchCount: data?.patchCount,
+              bitmapHexPrefix: data?.bitmapHexPrefix || data?.hexPrefix,
+              payloadHexPrefix: data?.payloadHexPrefix,
+              rect: {
+                left: data?.left,
+                top: data?.top,
+                right: data?.right,
+                bottom: data?.bottom,
+              },
+            });
+            return;
+          }
+
+          if (type === 'clearcodec_rgba_patch') {
+            if (compositor && data?.data && data?.width > 0 && data?.height > 0) {
+              compositor.drawRgbaPatch({
+                surfaceId: Number(data.surfaceId),
+                rect: {
+                  left: Number(data.left ?? 0),
+                  top: Number(data.top ?? 0),
+                  right: Number(data.right ?? data.width ?? 0),
+                  bottom: Number(data.bottom ?? data.height ?? 0),
+                },
+                width: Number(data.width),
+                height: Number(data.height),
+                data: data.data,
+              });
+            }
+
+            const patchCount = (officialWebClearCodecPatchCountRef.current.get(tabId) ?? 0) + 1;
+            officialWebClearCodecPatchCountRef.current.set(tabId, patchCount);
+            if (patchCount <= 3 || patchCount % 60 === 0) {
+              rdpLog.info('render', 'official-web ClearCodec RGBA patch', {
+                tabId,
+                patchCount,
+                codec,
+                surfaceId: data?.surfaceId,
+                width: data?.width,
+                height: data?.height,
+                bytes: data?.data?.byteLength,
+                rect: {
+                  left: data?.left,
+                  top: data?.top,
+                  right: data?.right,
+                  bottom: data?.bottom,
+                },
+              });
+            }
+            return;
+          }
+
+          const fallbackDecision = describeOfficialWebGfxFallback({
+            type,
+            codec,
+            detail: data?.message || data?.detail || codec,
+            bitmapHexPrefix: data?.bitmapHexPrefix || data?.hexPrefix,
+            payloadHexPrefix: data?.payloadHexPrefix,
+          });
+          if (fallbackDecision.shouldFallback) {
+            triggerOfficialWebGfxFallback({
+              type,
+              codec,
+              detail: data?.message || data?.detail || codec,
+              bitmapHexPrefix: data?.bitmapHexPrefix || data?.hexPrefix,
+              payloadHexPrefix: data?.payloadHexPrefix,
+            });
+            return;
+          }
+
           if (type === 'h264_frame' && decodeWorkerRef.current) {
+            const frameCount = (officialWebH264FrameCountRef.current.get(tabId) ?? 0) + 1;
+            officialWebH264FrameCountRef.current.set(tabId, frameCount);
+            if (frameCount <= 3 || frameCount % 60 === 0) {
+              rdpLog.info('render', 'official-web H.264 frame', {
+                tabId,
+                frameCount,
+                codec,
+                surfaceId: data?.surfaceId,
+                bytes: data?.data?.byteLength,
+              });
+            }
             const buf = data.data.buffer.slice(0);
             decodeWorkerRef.current.postMessage(
               {
                 type: 'decode',
                 data: buf,
                 timestamp: performance.now() * 1000,
+                surfaceId: Number(data.surfaceId ?? 0),
                 rect: {
                   left: data.left ?? 0,
                   top: data.top ?? 0,
@@ -1712,25 +1990,35 @@ export function RdpManager({
               },
               [buf],
             );
+          } else if (type === 'h264_frame') {
+            triggerOfficialWebGfxFallback({
+              type: 'decode_error',
+              codec,
+              detail: 'worker-unavailable',
+            });
           }
         };
-        builder.extension(new wasm.Extension('gfx_callback', gfxCallback));
+        applyIronRdpGfxH264Callback(wasm, builder, { gfx: gfxCallback });
         rdpLog.info('render', 'GFX H.264 pipeline enabled (WebCodecs Worker)');
       } else {
-        rdpLog.info('render', OFFICIAL_WEB_ENABLE_GFX
+        rdpLog.info('render', officialWebGfxEnabled
           ? 'WebCodecs not available, official-web GFX disabled'
+          : officialWebGfxDisabledByFallback
+            ? 'official-web GFX disabled by fallback for this tab'
+          : OFFICIAL_WEB_FEATURES.gfxRequested
+            ? 'official-web GFX requested but disabled'
           : 'official-web GFX extension disabled');
       }
 
       // Enable DisplayControl DVC for dynamic resolution updates (no reconnect needed)
-      if (OFFICIAL_WEB_ENABLE_DISPLAY_CONTROL) {
-        builder.extension(new wasm.Extension('display_control', true));
+      if (OFFICIAL_WEB_FEATURES.displayControl) {
+        applyIronRdpDisplayControlExtension(wasm, builder, true);
         rdpLog.info('render', 'DisplayControl DVC enabled for dynamic resolution');
       } else {
         rdpLog.info('render', 'DisplayControl DVC disabled');
       }
 
-      if (OFFICIAL_WEB_ENABLE_FILE_TRANSFER) {
+      if (OFFICIAL_WEB_FEATURES.fileTransfer) {
         // Enable file transfer WS bypass for large CLIPRDR files (≥2MB)
         const ftPort = await invoke<number>('get_file_transfer_ws_port').catch(() => 0);
         if (ftPort > 0) {
@@ -1821,6 +2109,8 @@ export function RdpManager({
       // Hide H.264 overlay for this tab
       const overlay = h264OverlayRefs.current.get(tabId);
       if (overlay) overlay.style.opacity = '0';
+      officialWebH264FrameCountRef.current.delete(tabId);
+      officialWebClearCodecPatchCountRef.current.delete(tabId);
       delete (globalThis as any).__nextdesk_fps_count;
       setRdpStats({ resolution: '', fps: 0, status: 'disconnected' });
 
@@ -1947,6 +2237,10 @@ export function RdpManager({
     forgetNativeResizeState(tabId);
     stopFpsCounter(tabId);
     cleanupH264Worker(tabId);
+    officialWebGfxDisabledByFallbackRef.current.delete(tabId);
+    officialWebGfxFallbackInFlightRef.current.delete(tabId);
+    officialWebH264FrameCountRef.current.delete(tabId);
+    officialWebClearCodecPatchCountRef.current.delete(tabId);
     attemptIdsRef.current.delete(tabId);
     // Shutdown WASM session if any
     const session = sessionRefs.current.get(tabId);
@@ -1992,6 +2286,8 @@ export function RdpManager({
     forgetNativeResizeState(tabId);
     stopFpsCounter(tabId);
     cleanupH264Worker(tabId);
+    officialWebH264FrameCountRef.current.delete(tabId);
+    officialWebClearCodecPatchCountRef.current.delete(tabId);
     attemptIdsRef.current.delete(tabId);
     const session = sessionRefs.current.get(tabId);
     if (session) {
@@ -2260,6 +2556,13 @@ export function RdpManager({
       }
       const session = sessionRefs.current.get(tabId);
       if (session) {
+        const canvas = canvasRefs.current.get(tabId);
+        if (canvas?.width === ws && canvas.height === hs) {
+          desiredSizeRef.current = { w: ws, h: hs };
+          lastSizeRef.current = { w: ws, h: hs };
+          rdpLog.info('render', 'official-web resize skipped (fixed already current)', { width: ws, height: hs });
+          return;
+        }
         try {
           session.resize(ws, hs);
           desiredSizeRef.current = { w: ws, h: hs };
@@ -2628,8 +2931,10 @@ export function RdpManager({
         };
       };
 
-      const onMouseMove = (e: MouseEvent) => {
-        const { x: mx, y: my } = canvasPointToRemote(e);
+      let pendingMouseMove: { x: number; y: number } | null = null;
+      let mouseMoveAnimationFrame: number | null = null;
+
+      const sendMouseMoveNow = (mx: number, my: number) => {
         if (isNative) {
           api.rdpNativeMouse(tabId, mx, my, -1, false).catch(() => {});
         } else {
@@ -2637,11 +2942,43 @@ export function RdpManager({
           sendInput(wasmModule.DeviceEvent.mouseMove(mx, my));
         }
       };
+
+      const flushPendingMouseMove = () => {
+        if (mouseMoveAnimationFrame !== null) {
+          cancelAnimationFrame(mouseMoveAnimationFrame);
+          mouseMoveAnimationFrame = null;
+        }
+        const move = pendingMouseMove;
+        pendingMouseMove = null;
+        if (move) sendMouseMoveNow(move.x, move.y);
+      };
+
+      const discardPendingMouseMove = () => {
+        if (mouseMoveAnimationFrame !== null) {
+          cancelAnimationFrame(mouseMoveAnimationFrame);
+          mouseMoveAnimationFrame = null;
+        }
+        pendingMouseMove = null;
+      };
+
+      const onMouseMove = (e: MouseEvent) => {
+        const { x: mx, y: my } = canvasPointToRemote(e);
+        pendingMouseMove = { x: mx, y: my };
+        if (mouseMoveAnimationFrame !== null) return;
+        mouseMoveAnimationFrame = requestAnimationFrame(() => {
+          mouseMoveAnimationFrame = null;
+          const move = pendingMouseMove;
+          pendingMouseMove = null;
+          if (move) sendMouseMoveNow(move.x, move.y);
+        });
+      };
       const pressedButtons = new Set<number>();
       const onMouseDown = (e: MouseEvent) => {
         e.preventDefault();
         pressedButtons.add(e.button);
         const { x: mx, y: my } = canvasPointToRemote(e);
+        pendingMouseMove = { x: mx, y: my };
+        flushPendingMouseMove();
         rdpLog.info('input', `mouse DOWN btn=${e.button}`, {
           x: Math.round(mx),
           y: Math.round(my),
@@ -2666,6 +3003,8 @@ export function RdpManager({
         }
         pressedButtons.delete(e.button);
         const { x: mx, y: my } = canvasPointToRemote(e);
+        pendingMouseMove = { x: mx, y: my };
+        flushPendingMouseMove();
         rdpLog.info('input', `mouse UP btn=${e.button} SENT`, {
           x: Math.round(mx),
           y: Math.round(my),
@@ -2911,6 +3250,7 @@ export function RdpManager({
         canvas.removeEventListener('focus', onFocusSync);
         window.removeEventListener('focus', onFocusSync);
         if (clipboardPollTimer) clearInterval(clipboardPollTimer);
+        discardPendingMouseMove();
       };
     };
 
@@ -3012,25 +3352,44 @@ export function RdpManager({
       .catch(e => cblog('[file-transfer] Failed to switch macOS clipboard strategy:', e));
   }, [macClipboardStrategy]);
 
-  // ── Periodic canvas snapshots for sidebar & grid thumbnails ──
-  useEffect(() => {
-    const iv = setInterval(() => {
-      const activeTabId = activeTabIdRef.current;
-      for (const tab of tabsRef.current) {
-        if (tab.id === activeTabId) continue;
-        if (tab.status === 'connected') {
-          const canvas = canvasRefs.current.get(tab.id);
-          if (canvas && canvas.width > 0 && canvas.height > 0) {
-            try {
-              const url = canvas.toDataURL('image/jpeg', 0.5);
-              store.updateTabThumbnail(tab.id, url);
-            } catch { /* ignore */ }
-          }
+  // ── On-demand canvas snapshots for grid thumbnails ──
+  const refreshGridThumbnails = useCallback(() => {
+    const captured = captureConnectedTabThumbnails({
+      tabs: tabsRef.current,
+      canvasRefs: canvasRefs.current,
+      overlayCanvasRefs: h264OverlayRefs.current,
+      updateTabThumbnail: store.updateTabThumbnail,
+      requestSessionThumbnail: (tabId, updateThumbnail) => {
+        const session = sessionRefs.current.get(tabId);
+        const wasm = wasmModule;
+        if (!session || !wasm) return false;
+
+        try {
+          session.invokeExtension(new wasm.Extension('snapshot_thumbnail', (thumbnailUrl: string) => {
+            if (!thumbnailUrl.startsWith('data:image/')) return;
+            updateThumbnail(thumbnailUrl);
+          }));
+          return true;
+        } catch (error) {
+          rdpLog.warn('render', 'session thumbnail snapshot request failed; falling back to canvas capture', {
+            tabId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return false;
         }
-      }
-    }, THUMBNAIL_CAPTURE_INTERVAL_MS);
-    return () => clearInterval(iv);
+      },
+    });
+    if (captured > 0) {
+      rdpLog.debug('render', `captured ${captured} tab thumbnail(s) for grid view`);
+    }
   }, [store.updateTabThumbnail]);
+
+  const handleViewModeChange = useCallback((mode: ViewMode) => {
+    if (mode === 'grid') {
+      refreshGridThumbnails();
+    }
+    store.setViewMode(mode);
+  }, [refreshGridThumbnails, store.setViewMode]);
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -3055,7 +3414,7 @@ export function RdpManager({
             onToggleSidebar={() => store.setSidebarOpen(!store.sidebarOpen)}
             onSelectTab={store.setActiveTabId}
             onCloseTab={handleCloseTab}
-            onViewModeChange={store.setViewMode}
+            onViewModeChange={handleViewModeChange}
             onReorderTabs={store.reorderTabs}
             onReconnectTab={(tabId) => reconnectWithSize(tabId)}
             sessionControls={activeTab?.status === 'connected' ? {

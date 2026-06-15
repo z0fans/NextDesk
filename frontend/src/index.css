@@ -156,6 +156,15 @@ body {
   .animate-shake {
     animation: shake 0.4s ease-in-out;
   }
+
+  .scrollbar-none {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
+  }
 }
 
 @keyframes shake {

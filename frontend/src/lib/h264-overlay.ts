@@ -12,6 +12,16 @@ export interface H264DrawRect {
   height: number;
 }
 
+export interface RgbaPatch {
+  data: Uint8Array | Uint8ClampedArray;
+  left: number;
+  top: number;
+  right?: number;
+  bottom?: number;
+  width: number;
+  height: number;
+}
+
 export function gfxRectToDrawRect(
   rect: GfxRect | undefined,
   fallbackWidth: number,
@@ -62,5 +72,24 @@ export function drawDecodedH264FrameToOverlay(
   if (ctx2d) {
     ctx2d.drawImage(frame, drawRect.x, drawRect.y, drawRect.width, drawRect.height);
   }
+  overlay.style.opacity = '1';
+}
+
+export function drawRgbaPatchToOverlay(
+  overlay: HTMLCanvasElement,
+  patch: RgbaPatch,
+) {
+  const targetWidth = Math.max(1, overlay.clientWidth || patch.right || patch.width);
+  const targetHeight = Math.max(1, overlay.clientHeight || patch.bottom || patch.height);
+  ensureOverlaySize(overlay, targetWidth, targetHeight);
+
+  const ctx2d = overlay.getContext('2d');
+  if (!ctx2d) return;
+
+  const rgba = patch.data instanceof Uint8ClampedArray
+    ? patch.data
+    : new Uint8ClampedArray(patch.data.buffer, patch.data.byteOffset, patch.data.byteLength);
+  const imageData = new ImageData(new Uint8ClampedArray(rgba), patch.width, patch.height);
+  ctx2d.putImageData(imageData, patch.left, patch.top);
   overlay.style.opacity = '1';
 }

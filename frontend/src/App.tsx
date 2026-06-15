@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { 
   LayoutDashboard, 
@@ -12,7 +12,6 @@ import {
   Globe,
   Download,
   X,
-  ChevronDown,
   ChevronRight,
   FileText,
   PanelLeftClose,
@@ -41,9 +40,25 @@ import { getTimeAgo } from './lib/timeAgo';
 import { ThemeToggle } from '@/components/ThemeToggle';
 import { LanguageProvider } from '@/i18n/LanguageProvider';
 import { useTranslation } from '@/i18n/useTranslation';
+import type { TranslationKey } from '@/i18n/translations';
 import { LanguageToggle } from '@/components/LanguageToggle';
 import { RdpManager } from '@/components/RdpManager';
 import { rdpLog, type RdpLogModule } from '@/lib/rdp-logger';
+import { useFolderSharingSetting } from '@/lib/useSessionStore';
+import {
+  delayStatus,
+  delayText,
+  groupRealNodes,
+  markDelayNodesAsTesting,
+  markUnresolvedDelayNodesAsTimeout,
+  resolveActiveServerGroupName,
+  resolveDelayTargetGroups,
+  selectableServerGroups,
+  sortServerNodes,
+  type DelayScope,
+  type ServerNodeSort,
+  uniqueDelayNodesForGroups,
+} from '@/lib/server-list';
 
 const DEV_LOG_MODULES: RdpLogModule[] = [
   'connection',
@@ -68,6 +83,7 @@ const formatBytes = (bytes: number): string => {
 
 function AppContent() {
   const { t } = useTranslation();
+  const { folderSharingEnabled, setFolderSharingEnabled } = useFolderSharingSetting();
   const [activeTab, setActiveTab] = useState<'dashboard' | 'servers' | 'proxy' | 'logs' | 'settings' | 'rdp'>('dashboard');
   const [status, setStatus] = useState<EngineStatus>({ clash: false, rdp_proxy_port: 8765 });
   const [servers, setServers] = useState<Server[]>([]);
@@ -82,10 +98,11 @@ function AppContent() {
   const [, setCurrentVersion] = useState('');
   const [subMessage, setSubMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [proxyGroups, setProxyGroups] = useState<ProxyGroup[]>([]);
-  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
-  const autoExpandedGroupsRef = useRef(false);
+  const [activeServerGroupName, setActiveServerGroupName] = useState<string | null>(null);
+  const [serverNodeSort, setServerNodeSort] = useState<ServerNodeSort>('default');
   const [selectedProxies, setSelectedProxies] = useState<Record<string, string>>({});
   const [testingConnectivity, setTestingConnectivity] = useState(false);
+  const [testingGroups, setTestingGroups] = useState<Set<string>>(new Set());
   const [nodeDelays, setNodeDelays] = useState<Record<string, number>>({});
   const [connections, setConnections] = useState<Connection[]>([]);
   const [runMode, setRunMode] = useState<RunMode>({ reuse_mode: false, clash_api: '', proxy_port: 17897, cloud_mode: false, dashboard_url: '' });
@@ -178,17 +195,14 @@ function AppContent() {
         return changed ? next : prev;
       });
 
-      if (!autoExpandedGroupsRef.current) {
-        const selectableGroups = proxyGroups
-          .filter(group => group.type.toLowerCase().includes('select'))
-          .map(group => group.name);
-        if (selectableGroups.length > 0) {
-          autoExpandedGroupsRef.current = true;
-          setExpandedGroups(new Set(selectableGroups));
-        }
-      }
     }
   }, [proxyGroups]);
+
+  useEffect(() => {
+    setActiveServerGroupName((current) =>
+      resolveActiveServerGroupName(current, proxyGroups, servers)
+    );
+  }, [proxyGroups, servers]);
 
   // Fetch auto-update status on mount + listen for changes
   useEffect(() => {
@@ -200,18 +214,6 @@ function AppContent() {
 
     return () => { unlisten.then(fn => fn()); };
   }, []);
-
-  const toggleGroupExpansion = (groupName: string) => {
-    setExpandedGroups(prev => {
-      const next = new Set(prev);
-      if (next.has(groupName)) {
-        next.delete(groupName);
-      } else {
-        next.add(groupName);
-      }
-      return next;
-    });
-  };
 
   const handleProxySelect = async (groupName: string, proxyName: string) => {
     setSelectedProxies(prev => ({
@@ -243,46 +245,38 @@ function AppContent() {
     setRunMode(newRunMode);
   };
 
-  const handleTestConnectivity = async () => {
-    const realProxyNames = new Set(servers.map(server => server.name));
-    const expandedGroupNames = Array.from(expandedGroups);
-    const targetGroupNames = expandedGroupNames.length > 0
-      ? expandedGroupNames
-      : proxyGroups
-        .filter(group => group.type.toLowerCase().includes('select'))
-        .filter(group => group.proxies.some(proxy => realProxyNames.has(proxy)))
-        .map(group => group.name);
+  const handleTestConnectivity = async (scope: DelayScope = { type: 'all' }) => {
+    const targetGroupNames = resolveDelayTargetGroups(scope, proxyGroups, servers);
 
     if (targetGroupNames.length === 0) {
       return;
     }
 
-    const setGroupDelayState = (groupName: string, value: number) => {
+    const targetNodeNames = uniqueDelayNodesForGroups(targetGroupNames, proxyGroups, servers);
+
+    const setGroupTimeoutState = (groupName: string) => {
       const group = proxyGroups.find(item => item.name === groupName);
       if (!group) {
         return;
       }
-      const entries = group.proxies
-        .filter(proxy => realProxyNames.has(proxy));
+      const entries = groupRealNodes(group, servers);
       if (entries.length === 0) {
         return;
       }
-      setNodeDelays(prev => ({
-        ...prev,
-        ...Object.fromEntries(entries.map(proxy => [proxy, value])),
-      }));
+      setNodeDelays(prev => markUnresolvedDelayNodesAsTimeout(prev, entries));
     };
 
     setTestingConnectivity(true);
+    setTestingGroups(prev => new Set([...prev, ...targetGroupNames]));
+    setNodeDelays(prev => markDelayNodesAsTesting(prev, targetNodeNames));
     try {
       await ensureEngineRunningForDelayTest();
       for (const groupName of targetGroupNames) {
-        setGroupDelayState(groupName, 0);
         try {
           const delays = await api.testGroupDelays(groupName);
           setNodeDelays(prev => ({ ...prev, ...delays }));
         } catch (error) {
-          setGroupDelayState(groupName, -1);
+          setGroupTimeoutState(groupName);
           console.error(`Failed to test connectivity for ${groupName}`, error);
         }
       }
@@ -290,6 +284,11 @@ function AppContent() {
       console.error('Failed to test connectivity', error);
     } finally {
       setTestingConnectivity(false);
+      setTestingGroups(prev => {
+        const next = new Set(prev);
+        targetGroupNames.forEach(groupName => next.delete(groupName));
+        return next;
+      });
     }
   };
 
@@ -427,7 +426,7 @@ function AppContent() {
       } else {
         setSubMessage({ type: 'error', text: result.error || t('failedToLoadSub') });
       }
-    } catch (error) {
+    } catch {
       setSubMessage({ type: 'error', text: t('networkError') });
     } finally {
       setUpdatingSub(false);
@@ -611,11 +610,14 @@ function AppContent() {
         </div>
       </aside>
 
-      <main className="flex-1 min-w-0 h-screen bg-background transition-all duration-300 overflow-hidden">
+      <main className={cn(
+        "flex-1 min-w-0 h-screen bg-background transition-all duration-300 overflow-hidden",
+        sidebarCollapsed ? "md:ml-16" : "md:ml-48"
+      )}>
         <div className={cn(
           activeTab === 'rdp'
             ? "h-full flex flex-col"
-            : "h-full overflow-y-auto max-w-6xl mx-auto px-6 py-8 md:px-10 md:py-10 space-y-8"
+            : "h-full overflow-y-auto scrollbar-none max-w-6xl mx-auto px-6 py-8 md:px-10 md:py-10 space-y-8"
         )}>
           
           {/* Header — hidden for RDP (has its own chrome) */}
@@ -638,20 +640,30 @@ function AppContent() {
               </p>
             </div>
             {activeTab === 'servers' ? (
-              <Button 
-                variant="outline" 
-                size="icon" 
-                onClick={handleTestConnectivity}
-                disabled={testingConnectivity || proxyGroups.length === 0}
-                className={cn(
-                  "rounded-full h-10 w-10 shrink-0 border-input bg-card hover:bg-accent hover:border-accent",
-                  "fixed top-20 right-4 z-40 sm:top-8 sm:right-8",
-                  testingConnectivity ? "text-yellow-500" : "text-muted-foreground hover:text-yellow-400"
-                )}
-                title={proxyGroups.length === 0 ? t('expandGroupFirst') : t('testNodeDelays')}
-              >
-                <Zap className={cn("h-4 w-4", testingConnectivity && "animate-pulse")} />
-              </Button>
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => activeServerGroupName && handleTestConnectivity({ type: 'group', groupName: activeServerGroupName })}
+                  disabled={testingConnectivity || !activeServerGroupName}
+                  className="h-9 rounded-full border-input bg-card text-muted-foreground hover:bg-accent hover:text-foreground"
+                  title={t('testCurrentGroup')}
+                >
+                  <Zap className={cn("mr-1.5 h-3.5 w-3.5", testingConnectivity && "animate-pulse")} />
+                  {t('testCurrentGroup')}
+                </Button>
+                <Button
+                  variant="default"
+                  size="sm"
+                  onClick={() => handleTestConnectivity({ type: 'all' })}
+                  disabled={testingConnectivity || selectableServerGroups(proxyGroups, servers).length === 0}
+                  className="h-9 rounded-full bg-gradient-to-r from-blue-500 to-cyan-500 text-white shadow-[0_10px_24px_rgba(59,130,246,0.22)] hover:from-blue-600 hover:to-cyan-600"
+                  title={t('testAllNodes')}
+                >
+                  <RefreshCw className={cn("mr-1.5 h-3.5 w-3.5", testingConnectivity && "animate-spin")} />
+                  {t('testAllNodes')}
+                </Button>
+              </div>
             ) : activeTab === 'dashboard' ? (
               <Button 
                 variant="outline" 
@@ -889,10 +901,51 @@ function AppContent() {
                 iconBg: 'bg-slate-500/12',
               };
             };
+            const realGroups = selectableServerGroups(proxyGroups, servers);
+            const activeGroup = realGroups.find(group => group.name === activeServerGroupName) ?? realGroups[0] ?? null;
+
+            const cleanGroupName = (name: string) =>
+              name.replace(/^[^\p{L}\p{N}]+/u, '').trim();
+
+            const resolveSelectedRealProxy = (group: ProxyGroup) => {
+              const realNodes = groupRealNodes(group, servers);
+              const candidates = [
+                group.now,
+                selectedProxies[group.name],
+                proxyGroups.find(item => item.name === group.now)?.now,
+                realNodes[0],
+              ];
+              return candidates.find((candidate): candidate is string =>
+                Boolean(candidate && realNodes.includes(candidate))
+              ) ?? realNodes[0] ?? group.now ?? group.proxies[0] ?? '';
+            };
+
+            const getDelayColor = (delay: number | undefined) => {
+              switch (delayStatus(delay)) {
+                case 'testing':
+                  return 'text-cyan-400';
+                case 'timeout':
+                  return 'text-red-400';
+                case 'good':
+                  return 'text-emerald-400';
+                case 'medium':
+                  return 'text-yellow-400';
+                case 'slow':
+                  return 'text-orange-400';
+                default:
+                  return 'text-muted-foreground/60';
+              }
+            };
+
+            const activeGroupMeta = activeGroup ? getGroupMeta(activeGroup.name) : null;
+            const activeSelectedProxy = activeGroup ? resolveSelectedRealProxy(activeGroup) : '';
+            const activeGroupNodes = activeGroup
+              ? sortServerNodes(groupRealNodes(activeGroup, servers), nodeDelays, serverNodeSort)
+              : [];
 
             return (
             <div className="space-y-6">
-              {proxyGroups.length === 0 ? (
+              {realGroups.length === 0 ? (
                 <Card className="bg-card border-border">
                   <CardContent className="p-6 text-center text-muted-foreground">
                     {t('noProxyGroups')}
@@ -901,19 +954,26 @@ function AppContent() {
               ) : (
                 <>
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-                    {proxyGroups.map((group) => {
+                    {realGroups.map((group) => {
                       const meta = getGroupMeta(group.name);
-                      const isSelectType = group.type.toLowerCase().includes('select');
-                      const isExpanded = isSelectType && expandedGroups.has(group.name);
-                      const selectedProxy = group.now || selectedProxies[group.name] || group.proxies[0];
-                      const displayName = group.name.replace(/^[\p{Emoji}\s🖥️]+/u, '').trim();
+                      const selectedProxy = resolveSelectedRealProxy(group);
+                      const selectedNodeDelay = nodeDelays[selectedProxy];
+                      const selectedDelay = testingGroups.has(group.name) && selectedNodeDelay === undefined
+                        ? 0
+                        : selectedNodeDelay;
+                      const selectedDelayText = delayText(selectedDelay);
+                      const displayName = cleanGroupName(group.name);
+                      const isActive = activeGroup?.name === group.name;
 
                       return (
-                        <div
+                        <button
                           key={group.name}
+                          type="button"
+                          onClick={() => setActiveServerGroupName(group.name)}
                           className={cn(
-                            "relative bg-card/80 backdrop-blur-sm border border-border rounded-2xl overflow-hidden transition-all duration-300 hover:border-border/80 hover:shadow-[0_8px_32px_rgba(0,0,0,0.25)] hover:-translate-y-0.5",
-                            `border-l-4 ${meta.accentBg}`
+                            "relative bg-card/80 backdrop-blur-sm border rounded-2xl overflow-hidden text-left transition-all duration-200 hover:border-border/80 hover:shadow-[0_8px_32px_rgba(0,0,0,0.18)] hover:-translate-y-0.5",
+                            `border-l-4 ${meta.accentBg}`,
+                            isActive ? "border-border shadow-[0_10px_32px_rgba(15,23,42,0.12)]" : "border-border/70"
                           )}
                         >
                           <div className="p-5">
@@ -938,99 +998,104 @@ function AppContent() {
                               <div className={cn("w-2 h-2 rounded-full shrink-0", meta.dotColor)} />
                               <span className="text-[11px] text-muted-foreground">{t('currentNode')}</span>
                               <span className={cn("text-[13px] font-semibold ml-auto truncate", meta.nameColor)}>{selectedProxy}</span>
+                              {selectedDelayText && (
+                                <span className={cn("text-[10px] font-mono font-semibold shrink-0", getDelayColor(selectedDelay))}>
+                                  {selectedDelayText}
+                                </span>
+                              )}
                             </div>
                           </div>
-
-                          {isSelectType && (
-                            <button
-                              className="w-full flex items-center justify-center gap-1.5 px-4 py-2.5 border-t border-border/50 text-xs text-muted-foreground hover:text-foreground hover:bg-accent/30 transition-colors cursor-pointer"
-                              onClick={() => toggleGroupExpansion(group.name)}
-                            >
-                              {isExpanded ? (
-                                <>{t('collapseNodes')} <ChevronDown className="h-3.5 w-3.5" /></>
-                              ) : (
-                                <>{t('expandNodes')} ({group.proxies.length}) <ChevronRight className="h-3.5 w-3.5" /></>
-                              )}
-                            </button>
-                          )}
-                        </div>
+                        </button>
                       );
                     })}
                   </div>
 
-                  {proxyGroups.map((group) => {
-                    const meta = getGroupMeta(group.name);
-                    const isSelectType = group.type.toLowerCase().includes('select');
-                    const isExpanded = isSelectType && expandedGroups.has(group.name);
-                    const selectedProxy = group.now || selectedProxies[group.name] || group.proxies[0];
-                    const displayName = group.name.replace(/^[\p{Emoji}\s🖥️]+/u, '').trim();
-                    if (!isExpanded) return null;
-
-                    return (
-                      <div key={`${group.name}-nodes`} className={cn("bg-card/80 backdrop-blur-sm border border-border rounded-2xl overflow-hidden border-l-4", meta.accentBg)}>
-                        <div className="p-4 flex items-center justify-between cursor-pointer hover:bg-accent/20 transition-colors" onClick={() => toggleGroupExpansion(group.name)}>
-                          <div className="flex items-center gap-3">
-                            <div className={cn("w-9 h-9 rounded-lg flex items-center justify-center text-lg shrink-0", meta.iconBg)}>{meta.icon}</div>
-                            <div>
-                              <div className="flex items-center gap-2">
-                                <span className="font-bold text-foreground text-sm">{displayName}</span>
-                                <Badge variant="outline" className="text-[9px] uppercase tracking-wider border bg-cyan-500/10 text-cyan-400 border-cyan-500/20">{group.type}</Badge>
-                              </div>
-                              <p className="text-[11px] text-muted-foreground mt-0.5">{t(meta.descKey)}</p>
+                  {activeGroup && activeGroupMeta && (
+                    <div className={cn("bg-card/80 backdrop-blur-sm border border-border rounded-2xl overflow-hidden border-l-4", activeGroupMeta.accentBg)}>
+                      <div className="p-4 sm:p-5 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between border-b border-border">
+                        <div className="flex min-w-0 items-center gap-3">
+                          <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center text-xl shrink-0", activeGroupMeta.iconBg)}>{activeGroupMeta.icon}</div>
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-bold text-foreground text-base truncate">{cleanGroupName(activeGroup.name)}</span>
+                              <Badge variant="outline" className="text-[9px] uppercase tracking-wider border bg-cyan-500/10 text-cyan-400 border-cyan-500/20">{activeGroup.type}</Badge>
                             </div>
-                            <div className="hidden sm:flex items-center gap-2 ml-6">
-                              <span className="text-[11px] text-muted-foreground">{t('currentNode')}:</span>
-                              <span className={cn("text-[13px] font-semibold", meta.nameColor)}>{selectedProxy}</span>
-                            </div>
+                            <p className="text-xs text-muted-foreground mt-0.5">{t(activeGroupMeta.descKey)}</p>
                           </div>
-                          <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0" />
                         </div>
-                        <div className="bg-muted/20 p-4 border-t border-border grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-2.5">
-                          {group.proxies.map(proxy => {
-                            const isSelected = selectedProxy === proxy;
-                            const isSubGroup = proxyGroups.some(g => g.name === proxy);
-                            const delay = isSubGroup ? undefined : nodeDelays[proxy];
-                            const hasDelay = delay !== undefined;
-                            const isTesting = delay === 0;
-                            const isTimeout = delay === -1;
-                            const getDelayColor = () => {
-                              if (!hasDelay) return '';
-                              if (isTesting) return 'text-cyan-400';
-                              if (isTimeout) return 'text-red-400';
-                              if (delay < 100) return 'text-emerald-400';
-                              if (delay < 300) return 'text-yellow-400';
-                              return 'text-orange-400';
-                            };
-                            const getDelayText = () => {
-                              if (!hasDelay) return null;
-                              if (isTesting) return '...';
-                              if (isTimeout) return '--';
-                              return `${delay}ms`;
-                            };
-                            return (
-                              <button
-                                key={proxy}
-                                onClick={(e) => { e.stopPropagation(); handleProxySelect(group.name, proxy); }}
-                                className={cn(
-                                  "px-3 py-2 rounded-lg text-xs font-medium transition-all text-left truncate flex items-center justify-between gap-2",
-                                  isSubGroup ? "bg-cyan-500/8 text-cyan-300 border border-dashed border-cyan-500/30 hover:bg-cyan-500/15"
-                                    : isSelected ? "bg-blue-500/20 text-blue-400 border border-blue-500/30"
-                                    : "bg-muted/60 text-muted-foreground border border-transparent hover:bg-accent"
-                                )}
-                              >
-                                <span className="truncate">{proxy}</span>
-                                {isSubGroup && !hasDelay ? (
-                                  <span className="text-[9px] font-semibold text-cyan-400/70 shrink-0">{t('subGroup')}</span>
-                                ) : hasDelay ? (
-                                  <span className={cn("text-[10px] font-mono shrink-0", getDelayColor())}>{getDelayText()}</span>
-                                ) : null}
-                              </button>
-                            );
-                          })}
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between lg:justify-end">
+                          <div className="flex min-w-0 items-center gap-2 rounded-xl border border-border/60 bg-background/40 px-3 py-2">
+                            <span className="text-[11px] text-muted-foreground shrink-0">{t('currentNode')}:</span>
+                            <span className={cn("truncate text-[13px] font-semibold", activeGroupMeta.nameColor)}>{activeSelectedProxy}</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <div className="flex rounded-full border border-border bg-muted/50 p-1">
+                              {([
+                                ['default', t('sortDefault')],
+                                ['delay', t('sortByDelay')],
+                                ['name', t('sortByName')],
+                              ] as const).map(([value, label]) => (
+                                <button
+                                  key={value}
+                                  type="button"
+                                  onClick={() => setServerNodeSort(value)}
+                                  className={cn(
+                                    "h-7 rounded-full px-3 text-[11px] font-semibold transition-colors",
+                                    serverNodeSort === value
+                                      ? "bg-card text-foreground shadow-sm"
+                                      : "text-muted-foreground hover:text-foreground"
+                                  )}
+                                >
+                                  {label}
+                                </button>
+                              ))}
+                            </div>
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              onClick={() => handleTestConnectivity({ type: 'group', groupName: activeGroup.name })}
+                              disabled={testingConnectivity}
+                              className="h-9 w-9 rounded-full border-input bg-card text-muted-foreground hover:bg-accent hover:text-yellow-400"
+                              title={t('testCurrentGroup')}
+                            >
+                              <Zap className={cn("h-4 w-4", testingGroups.has(activeGroup.name) && "animate-pulse text-yellow-400")} />
+                            </Button>
+                          </div>
                         </div>
                       </div>
-                    );
-                  })}
+                      <div className="grid grid-cols-1 gap-3 bg-muted/20 p-4 sm:grid-cols-2 lg:grid-cols-3">
+                        {activeGroupNodes.map(proxy => {
+                          const isSelected = activeSelectedProxy === proxy;
+                          const delay = testingGroups.has(activeGroup.name) && nodeDelays[proxy] === undefined
+                            ? 0
+                            : nodeDelays[proxy];
+                          const text = delayText(delay);
+
+                          return (
+                            <button
+                              key={proxy}
+                              type="button"
+                              onClick={() => handleProxySelect(activeGroup.name, proxy)}
+                              className={cn(
+                                "min-w-0 rounded-xl border px-4 py-3 text-left transition-all flex items-center justify-between gap-3",
+                                isSelected
+                                  ? "bg-blue-500/15 text-blue-400 border-blue-500/30 shadow-[0_8px_18px_rgba(59,130,246,0.12)]"
+                                  : "bg-card/70 text-muted-foreground border-transparent hover:bg-accent hover:text-foreground"
+                              )}
+                            >
+                              <span className="min-w-0">
+                                <span className="block truncate text-sm font-semibold">{proxy}</span>
+                                <span className="mt-0.5 block text-[11px] text-muted-foreground">RDP</span>
+                              </span>
+                              {text && (
+                                <span className={cn("font-mono text-[11px] font-semibold shrink-0", getDelayColor(delay))}>{text}</span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
                 </>
               )}
             </div>
@@ -1128,7 +1193,7 @@ function AppContent() {
                             <span className="text-xs text-blue-400/60">
                               {t('lastSyncedAgo').replace('{time}', (() => {
                                 const { key, n } = getTimeAgo(autoUpdateStatus.last_sync_ts);
-                                return t(key as any).replace('{n}', String(n));
+                                return t(key as TranslationKey).replace('{n}', String(n));
                               })())}
                             </span>
                           )}
@@ -1355,6 +1420,21 @@ function AppContent() {
                     <div className="relative inline-flex h-6 w-11 items-center rounded-full bg-zinc-600 pointer-events-none">
                       <span className="inline-block h-4 w-4 rounded-full bg-white shadow-sm translate-x-1" />
                     </div>
+                  </div>
+                  <div className="flex items-center justify-between gap-4 py-2">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="h-9 w-9 rounded-lg bg-emerald-500/10 flex items-center justify-center shrink-0">
+                        <FolderOpen className="h-4 w-4 text-emerald-500" />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium text-foreground">{t('folderSharing')}</div>
+                        <div className="text-xs text-muted-foreground">{t('folderSharingDesc')}</div>
+                      </div>
+                    </div>
+                    <Switch
+                      checked={folderSharingEnabled}
+                      onCheckedChange={setFolderSharingEnabled}
+                    />
                   </div>
                 </CardContent>
               </Card>

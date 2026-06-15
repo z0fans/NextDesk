@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, type SetStateAction } from 'react';
 import type { ServerEntry, ServerGroup, SessionTab, ViewMode, ConnectionState } from './rdp-types';
 
 function uid() {
@@ -8,6 +8,7 @@ function uid() {
 const STORAGE_KEY = 'nextdesk_servers';
 const GROUPS_KEY = 'nextdesk_groups';
 const FOLDER_SHARING_KEY = 'nextdesk_folder_sharing';
+const FOLDER_SHARING_EVENT = 'nextdesk-folder-sharing-change';
 
 const DEFAULT_GROUPS: ServerGroup[] = [
   { id: 'fav', name: 'Favorites', isExpanded: true },
@@ -31,6 +32,54 @@ function saveToStorage<T>(key: string, data: T) {
   }
 }
 
+export function useFolderSharingSetting() {
+  const [folderSharingEnabled, setFolderSharingEnabledState] = useState<boolean>(() =>
+    loadFromStorage(FOLDER_SHARING_KEY, false)
+  );
+
+  const setFolderSharingEnabled = useCallback((value: SetStateAction<boolean>) => {
+    setFolderSharingEnabledState(prev => {
+      const next = typeof value === 'function'
+        ? (value as (previous: boolean) => boolean)(prev)
+        : value;
+
+      saveToStorage(FOLDER_SHARING_KEY, next);
+      window.dispatchEvent(new CustomEvent<boolean>(FOLDER_SHARING_EVENT, { detail: next }));
+
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    saveToStorage(FOLDER_SHARING_KEY, folderSharingEnabled);
+  }, [folderSharingEnabled]);
+
+  useEffect(() => {
+    const handleFolderSharingChange = (event: Event) => {
+      const next = (event as CustomEvent<boolean>).detail;
+      if (typeof next === 'boolean') {
+        setFolderSharingEnabledState(next);
+      }
+    };
+
+    const handleStorageChange = (event: StorageEvent) => {
+      if (event.key === FOLDER_SHARING_KEY) {
+        setFolderSharingEnabledState(loadFromStorage(FOLDER_SHARING_KEY, false));
+      }
+    };
+
+    window.addEventListener(FOLDER_SHARING_EVENT, handleFolderSharingChange);
+    window.addEventListener('storage', handleStorageChange);
+
+    return () => {
+      window.removeEventListener(FOLDER_SHARING_EVENT, handleFolderSharingChange);
+      window.removeEventListener('storage', handleStorageChange);
+    };
+  }, []);
+
+  return { folderSharingEnabled, setFolderSharingEnabled };
+}
+
 export function useSessionStore() {
   const [groups, setGroups] = useState<ServerGroup[]>(() => loadFromStorage(GROUPS_KEY, DEFAULT_GROUPS));
   const [servers, setServers] = useState<ServerEntry[]>(() => loadFromStorage(STORAGE_KEY, []));
@@ -38,12 +87,11 @@ export function useSessionStore() {
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('tab');
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [folderSharingEnabled, setFolderSharingEnabled] = useState<boolean>(() => loadFromStorage(FOLDER_SHARING_KEY, false));
+  const { folderSharingEnabled, setFolderSharingEnabled } = useFolderSharingSetting();
 
   // Persist servers whenever they change
   useEffect(() => { saveToStorage(STORAGE_KEY, servers); }, [servers]);
   useEffect(() => { saveToStorage(GROUPS_KEY, groups); }, [groups]);
-  useEffect(() => { saveToStorage(FOLDER_SHARING_KEY, folderSharingEnabled); }, [folderSharingEnabled]);
 
   // ── Server CRUD ──
   const addServer = useCallback((entry: Omit<ServerEntry, 'id'>) => {

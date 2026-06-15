@@ -109,6 +109,15 @@ describe('RDP engine mode selection', () => {
     })).toBe('official-web');
   });
 
+  it('uses env when no debug override exists and native is experimental', () => {
+    expect(resolveRdpEngineMode({
+      envValue: 'native',
+      storage: createStorage(),
+      globalValue: null,
+      experimentalNativeValue: '1',
+    })).toBe('native');
+  });
+
   it('does not read ambient global override when globalValue is null', () => {
     const runtimeGlobal = globalThis as { __NEXTDESK_RDP_ENGINE__?: unknown };
     const previous = runtimeGlobal.__NEXTDESK_RDP_ENGINE__;

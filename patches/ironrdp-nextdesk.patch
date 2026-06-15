@@ -45,10 +45,10 @@ index 2f87aae..f2903a9 100644
  name = "serde_bytes"
  version = "0.11.19"
 diff --git a/crates/iron-remote-desktop/src/lib.rs b/crates/iron-remote-desktop/src/lib.rs
-index a4d309b..c105e1e 100644
+index a4d309b..e8974b6 100644
 --- a/crates/iron-remote-desktop/src/lib.rs
 +++ b/crates/iron-remote-desktop/src/lib.rs
-@@ -277,6 +277,36 @@ macro_rules! make_bridge {
+@@ -277,6 +277,31 @@ macro_rules! make_bridge {
                  ))
              }
  
@@ -73,13 +73,8 @@ index a4d309b..c105e1e 100644
 +            }
 +
 +            #[wasm_bindgen(js_name = fileChunkCallback)]
-+            pub fn file_chunk_callback(
-+                &self,
-+                callback: $crate::internal::web_sys::js_sys::Function,
-+            ) -> Self {
-+                Self($crate::SessionBuilder::file_chunk_callback(
-+                    &self.0, callback,
-+                ))
++            pub fn file_chunk_callback(&self, callback: $crate::internal::web_sys::js_sys::Function) -> Self {
++                Self($crate::SessionBuilder::file_chunk_callback(&self.0, callback))
 +            }
 +
              #[wasm_bindgen(js_name = canvasResizedCallback)]
@@ -105,8 +100,115 @@ index db347f0..e8262ed 100644
      #[must_use]
      fn canvas_resized_callback(&self, callback: js_sys::Function) -> Self;
  
+diff --git a/crates/ironrdp-async/src/connector.rs b/crates/ironrdp-async/src/connector.rs
+index 9db6fa5..1b5ec2d 100644
+--- a/crates/ironrdp-async/src/connector.rs
++++ b/crates/ironrdp-async/src/connector.rs
+@@ -6,7 +6,7 @@ use ironrdp_connector::{
+     general_err,
+ };
+ use ironrdp_core::WriteBuf;
+-use tracing::{debug, info, instrument, trace};
++use tracing::{info, instrument, trace};
+ 
+ use crate::framed::{Framed, FramedRead, FramedWrite};
+ use crate::{NetworkClient, single_sequence_step};
+@@ -64,6 +64,12 @@ where
+ {
+     let mut buf = WriteBuf::new();
+ 
++    info!(
++        state = connector.state.name(),
++        credssp = connector.should_perform_credssp(),
++        "RDP finalize begin"
++    );
++
+     if connector.should_perform_credssp() {
+         perform_credssp_step(
+             &mut connector,
+@@ -75,9 +81,11 @@ where
+             kerberos_config,
+         )
+         .await?;
++        info!(state = connector.state.name(), "RDP finalize after CredSSP");
+     }
+ 
+     let result = loop {
++        info!(state = connector.state.name(), "RDP finalize connector step");
+         single_sequence_step(framed, &mut connector, &mut buf).await?;
+ 
+         if let ClientConnectorState::Connected { result } = connector.state {
+@@ -126,6 +134,13 @@ where
+ {
+     assert!(connector.should_perform_credssp());
+ 
++    info!(
++        server_name = server_name.as_str(),
++        public_key_len = server_public_key.len(),
++        state = connector.state.name(),
++        "CredSSP begin"
++    );
++
+     let selected_protocol = match connector.state {
+         ClientConnectorState::Credssp { selected_protocol, .. } => selected_protocol,
+         _ => return Err(general_err!("invalid connector state for CredSSP sequence")),
+@@ -140,7 +155,12 @@ where
+         kerberos_config,
+     )?;
+ 
++    let mut step_count = 0usize;
++
+     loop {
++        step_count += 1;
++        info!(step = step_count, "CredSSP step begin");
++
+         let client_state = {
+             let mut generator = sequence.process_ts_request(ts_request);
+             trace!("resolving network");
+@@ -152,6 +172,7 @@ where
+ 
+         if let Some(response_len) = written.size() {
+             let response = &buf[..response_len];
++            info!(step = step_count, response_len, "CredSSP send response");
+             trace!(response_len, "Send response");
+             framed
+                 .write_all(response)
+@@ -160,13 +181,15 @@ where
+         }
+ 
+         let Some(next_pdu_hint) = sequence.next_pdu_hint() else {
++            info!(step = step_count, "CredSSP no further PDU hint");
+             break;
+         };
+ 
+-        debug!(
++        info!(
+             connector.state = connector.state.name(),
+             hint = ?next_pdu_hint,
+-            "Wait for PDU"
++            step = step_count,
++            "CredSSP wait for PDU"
+         );
+ 
+         let pdu = framed
+@@ -174,6 +197,7 @@ where
+             .await
+             .map_err(|e| ironrdp_connector::custom_err!("read frame by hint", e))?;
+ 
++        info!(step = step_count, length = pdu.len(), "CredSSP PDU received");
+         trace!(length = pdu.len(), "PDU received");
+ 
+         if let Some(next_request) = sequence.decode_server_message(&pdu)? {
+@@ -184,6 +208,7 @@ where
+     }
+ 
+     connector.mark_credssp_as_done();
++    info!(steps = step_count, "CredSSP finished");
+ 
+     Ok(())
+ }
 diff --git a/crates/ironrdp-cliprdr/src/pdu/format_data/file_list.rs b/crates/ironrdp-cliprdr/src/pdu/format_data/file_list.rs
-index 975c0f5..fe3ef1a 100644
+index 975c0f5..0560f73 100644
 --- a/crates/ironrdp-cliprdr/src/pdu/format_data/file_list.rs
 +++ b/crates/ironrdp-cliprdr/src/pdu/format_data/file_list.rs
 @@ -17,6 +17,10 @@ bitflags! {
@@ -139,12 +241,13 @@ index 975c0f5..fe3ef1a 100644
          if self.attributes.is_some() {
              flags |= ClipboardFileFlags::ATTRIBUTES;
          }
-@@ -150,10 +157,14 @@ impl<'de> Decode<'de> for FileDescriptor {
+@@ -150,10 +157,15 @@ impl<'de> Decode<'de> for FileDescriptor {
          let name = decode_string(src.remaining(), CharacterSet::Unicode, true)?;
          src.advance(NAME_LENGTH);
  
 +        // Extract extra flags (bits not covered by auto-computed fields)
-+        let extra = flags & !(ClipboardFileFlags::ATTRIBUTES | ClipboardFileFlags::LAST_WRITE_TIME | ClipboardFileFlags::FILE_SIZE);
++        let extra = flags
++            & !(ClipboardFileFlags::ATTRIBUTES | ClipboardFileFlags::LAST_WRITE_TIME | ClipboardFileFlags::FILE_SIZE);
 +
          Ok(Self {
              attributes,
@@ -205,10 +308,29 @@ index 6d70c84..c57d5dc 100644
                  let channel_id = create_request.channel_id();
                  let channel_name = create_request.into_channel_name();
 diff --git a/crates/ironrdp-egfx/src/client.rs b/crates/ironrdp-egfx/src/client.rs
-index 19ca4de..c77bb4b 100644
+index 19ca4de..7bb3e83 100644
 --- a/crates/ironrdp-egfx/src/client.rs
 +++ b/crates/ironrdp-egfx/src/client.rs
-@@ -17,8 +17,10 @@ pub trait GraphicsPipelineHandler: Send {
+@@ -1,11 +1,14 @@
+-use ironrdp_core::{ReadCursor, impl_as_any};
++use ironrdp_core::{decode, impl_as_any, DecodeResult, ReadCursor};
+ use ironrdp_dvc::{DvcClientProcessor, DvcMessage, DvcProcessor};
+-use ironrdp_graphics::zgfx;
+-use ironrdp_pdu::{PduResult, decode_cursor, decode_err};
++use ironrdp_graphics::{clearcodec, zgfx};
++use ironrdp_pdu::geometry::InclusiveRectangle;
++use ironrdp_pdu::{decode_cursor, decode_err, PduResult};
+ use tracing::trace;
+ 
++use crate::pdu::{
++    Avc420BitmapStream, CapabilitiesAdvertisePdu, CapabilitiesV81Flags, CapabilitiesV8Flags, CapabilitySet, GfxPdu,
++};
+ use crate::CHANNEL_NAME;
+-use crate::pdu::{CapabilitiesAdvertisePdu, CapabilitiesV8Flags, CapabilitySet, GfxPdu};
+ 
+ /// Max capacity to keep for decompressed buffer when cleared.
+ const MAX_DECOMPRESSED_BUFFER_CAPACITY: usize = 16384; // 16 KiB
+@@ -17,11 +20,131 @@ pub trait GraphicsPipelineHandler: Send {
          }]
      }
  
@@ -220,7 +342,128 @@ index 19ca4de..c77bb4b 100644
      }
  }
  
-@@ -47,7 +49,12 @@ impl DvcProcessor for GraphicsPipelineClient {
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Avc420Frame<'a> {
++    pub rectangles: Vec<InclusiveRectangle>,
++    pub data: &'a [u8],
++}
++
++pub fn avc420_capabilities() -> Vec<CapabilitySet> {
++    vec![
++        CapabilitySet::V8_1 {
++            flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE,
++        },
++        CapabilitySet::V8 {
++            flags: CapabilitiesV8Flags::SMALL_CACHE,
++        },
++    ]
++}
++
++pub fn extract_avc420_frame(bitmap_data: &[u8]) -> DecodeResult<Avc420Frame<'_>> {
++    let stream: Avc420BitmapStream<'_> = decode(bitmap_data)?;
++    Ok(Avc420Frame {
++        rectangles: stream.rectangles,
++        data: stream.data,
++    })
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ClearCodecRgbaPatch {
++    pub x: u16,
++    pub y: u16,
++    pub width: u16,
++    pub height: u16,
++    pub rgba: Vec<u8>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ClearCodecFrame {
++    pub flags: u8,
++    pub glyph_index_present: bool,
++    pub glyph_hit_present: bool,
++    pub cache_reset: bool,
++    pub sequence_number: u8,
++    pub payload_len: usize,
++    pub residual_byte_count: u32,
++    pub bands_byte_count: u32,
++    pub subcodec_byte_count: u32,
++    pub patches: Vec<ClearCodecRgbaPatch>,
++}
++
++pub struct ClearCodecFrameDecoder {
++    decoder: clearcodec::ClearCodecDecoder,
++}
++
++impl ClearCodecFrameDecoder {
++    pub fn new() -> Self {
++        Self {
++            decoder: clearcodec::ClearCodecDecoder::new(),
++        }
++    }
++
++    pub fn decode_frame(&mut self, bitmap_data: &[u8], width: u16, height: u16) -> DecodeResult<ClearCodecFrame> {
++        let mut cursor = ReadCursor::new(bitmap_data);
++        let stream = ironrdp_pdu::codecs::clearcodec::ClearCodecBitmapStream::decode(&mut cursor)?;
++        let flags = stream.flags;
++        let glyph_index_present = stream.has_glyph_index();
++        let glyph_hit_present = stream.is_glyph_hit();
++        let cache_reset = stream.is_cache_reset();
++        let sequence_number = stream.seq_number;
++        let header_len = 2 + usize::from(glyph_index_present) * 2;
++        let payload_len = bitmap_data.len().saturating_sub(header_len);
++        let residual_byte_count = stream.composite.as_ref().map_or(0, |c| c.residual_data.len() as u32);
++        let bands_byte_count = stream.composite.as_ref().map_or(0, |c| c.bands_data.len() as u32);
++        let subcodec_byte_count = stream.composite.as_ref().map_or(0, |c| c.subcodec_data.len() as u32);
++        let should_draw = glyph_hit_present || stream.composite.is_some();
++
++        let bgra = self.decoder.decode(bitmap_data, width, height)?;
++        let mut patches = Vec::new();
++        if should_draw && width != 0 && height != 0 && !bgra.is_empty() {
++            patches.push(ClearCodecRgbaPatch {
++                x: 0,
++                y: 0,
++                width,
++                height,
++                rgba: bgra_to_rgba(bgra),
++            });
++        }
++
++        Ok(ClearCodecFrame {
++            flags,
++            glyph_index_present,
++            glyph_hit_present,
++            cache_reset,
++            sequence_number,
++            payload_len,
++            residual_byte_count,
++            bands_byte_count,
++            subcodec_byte_count,
++            patches,
++        })
++    }
++}
++
++impl Default for ClearCodecFrameDecoder {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++pub fn extract_clearcodec_frame(bitmap_data: &[u8], width: u16, height: u16) -> DecodeResult<ClearCodecFrame> {
++    ClearCodecFrameDecoder::new().decode_frame(bitmap_data, width, height)
++}
++
++fn bgra_to_rgba(mut bgra: Vec<u8>) -> Vec<u8> {
++    for pixel in bgra.chunks_exact_mut(4) {
++        pixel.swap(0, 2);
++    }
++    bgra
++}
++
+ /// A client for the Graphics Pipeline Virtual Channel.
+ pub struct GraphicsPipelineClient {
+     handler: Box<dyn GraphicsPipelineHandler>,
+@@ -47,7 +170,13 @@ impl DvcProcessor for GraphicsPipelineClient {
      }
  
      fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
@@ -228,13 +471,14 @@ index 19ca4de..c77bb4b 100644
 +        let caps = self.handler.capabilities();
 +        eprintln!(
 +            "[egfx] GFX DVC opened by server (channel_id={}), sending CapabilitiesAdvertise ({} caps)",
-+            _channel_id, caps.len()
++            _channel_id,
++            caps.len()
 +        );
 +        let pdu = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu(caps));
  
          Ok(vec![Box::new(pdu)])
      }
-@@ -60,12 +67,15 @@ impl DvcProcessor for GraphicsPipelineClient {
+@@ -60,13 +189,131 @@ impl DvcProcessor for GraphicsPipelineClient {
              .map_err(|e| decode_err!(e))?;
  
          let mut cursor = ReadCursor::new(self.decompressed_buffer.as_slice());
@@ -252,6 +496,2104 @@ index 19ca4de..c77bb4b 100644
      }
  }
  
+ impl DvcClientProcessor for GraphicsPipelineClient {}
++
++#[cfg(test)]
++mod tests {
++    use ironrdp_pdu::geometry::InclusiveRectangle;
++    use ironrdp_pdu::{Encode as _, WriteCursor};
++
++    use super::{avc420_capabilities, extract_avc420_frame, extract_clearcodec_frame, ClearCodecFrameDecoder};
++    use crate::pdu::{Avc420BitmapStream, CapabilitiesV81Flags, CapabilitiesV8Flags, CapabilitySet, QuantQuality};
++
++    #[test]
++    fn avc420_capabilities_advertise_v81_before_v8() {
++        let caps = avc420_capabilities();
++
++        assert!(matches!(
++            caps.as_slice(),
++            [
++                CapabilitySet::V8_1 { flags: v81 },
++                CapabilitySet::V8 { flags: v8 },
++            ] if v81.contains(CapabilitiesV81Flags::AVC420_ENABLED)
++                && v81.contains(CapabilitiesV81Flags::SMALL_CACHE)
++                && v8.contains(CapabilitiesV8Flags::SMALL_CACHE)
++        ));
++    }
++
++    #[test]
++    fn extract_avc420_frame_returns_inner_h264_payload() {
++        let h264 = [0, 0, 0, 1, 0x67, 0x42, 0, 0x1f];
++        let stream = Avc420BitmapStream {
++            rectangles: vec![InclusiveRectangle {
++                left: 10,
++                top: 20,
++                right: 110,
++                bottom: 120,
++            }],
++            quant_qual_vals: vec![QuantQuality {
++                quantization_parameter: 22,
++                progressive: false,
++                quality: 100,
++            }],
++            data: &h264,
++        };
++
++        let mut encoded = vec![0; stream.size()];
++        let mut cursor = WriteCursor::new(&mut encoded);
++        stream.encode(&mut cursor).expect("encode avc420 test stream");
++
++        let frame = extract_avc420_frame(&encoded).expect("decode avc420 frame");
++
++        assert_eq!(frame.data, h264);
++        assert_eq!(frame.rectangles.len(), 1);
++        assert_eq!(frame.rectangles[0].left, 10);
++    }
++
++    #[test]
++    fn extract_clearcodec_frame_returns_metadata_and_payload() {
++        let encoded = [
++            0x00, 0x00, // ccFlags, seqNumber
++            0x00, 0x00, 0x00, 0x00, // residualByteCount
++            0x00, 0x00, 0x00, 0x00, // bandsByteCount
++            0x15, 0x00, 0x00, 0x00, // subcodecByteCount
++            0x00, 0x00, // xStart
++            0x00, 0x00, // yStart
++            0x28, 0x00, // width
++            0x40, 0x00, // height
++            0x08, 0x00, 0x00, 0x00, // bitmapDataByteCount
++            0x02, // subCodecId RLEX
++            0x01, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x09,
++        ];
++
++        let frame = extract_clearcodec_frame(&encoded, 40, 64).expect("decode clearcodec frame");
++
++        assert_eq!(frame.flags, 0);
++        assert!(!frame.glyph_index_present);
++        assert!(!frame.glyph_hit_present);
++        assert!(!frame.cache_reset);
++        assert_eq!(frame.sequence_number, 0);
++        assert_eq!(frame.payload_len, 33);
++        assert_eq!(frame.residual_byte_count, 0);
++        assert_eq!(frame.bands_byte_count, 0);
++        assert_eq!(frame.subcodec_byte_count, 21);
++        assert_eq!(frame.patches.len(), 1);
++        assert_eq!(frame.patches[0].x, 0);
++        assert_eq!(frame.patches[0].y, 0);
++        assert_eq!(frame.patches[0].width, 40);
++        assert_eq!(frame.patches[0].height, 64);
++        assert_eq!(frame.patches[0].rgba.len(), 40 * 64 * 4);
++    }
++
++    #[test]
++    fn clearcodec_decoder_preserves_glyph_cache_between_frames() {
++        let mut decoder = ClearCodecFrameDecoder::new();
++        let mut first = Vec::new();
++        first.push(0x01); // FLAG_GLYPH_INDEX
++        first.push(0x00);
++        first.extend_from_slice(&7u16.to_le_bytes());
++        first.extend_from_slice(&4u32.to_le_bytes());
++        first.extend_from_slice(&0u32.to_le_bytes());
++        first.extend_from_slice(&0u32.to_le_bytes());
++        first.extend_from_slice(&[0x00, 0x00, 0xff, 0x01]);
++
++        let first_frame = decoder.decode_frame(&first, 1, 1).expect("decode and cache glyph");
++        assert_eq!(first_frame.patches.len(), 1);
++        assert_eq!(first_frame.patches[0].rgba, vec![0xff, 0x00, 0x00, 0xff]);
++
++        let mut hit = Vec::new();
++        hit.push(0x03); // FLAG_GLYPH_INDEX | FLAG_GLYPH_HIT
++        hit.push(0x01);
++        hit.extend_from_slice(&7u16.to_le_bytes());
++
++        let hit_frame = decoder.decode_frame(&hit, 1, 1).expect("decode glyph hit");
++        assert!(hit_frame.glyph_hit_present);
++        assert_eq!(hit_frame.patches.len(), 1);
++        assert_eq!(hit_frame.patches[0].rgba, first_frame.patches[0].rgba);
++    }
++}
+diff --git a/crates/ironrdp-egfx/src/pdu/avc.rs b/crates/ironrdp-egfx/src/pdu/avc.rs
+index e310eb5..237ba77 100644
+--- a/crates/ironrdp-egfx/src/pdu/avc.rs
++++ b/crates/ironrdp-egfx/src/pdu/avc.rs
+@@ -4,8 +4,8 @@ use bit_field::BitField as _;
+ use bitflags::bitflags;
+ use ironrdp_pdu::geometry::InclusiveRectangle;
+ use ironrdp_pdu::{
+-    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_fixed_part_size,
+-    ensure_size, invalid_field_err,
++    cast_length, ensure_fixed_part_size, ensure_size, invalid_field_err, Decode, DecodeResult, Encode, EncodeResult,
++    ReadCursor, WriteCursor,
+ };
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+diff --git a/crates/ironrdp-egfx/src/pdu/cmd.rs b/crates/ironrdp-egfx/src/pdu/cmd.rs
+index a3a71d9..ab07e7d 100644
+--- a/crates/ironrdp-egfx/src/pdu/cmd.rs
++++ b/crates/ironrdp-egfx/src/pdu/cmd.rs
+@@ -3,12 +3,12 @@ use core::{fmt, iter};
+ use bit_field::BitField as _;
+ use bitflags::bitflags;
+ use ironrdp_core::{
+-    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_fixed_part_size, invalid_field_err,
++    ensure_fixed_part_size, invalid_field_err, Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor,
+ };
+ use ironrdp_dvc::DvcEncode;
+ use ironrdp_pdu::gcc::Monitor;
+ use ironrdp_pdu::geometry::InclusiveRectangle;
+-use ironrdp_pdu::{DecodeError, cast_length, ensure_size, read_padding, write_padding};
++use ironrdp_pdu::{cast_length, ensure_size, read_padding, write_padding, DecodeError};
+ use tracing::warn;
+ 
+ use super::{Color, PixelFormat, Point};
+diff --git a/crates/ironrdp-egfx/src/pdu/common.rs b/crates/ironrdp-egfx/src/pdu/common.rs
+index 660f73d..112683a 100644
+--- a/crates/ironrdp-egfx/src/pdu/common.rs
++++ b/crates/ironrdp-egfx/src/pdu/common.rs
+@@ -1,6 +1,6 @@
+ use ironrdp_pdu::{
+-    Decode, DecodeError, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, ensure_fixed_part_size,
+-    invalid_field_err,
++    ensure_fixed_part_size, invalid_field_err, Decode, DecodeError, DecodeResult, Encode, EncodeResult, ReadCursor,
++    WriteCursor,
+ };
+ 
+ /// 2.2.1.1 RDPGFX_POINT16
+diff --git a/crates/ironrdp-graphics/src/clearcodec/glyph_cache.rs b/crates/ironrdp-graphics/src/clearcodec/glyph_cache.rs
+new file mode 100644
+index 0000000..b36f65a
+--- /dev/null
++++ b/crates/ironrdp-graphics/src/clearcodec/glyph_cache.rs
+@@ -0,0 +1,94 @@
++//! Glyph cache for ClearCodec (MS-RDPEGFX 2.2.4.1).
++
++/// Maximum number of glyph cache entries.
++pub const GLYPH_CACHE_SIZE: usize = 4_000;
++
++/// A cached glyph entry: BGRA pixel data with dimensions.
++#[derive(Debug, Clone)]
++pub struct GlyphEntry {
++    pub width: u16,
++    pub height: u16,
++    /// BGRA pixel data (4 bytes per pixel).
++    pub pixels: Vec<u8>,
++}
++
++/// Glyph cache for ClearCodec bitmap deduplication.
++pub struct GlyphCache {
++    entries: Vec<Option<GlyphEntry>>,
++}
++
++impl GlyphCache {
++    pub fn new() -> Self {
++        let mut entries = Vec::with_capacity(GLYPH_CACHE_SIZE);
++        entries.resize_with(GLYPH_CACHE_SIZE, || None);
++        Self { entries }
++    }
++
++    /// Look up a glyph by its cache index.
++    pub fn get(&self, index: u16) -> Option<&GlyphEntry> {
++        self.entries.get(usize::from(index)).and_then(|slot| slot.as_ref())
++    }
++
++    /// Store a glyph at the given index.
++    ///
++    /// Returns `true` if the index was valid and the entry was stored.
++    pub fn store(&mut self, index: u16, entry: GlyphEntry) -> bool {
++        let idx = usize::from(index);
++        if idx < GLYPH_CACHE_SIZE {
++            self.entries[idx] = Some(entry);
++            true
++        } else {
++            false
++        }
++    }
++
++    /// Reset the entire glyph cache, removing all entries.
++    pub fn reset(&mut self) {
++        for slot in &mut self.entries {
++            *slot = None;
++        }
++    }
++}
++
++impl Default for GlyphCache {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn store_and_retrieve() {
++        let mut cache = GlyphCache::new();
++        let entry = GlyphEntry {
++            width: 8,
++            height: 16,
++            pixels: vec![0xFF; 8 * 16 * 4],
++        };
++        assert!(cache.store(42, entry));
++        let retrieved = cache.get(42).unwrap();
++        assert_eq!(retrieved.width, 8);
++        assert_eq!(retrieved.height, 16);
++    }
++
++    #[test]
++    fn get_empty_returns_none() {
++        let cache = GlyphCache::new();
++        assert!(cache.get(0).is_none());
++        assert!(cache.get(3999).is_none());
++    }
++
++    #[test]
++    fn reject_out_of_range() {
++        let mut cache = GlyphCache::new();
++        let entry = GlyphEntry {
++            width: 1,
++            height: 1,
++            pixels: vec![0; 4],
++        };
++        assert!(!cache.store(4000, entry));
++    }
++}
+diff --git a/crates/ironrdp-graphics/src/clearcodec/mod.rs b/crates/ironrdp-graphics/src/clearcodec/mod.rs
+new file mode 100644
+index 0000000..3e57766
+--- /dev/null
++++ b/crates/ironrdp-graphics/src/clearcodec/mod.rs
+@@ -0,0 +1,611 @@
++//! ClearCodec bitmap decoder and encoder (MS-RDPEGFX 2.2.4.1).
++//!
++//! ClearCodec is a mandatory lossless codec for EGFX that uses three-layer
++//! compositing (residual BGR RLE, bands with V-bar caching, subcodecs) to
++//! efficiently encode text, UI elements, and icons.
++
++mod glyph_cache;
++mod vbar_cache;
++
++pub use self::glyph_cache::{GlyphCache, GlyphEntry, GLYPH_CACHE_SIZE};
++pub use self::vbar_cache::{FullVBar, ShortVBar, VBarCache};
++
++use ironrdp_core::{invalid_field_err, DecodeResult, ReadCursor};
++use ironrdp_pdu::codecs::clearcodec::{
++    decode_bands_layer, decode_residual_layer, decode_subcodec_layer, encode_residual_layer, ClearCodecBitmapStream,
++    CompositePayload, RgbRunSegment, SubcodecId, VBar, FLAG_GLYPH_INDEX,
++};
++
++/// Glyph cache size as u16 for index arithmetic. `GLYPH_CACHE_SIZE=4000` fits in u16.
++const GLYPH_CACHE_WRAP: u16 = 4_000;
++
++/// ClearCodec decoder maintaining persistent cache state across frames.
++pub struct ClearCodecDecoder {
++    vbar_cache: VBarCache,
++    glyph_cache: GlyphCache,
++}
++
++impl ClearCodecDecoder {
++    pub fn new() -> Self {
++        Self {
++            vbar_cache: VBarCache::new(),
++            glyph_cache: GlyphCache::new(),
++        }
++    }
++
++    /// Decode a ClearCodec bitmap stream into BGRA pixel data.
++    ///
++    /// The output buffer is `width * height * 4` bytes in BGRA format.
++    /// The wire format does not transmit alpha, so this decoder fills alpha
++    /// with `0xFF`.
++    pub fn decode(&mut self, data: &[u8], width: u16, height: u16) -> DecodeResult<Vec<u8>> {
++        let mut src = ReadCursor::new(data);
++        let stream = ClearCodecBitmapStream::decode(&mut src)?;
++
++        if stream.is_cache_reset() {
++            self.vbar_cache.reset();
++        }
++
++        if let Some(idx) = stream.glyph_index {
++            if idx >= GLYPH_CACHE_WRAP {
++                return Err(invalid_field_err!("glyphIndex", "glyph index out of range 0-3999"));
++            }
++        }
++
++        let w = usize::from(width);
++        let h = usize::from(height);
++        let pixel_count = w
++            .checked_mul(h)
++            .ok_or_else(|| invalid_field_err!("dimensions", "width * height overflow"))?;
++
++        if stream.is_glyph_hit() {
++            let glyph_index = stream
++                .glyph_index
++                .ok_or_else(|| invalid_field_err!("flags", "GLYPH_HIT without GLYPH_INDEX"))?;
++            let entry = self
++                .glyph_cache
++                .get(glyph_index)
++                .ok_or_else(|| invalid_field_err!("glyphIndex", "glyph cache miss on hit"))?;
++            if entry.width != width || entry.height != height {
++                return Err(invalid_field_err!("glyphIndex", "cached glyph dimensions mismatch"));
++            }
++            return Ok(entry.pixels.clone());
++        }
++
++        const MAX_DECODE_DIM: u16 = 8192;
++        if width > MAX_DECODE_DIM || height > MAX_DECODE_DIM {
++            return Err(invalid_field_err!(
++                "dimensions",
++                "width or height exceeds 8192-pixel decoder limit"
++            ));
++        }
++
++        let mut output = vec![0u8; pixel_count * 4];
++
++        if let Some(ref composite) = stream.composite {
++            self.decode_composite(composite, &mut output, width)?;
++        }
++
++        if stream.flags & FLAG_GLYPH_INDEX != 0 {
++            if let Some(glyph_index) = stream.glyph_index {
++                if pixel_count <= 1024 {
++                    self.glyph_cache.store(
++                        glyph_index,
++                        GlyphEntry {
++                            width,
++                            height,
++                            pixels: output.clone(),
++                        },
++                    );
++                }
++            }
++        }
++
++        Ok(output)
++    }
++
++    fn decode_composite(
++        &mut self,
++        composite: &CompositePayload<'_>,
++        output: &mut [u8],
++        width: u16,
++    ) -> DecodeResult<()> {
++        let w = usize::from(width);
++
++        if !composite.residual_data.is_empty() {
++            let segments = decode_residual_layer(composite.residual_data)?;
++            let max_offset = output.len();
++            let mut offset = 0;
++            for seg in &segments {
++                let pixels_remaining = (max_offset.saturating_sub(offset)) / 4;
++                let effective_run = u32::try_from(pixels_remaining).unwrap_or(u32::MAX).min(seg.run_length);
++                for _ in 0..effective_run {
++                    output[offset] = seg.blue;
++                    output[offset + 1] = seg.green;
++                    output[offset + 2] = seg.red;
++                    output[offset + 3] = 0xFF;
++                    offset += 4;
++                }
++                if offset >= max_offset {
++                    break;
++                }
++            }
++        }
++
++        if !composite.bands_data.is_empty() {
++            let bands = decode_bands_layer(composite.bands_data)?;
++            for band in &bands {
++                let band_height = band.y_end - band.y_start + 1;
++                for (col_offset, vbar) in band.vbars.iter().enumerate() {
++                    let x = usize::from(band.x_start) + col_offset;
++                    if x >= w {
++                        continue;
++                    }
++
++                    let full_vbar =
++                        self.resolve_vbar(vbar, band_height, band.blue_bkg, band.green_bkg, band.red_bkg)?;
++
++                    let pixel_rows = full_vbar.pixels.len() / 3;
++                    for row in 0..pixel_rows {
++                        let y = usize::from(band.y_start) + row;
++                        let dst_offset = (y * w + x) * 4;
++                        let src_offset = row * 3;
++                        if dst_offset + 3 < output.len() && src_offset + 2 < full_vbar.pixels.len() {
++                            output[dst_offset] = full_vbar.pixels[src_offset];
++                            output[dst_offset + 1] = full_vbar.pixels[src_offset + 1];
++                            output[dst_offset + 2] = full_vbar.pixels[src_offset + 2];
++                            output[dst_offset + 3] = 0xFF;
++                        }
++                    }
++                }
++            }
++        }
++
++        if !composite.subcodec_data.is_empty() {
++            let subcodecs = decode_subcodec_layer(composite.subcodec_data)?;
++            for sub in &subcodecs {
++                self.decode_subcodec_region(sub, output, width)?;
++            }
++        }
++
++        Ok(())
++    }
++
++    fn resolve_vbar(
++        &mut self,
++        vbar: &VBar<'_>,
++        band_height: u16,
++        bg_blue: u8,
++        bg_green: u8,
++        bg_red: u8,
++    ) -> DecodeResult<FullVBar> {
++        match vbar {
++            VBar::CacheHit { index } => {
++                let cached = self
++                    .vbar_cache
++                    .get_vbar(*index)
++                    .ok_or_else(|| invalid_field_err!("vbarIndex", "V-bar cache miss on hit"))?;
++                Ok(cached.clone())
++            }
++            VBar::ShortCacheHit { index, y_on } => {
++                let cached_short = self
++                    .vbar_cache
++                    .get_short_vbar(*index)
++                    .ok_or_else(|| invalid_field_err!("shortVbarIndex", "short V-bar cache miss on hit"))?;
++                let modified = ShortVBar {
++                    y_on: *y_on,
++                    pixel_count: cached_short.pixel_count,
++                    pixels: cached_short.pixels.clone(),
++                };
++                let full = VBarCache::reconstruct_full_vbar(&modified, band_height, bg_blue, bg_green, bg_red);
++                self.vbar_cache.store_vbar(full.clone());
++                Ok(full)
++            }
++            VBar::ShortCacheMiss(miss) => {
++                let short = ShortVBar {
++                    y_on: miss.y_on,
++                    pixel_count: miss.y_off_delta,
++                    pixels: miss.pixel_data.to_vec(),
++                };
++                self.vbar_cache.store_short_vbar(short.clone());
++                let full = VBarCache::reconstruct_full_vbar(&short, band_height, bg_blue, bg_green, bg_red);
++                self.vbar_cache.store_vbar(full.clone());
++                Ok(full)
++            }
++        }
++    }
++
++    #[expect(clippy::unused_self)]
++    fn decode_subcodec_region(
++        &self,
++        sub: &ironrdp_pdu::codecs::clearcodec::Subcodec<'_>,
++        output: &mut [u8],
++        surface_width: u16,
++    ) -> DecodeResult<()> {
++        let sw = usize::from(surface_width);
++        let sh = output.len() / (sw * 4).max(1);
++
++        let x_end = usize::from(sub.x_start) + usize::from(sub.width);
++        let y_end = usize::from(sub.y_start) + usize::from(sub.height);
++        if x_end > sw || y_end > sh {
++            return Err(invalid_field_err!("subcodec", "region exceeds surface bounds"));
++        }
++
++        match sub.codec_id {
++            SubcodecId::Raw => {
++                let w = usize::from(sub.width);
++                let h = usize::from(sub.height);
++                let expected = w
++                    .checked_mul(h)
++                    .and_then(|v| v.checked_mul(3))
++                    .ok_or_else(|| invalid_field_err!("bitmapData", "raw subcodec dimensions overflow"))?;
++                if sub.bitmap_data.len() < expected {
++                    return Err(invalid_field_err!("bitmapData", "raw subcodec data too short"));
++                }
++                for row in 0..h {
++                    for col in 0..w {
++                        let x = usize::from(sub.x_start) + col;
++                        let y = usize::from(sub.y_start) + row;
++                        let src_idx = (row * w + col) * 3;
++                        let dst_idx = (y * sw + x) * 4;
++                        output[dst_idx] = sub.bitmap_data[src_idx];
++                        output[dst_idx + 1] = sub.bitmap_data[src_idx + 1];
++                        output[dst_idx + 2] = sub.bitmap_data[src_idx + 2];
++                        output[dst_idx + 3] = 0xFF;
++                    }
++                }
++            }
++            SubcodecId::Rlex => {
++                let rlex = ironrdp_pdu::codecs::clearcodec::decode_rlex(sub.bitmap_data)?;
++                let w = usize::from(sub.width);
++                let region_pixels = usize::from(sub.width) * usize::from(sub.height);
++                let palette_len = rlex.palette.len();
++                let mut px = 0usize;
++
++                for seg in &rlex.segments {
++                    if usize::from(seg.start_index) >= palette_len {
++                        return Err(invalid_field_err!("rlex", "start_index exceeds palette size"));
++                    }
++                    if usize::from(seg.stop_index) >= palette_len {
++                        return Err(invalid_field_err!("rlex", "stop_index exceeds palette size"));
++                    }
++
++                    let color = &rlex.palette[usize::from(seg.start_index)];
++                    for _ in 0..seg.run_length {
++                        if px >= region_pixels {
++                            return Err(invalid_field_err!("rlex", "run exceeds region pixel count"));
++                        }
++                        let x = usize::from(sub.x_start) + px % w;
++                        let y = usize::from(sub.y_start) + px / w;
++                        let dst_idx = (y * sw + x) * 4;
++                        output[dst_idx] = color[0];
++                        output[dst_idx + 1] = color[1];
++                        output[dst_idx + 2] = color[2];
++                        output[dst_idx + 3] = 0xFF;
++                        px += 1;
++                    }
++
++                    for palette_idx in seg.start_index..=seg.stop_index {
++                        if px >= region_pixels {
++                            return Err(invalid_field_err!("rlex", "suite exceeds region pixel count"));
++                        }
++                        let color = &rlex.palette[usize::from(palette_idx)];
++                        let x = usize::from(sub.x_start) + px % w;
++                        let y = usize::from(sub.y_start) + px / w;
++                        let dst_idx = (y * sw + x) * 4;
++                        output[dst_idx] = color[0];
++                        output[dst_idx + 1] = color[1];
++                        output[dst_idx + 2] = color[2];
++                        output[dst_idx + 3] = 0xFF;
++                        px += 1;
++                    }
++                }
++            }
++            SubcodecId::NsCodec => {
++                // The current upstream decoder treats NSCodec as a no-op here.
++            }
++        }
++
++        Ok(())
++    }
++}
++
++impl Default for ClearCodecDecoder {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++/// ClearCodec encoder for server-side bitmap compression.
++pub struct ClearCodecEncoder {
++    seq_number: u8,
++    glyph_cache: GlyphCache,
++    next_glyph_index: u16,
++}
++
++impl ClearCodecEncoder {
++    pub fn new() -> Self {
++        Self {
++            seq_number: 0,
++            glyph_cache: GlyphCache::new(),
++            next_glyph_index: 0,
++        }
++    }
++
++    /// Encode BGRA pixel data into a ClearCodec bitmap stream.
++    pub fn encode(&mut self, bgra: &[u8], width: u16, height: u16) -> Vec<u8> {
++        let w = usize::from(width);
++        let h = usize::from(height);
++        let pixel_count = w.saturating_mul(h);
++        let use_glyph = pixel_count <= 1024;
++
++        if use_glyph {
++            if let Some((hit_index, _)) = self.find_glyph_match(bgra, width, height) {
++                return self.encode_glyph_hit(hit_index);
++            }
++        }
++
++        let segments = bgra_to_run_segments(bgra, pixel_count);
++        let residual_data = encode_residual_layer(&segments);
++
++        let mut flags = 0u8;
++        let glyph_index = if use_glyph {
++            flags |= FLAG_GLYPH_INDEX;
++            let idx = self.next_glyph_index;
++            self.glyph_cache.store(
++                idx,
++                GlyphEntry {
++                    width,
++                    height,
++                    pixels: bgra.to_vec(),
++                },
++            );
++            self.next_glyph_index = (idx + 1) % GLYPH_CACHE_WRAP;
++            Some(idx)
++        } else {
++            None
++        };
++
++        let seq = self.seq_number;
++        self.seq_number = seq.wrapping_add(1);
++
++        let mut out = Vec::with_capacity(2 + 2 + 12 + residual_data.len());
++        out.push(flags);
++        out.push(seq);
++
++        if let Some(idx) = glyph_index {
++            out.extend_from_slice(&idx.to_le_bytes());
++        }
++
++        let residual_len = u32::try_from(residual_data.len()).unwrap_or(u32::MAX);
++        out.extend_from_slice(&residual_len.to_le_bytes());
++        out.extend_from_slice(&0u32.to_le_bytes());
++        out.extend_from_slice(&0u32.to_le_bytes());
++        out.extend_from_slice(&residual_data);
++
++        out
++    }
++
++    /// Encode a cache reset message (`FLAG_CACHE_RESET`).
++    pub fn encode_cache_reset(&mut self) -> Vec<u8> {
++        let seq = self.seq_number;
++        self.seq_number = seq.wrapping_add(1);
++        vec![ironrdp_pdu::codecs::clearcodec::FLAG_CACHE_RESET, seq]
++    }
++
++    fn find_glyph_match(&self, bgra: &[u8], width: u16, height: u16) -> Option<(u16, &GlyphEntry)> {
++        for idx in 0..GLYPH_CACHE_WRAP {
++            if let Some(entry) = self.glyph_cache.get(idx) {
++                if entry.width == width && entry.height == height && entry.pixels == bgra {
++                    return Some((idx, entry));
++                }
++            }
++        }
++        None
++    }
++
++    fn encode_glyph_hit(&mut self, index: u16) -> Vec<u8> {
++        let seq = self.seq_number;
++        self.seq_number = seq.wrapping_add(1);
++
++        let flags = FLAG_GLYPH_INDEX | ironrdp_pdu::codecs::clearcodec::FLAG_GLYPH_HIT;
++        let mut out = Vec::with_capacity(4);
++        out.push(flags);
++        out.push(seq);
++        out.extend_from_slice(&index.to_le_bytes());
++        out
++    }
++}
++
++impl Default for ClearCodecEncoder {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++/// Convert BGRA pixels to BGR run-length segments.
++fn bgra_to_run_segments(bgra: &[u8], pixel_count: usize) -> Vec<RgbRunSegment> {
++    if pixel_count == 0 {
++        return Vec::new();
++    }
++
++    let available_pixels = bgra.len() / 4;
++    let pixel_count = pixel_count.min(available_pixels);
++
++    let mut segments = Vec::new();
++    let mut i = 0;
++
++    while i < pixel_count {
++        let offset = i * 4;
++        if offset + 2 >= bgra.len() {
++            break;
++        }
++
++        let blue = bgra[offset];
++        let green = bgra[offset + 1];
++        let red = bgra[offset + 2];
++
++        let mut run_length = 1u32;
++        let mut j = i + 1;
++        while j < pixel_count {
++            let jo = j * 4;
++            if jo + 2 >= bgra.len() {
++                break;
++            }
++            if bgra[jo] == blue && bgra[jo + 1] == green && bgra[jo + 2] == red {
++                run_length += 1;
++                j += 1;
++            } else {
++                break;
++            }
++        }
++
++        segments.push(RgbRunSegment {
++            blue,
++            green,
++            red,
++            run_length,
++        });
++        i = j;
++    }
++
++    segments
++}
++
++#[cfg(test)]
++mod tests {
++    use ironrdp_pdu::codecs::clearcodec::{FLAG_CACHE_RESET, FLAG_GLYPH_HIT};
++
++    use super::*;
++
++    fn make_residual_only_stream(width: u16, height: u16, blue: u8, green: u8, red: u8) -> Vec<u8> {
++        let pixel_count = u32::from(width) * u32::from(height);
++        let mut data = Vec::new();
++
++        data.push(0x00);
++        data.push(0x00);
++
++        let residual = if pixel_count < 0xFF {
++            vec![blue, green, red, u8::try_from(pixel_count).unwrap()]
++        } else if pixel_count < 0xFFFF {
++            let mut v = vec![blue, green, red, 0xFF];
++            v.extend_from_slice(&u16::try_from(pixel_count).unwrap().to_le_bytes());
++            v
++        } else {
++            let mut v = vec![blue, green, red, 0xFF, 0xFF, 0xFF];
++            v.extend_from_slice(&pixel_count.to_le_bytes());
++            v
++        };
++        let residual_len = u32::try_from(residual.len()).unwrap();
++
++        data.extend_from_slice(&residual_len.to_le_bytes());
++        data.extend_from_slice(&0u32.to_le_bytes());
++        data.extend_from_slice(&0u32.to_le_bytes());
++        data.extend_from_slice(&residual);
++
++        data
++    }
++
++    #[test]
++    fn decode_solid_red_4x4() {
++        let mut decoder = ClearCodecDecoder::new();
++        let stream = make_residual_only_stream(4, 4, 0x00, 0x00, 0xFF);
++        let pixels = decoder.decode(&stream, 4, 4).unwrap();
++        assert_eq!(pixels.len(), 4 * 4 * 4);
++        assert_eq!(pixels[0], 0x00);
++        assert_eq!(pixels[1], 0x00);
++        assert_eq!(pixels[2], 0xFF);
++        assert_eq!(pixels[3], 0xFF);
++    }
++
++    #[test]
++    fn glyph_cache_round_trip() {
++        let mut decoder = ClearCodecDecoder::new();
++
++        let mut stream = Vec::new();
++        stream.push(FLAG_GLYPH_INDEX);
++        stream.push(0x00);
++        stream.extend_from_slice(&42u16.to_le_bytes());
++        let residual = [0xFF, 0xFF, 0xFF, 0x01];
++        stream.extend_from_slice(&4u32.to_le_bytes());
++        stream.extend_from_slice(&0u32.to_le_bytes());
++        stream.extend_from_slice(&0u32.to_le_bytes());
++        stream.extend_from_slice(&residual);
++
++        let pixels1 = decoder.decode(&stream, 1, 1).unwrap();
++        assert_eq!(pixels1.len(), 4);
++
++        let mut hit_stream = Vec::new();
++        hit_stream.push(FLAG_GLYPH_INDEX | FLAG_GLYPH_HIT);
++        hit_stream.push(0x01);
++        hit_stream.extend_from_slice(&42u16.to_le_bytes());
++
++        let pixels2 = decoder.decode(&hit_stream, 1, 1).unwrap();
++        assert_eq!(pixels1, pixels2);
++    }
++
++    #[test]
++    fn raw_subcodec_decode() {
++        let mut decoder = ClearCodecDecoder::new();
++        let mut stream = Vec::new();
++        stream.push(0x00);
++        stream.push(0x00);
++
++        let mut subcodec_data = Vec::new();
++        subcodec_data.extend_from_slice(&0u16.to_le_bytes());
++        subcodec_data.extend_from_slice(&0u16.to_le_bytes());
++        subcodec_data.extend_from_slice(&2u16.to_le_bytes());
++        subcodec_data.extend_from_slice(&1u16.to_le_bytes());
++        subcodec_data.extend_from_slice(&6u32.to_le_bytes());
++        subcodec_data.push(0x00);
++        subcodec_data.extend_from_slice(&[0x00, 0x00, 0xFF]);
++        subcodec_data.extend_from_slice(&[0xFF, 0x00, 0x00]);
++
++        let subcodec_len = u32::try_from(subcodec_data.len()).unwrap();
++        stream.extend_from_slice(&0u32.to_le_bytes());
++        stream.extend_from_slice(&0u32.to_le_bytes());
++        stream.extend_from_slice(&subcodec_len.to_le_bytes());
++        stream.extend_from_slice(&subcodec_data);
++
++        let pixels = decoder.decode(&stream, 2, 1).unwrap();
++        assert_eq!(pixels.len(), 2 * 4);
++        assert_eq!(&pixels[0..4], &[0x00, 0x00, 0xFF, 0xFF]);
++        assert_eq!(&pixels[4..8], &[0xFF, 0x00, 0x00, 0xFF]);
++    }
++
++    #[test]
++    fn encode_solid_color_round_trip() {
++        let mut enc = ClearCodecEncoder::new();
++        let mut dec = ClearCodecDecoder::new();
++
++        let bgra: Vec<u8> = (0..16).flat_map(|_| [0x00, 0x00, 0xFF, 0xFF]).collect();
++
++        let wire = enc.encode(&bgra, 4, 4);
++        let result = dec.decode(&wire, 4, 4).unwrap();
++
++        assert_eq!(result, bgra);
++    }
++
++    #[test]
++    fn encode_glyph_cache_hit() {
++        let mut encoder = ClearCodecEncoder::new();
++        let bgra = vec![0xFF, 0x00, 0x00, 0xFF];
++
++        let first = encoder.encode(&bgra, 1, 1);
++        let second = encoder.encode(&bgra, 1, 1);
++        assert!(second.len() < first.len());
++
++        let mut decoder = ClearCodecDecoder::new();
++        let p1 = decoder.decode(&first, 1, 1).unwrap();
++        let p2 = decoder.decode(&second, 1, 1).unwrap();
++        assert_eq!(p1, p2);
++        assert_eq!(p1, bgra);
++    }
++
++    #[test]
++    fn encode_cache_reset() {
++        let mut encoder = ClearCodecEncoder::new();
++        let reset = encoder.encode_cache_reset();
++        assert_eq!(reset[0], FLAG_CACHE_RESET);
++    }
++}
+diff --git a/crates/ironrdp-graphics/src/clearcodec/vbar_cache.rs b/crates/ironrdp-graphics/src/clearcodec/vbar_cache.rs
+new file mode 100644
+index 0000000..8b74a6b
+--- /dev/null
++++ b/crates/ironrdp-graphics/src/clearcodec/vbar_cache.rs
+@@ -0,0 +1,149 @@
++//! V-Bar caching for ClearCodec bands layer.
++
++use ironrdp_pdu::codecs::clearcodec::{SHORT_VBAR_CACHE_SIZE, VBAR_CACHE_SIZE};
++
++const VBAR_WRAP: u16 = 32_768;
++const SHORT_VBAR_WRAP: u16 = 16_384;
++
++/// A full V-bar: column of BGR pixels for the full band height.
++#[derive(Debug, Clone)]
++pub struct FullVBar {
++    /// BGR pixel data, length = band_height * 3.
++    pub pixels: Vec<u8>,
++}
++
++/// A short V-bar: only the non-background pixels within a column.
++#[derive(Debug, Clone)]
++pub struct ShortVBar {
++    /// First row index where pixel data starts.
++    pub y_on: u8,
++    /// Number of pixel rows with color data.
++    pub pixel_count: u8,
++    /// BGR pixel data, length = pixel_count * 3.
++    pub pixels: Vec<u8>,
++}
++
++/// Combined V-bar cache state.
++pub struct VBarCache {
++    vbar_storage: Vec<Option<FullVBar>>,
++    short_vbar_storage: Vec<Option<ShortVBar>>,
++    vbar_cursor: u16,
++    short_vbar_cursor: u16,
++}
++
++impl VBarCache {
++    pub fn new() -> Self {
++        let mut vbar_storage = Vec::with_capacity(VBAR_CACHE_SIZE);
++        vbar_storage.resize_with(VBAR_CACHE_SIZE, || None);
++
++        let mut short_vbar_storage = Vec::with_capacity(SHORT_VBAR_CACHE_SIZE);
++        short_vbar_storage.resize_with(SHORT_VBAR_CACHE_SIZE, || None);
++
++        Self {
++            vbar_storage,
++            short_vbar_storage,
++            vbar_cursor: 0,
++            short_vbar_cursor: 0,
++        }
++    }
++
++    /// Reset both cache write cursors when `FLAG_CACHE_RESET` is received.
++    pub fn reset(&mut self) {
++        self.vbar_cursor = 0;
++        self.short_vbar_cursor = 0;
++    }
++
++    /// Get a full V-bar from cache by index.
++    pub fn get_vbar(&self, index: u16) -> Option<&FullVBar> {
++        self.vbar_storage.get(usize::from(index)).and_then(|slot| slot.as_ref())
++    }
++
++    /// Get a short V-bar from cache by index.
++    pub fn get_short_vbar(&self, index: u16) -> Option<&ShortVBar> {
++        self.short_vbar_storage
++            .get(usize::from(index))
++            .and_then(|slot| slot.as_ref())
++    }
++
++    /// Store a short V-bar and return its cache index.
++    pub fn store_short_vbar(&mut self, short_vbar: ShortVBar) -> u16 {
++        let index = self.short_vbar_cursor;
++        self.short_vbar_storage[usize::from(index)] = Some(short_vbar);
++        self.short_vbar_cursor = (index + 1) % SHORT_VBAR_WRAP;
++        index
++    }
++
++    /// Store a full V-bar and return its cache index.
++    pub fn store_vbar(&mut self, vbar: FullVBar) -> u16 {
++        let index = self.vbar_cursor;
++        self.vbar_storage[usize::from(index)] = Some(vbar);
++        self.vbar_cursor = (index + 1) % VBAR_WRAP;
++        index
++    }
++
++    /// Reconstruct a full V-bar from a short V-bar and background color.
++    pub fn reconstruct_full_vbar(
++        short_vbar: &ShortVBar,
++        band_height: u16,
++        bg_blue: u8,
++        bg_green: u8,
++        bg_red: u8,
++    ) -> FullVBar {
++        let height = usize::from(band_height);
++        let mut pixels = Vec::with_capacity(height * 3);
++
++        for _ in 0..usize::from(short_vbar.y_on) {
++            pixels.push(bg_blue);
++            pixels.push(bg_green);
++            pixels.push(bg_red);
++        }
++
++        pixels.extend_from_slice(&short_vbar.pixels);
++
++        let bottom_start = usize::from(short_vbar.y_on) + usize::from(short_vbar.pixel_count);
++        for _ in bottom_start..height {
++            pixels.push(bg_blue);
++            pixels.push(bg_green);
++            pixels.push(bg_red);
++        }
++
++        FullVBar { pixels }
++    }
++}
++
++impl Default for VBarCache {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn store_and_retrieve_vbar() {
++        let mut cache = VBarCache::new();
++        let vbar = FullVBar {
++            pixels: vec![0xFF, 0x00, 0x00],
++        };
++        let idx = cache.store_vbar(vbar);
++        assert_eq!(idx, 0);
++        let retrieved = cache.get_vbar(0).unwrap();
++        assert_eq!(retrieved.pixels, vec![0xFF, 0x00, 0x00]);
++    }
++
++    #[test]
++    fn reconstruct_full_vbar() {
++        let short = ShortVBar {
++            y_on: 1,
++            pixel_count: 2,
++            pixels: vec![0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00],
++        };
++        let full = VBarCache::reconstruct_full_vbar(&short, 4, 0xAA, 0xBB, 0xCC);
++        assert_eq!(full.pixels.len(), 12);
++        assert_eq!(&full.pixels[0..3], &[0xAA, 0xBB, 0xCC]);
++        assert_eq!(&full.pixels[3..9], &[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00]);
++        assert_eq!(&full.pixels[9..12], &[0xAA, 0xBB, 0xCC]);
++    }
++}
+diff --git a/crates/ironrdp-graphics/src/color_conversion.rs b/crates/ironrdp-graphics/src/color_conversion.rs
+index 9da9e95..2ec929b 100644
+--- a/crates/ironrdp-graphics/src/color_conversion.rs
++++ b/crates/ironrdp-graphics/src/color_conversion.rs
+@@ -1,8 +1,8 @@
+ use std::io;
+ 
+ use yuv::{
+-    BufferStoreMut, YuvError, YuvPlanarImage, YuvPlanarImageMut, rdp_abgr_to_yuv444, rdp_argb_to_yuv444,
+-    rdp_bgra_to_yuv444, rdp_rgba_to_yuv444, rdp_yuv444_to_argb, rdp_yuv444_to_rgba,
++    rdp_abgr_to_yuv444, rdp_argb_to_yuv444, rdp_bgra_to_yuv444, rdp_rgba_to_yuv444, rdp_yuv444_to_argb,
++    rdp_yuv444_to_rgba, BufferStoreMut, YuvError, YuvPlanarImage, YuvPlanarImageMut,
+ };
+ 
+ use crate::image_processing::PixelFormat;
+diff --git a/crates/ironrdp-graphics/src/lib.rs b/crates/ironrdp-graphics/src/lib.rs
+index 02d4104..47380ec 100644
+--- a/crates/ironrdp-graphics/src/lib.rs
++++ b/crates/ironrdp-graphics/src/lib.rs
+@@ -2,6 +2,7 @@
+ #![doc(html_logo_url = "https://cdnweb.devolutions.net/images/projects/devolutions/logos/devolutions-icon-shadow.svg")]
+ #![allow(clippy::arithmetic_side_effects)] // FIXME: remove
+ 
++pub mod clearcodec;
+ pub mod color_conversion;
+ pub mod diff;
+ pub mod dwt;
+diff --git a/crates/ironrdp-graphics/src/rdp6/bitmap_stream/decoder.rs b/crates/ironrdp-graphics/src/rdp6/bitmap_stream/decoder.rs
+index 78b511b..d5f07b6 100644
+--- a/crates/ironrdp-graphics/src/rdp6/bitmap_stream/decoder.rs
++++ b/crates/ironrdp-graphics/src/rdp6/bitmap_stream/decoder.rs
+@@ -1,8 +1,8 @@
+-use ironrdp_core::{DecodeError, decode};
++use ironrdp_core::{decode, DecodeError};
+ use ironrdp_pdu::bitmap::rdp6::{BitmapStream as BitmapStreamPdu, ColorPlaneDefinition};
+ 
+ use crate::color_conversion::Rgb;
+-use crate::rdp6::rle::{RleDecodeError, decompress_8bpp_plane};
++use crate::rdp6::rle::{decompress_8bpp_plane, RleDecodeError};
+ 
+ #[derive(Debug)]
+ pub enum BitmapDecodeError {
+diff --git a/crates/ironrdp-graphics/src/rdp6/bitmap_stream/encoder.rs b/crates/ironrdp-graphics/src/rdp6/bitmap_stream/encoder.rs
+index 3887d14..0cf4de2 100644
+--- a/crates/ironrdp-graphics/src/rdp6/bitmap_stream/encoder.rs
++++ b/crates/ironrdp-graphics/src/rdp6/bitmap_stream/encoder.rs
+@@ -1,7 +1,7 @@
+-use ironrdp_core::{EncodeError, WriteCursor, not_enough_bytes_err};
++use ironrdp_core::{not_enough_bytes_err, EncodeError, WriteCursor};
+ use ironrdp_pdu::bitmap::rdp6::{BitmapStreamHeader, ColorPlaneDefinition};
+ 
+-use crate::rdp6::rle::{RleEncodeError, compress_8bpp_plane};
++use crate::rdp6::rle::{compress_8bpp_plane, RleEncodeError};
+ 
+ #[derive(Debug)]
+ pub enum BitmapEncodeError {
+diff --git a/crates/ironrdp-graphics/src/rlgr.rs b/crates/ironrdp-graphics/src/rlgr.rs
+index 42a8a09..93d57d4 100644
+--- a/crates/ironrdp-graphics/src/rlgr.rs
++++ b/crates/ironrdp-graphics/src/rlgr.rs
+@@ -280,7 +280,11 @@ fn fill(buffer: &mut [i16], value: i16) {
+ }
+ 
+ fn load_be_u32(s: &BitSlice<u8, Msb0>) -> u32 {
+-    if s.is_empty() { 0 } else { s.load_be::<u32>() }
++    if s.is_empty() {
++        0
++    } else {
++        s.load_be::<u32>()
++    }
+ }
+ 
+ // Returns number of truncated bits
+@@ -380,7 +384,11 @@ enum CompressionMode {
+ 
+ impl From<u32> for CompressionMode {
+     fn from(m: u32) -> Self {
+-        if m != 0 { Self::RunLength } else { Self::GolombRice }
++        if m != 0 {
++            Self::RunLength
++        } else {
++            Self::GolombRice
++        }
+     }
+ }
+ 
+diff --git a/crates/ironrdp-graphics/src/zgfx/api.rs b/crates/ironrdp-graphics/src/zgfx/api.rs
+index eb6f446..66db743 100644
+--- a/crates/ironrdp-graphics/src/zgfx/api.rs
++++ b/crates/ironrdp-graphics/src/zgfx/api.rs
+@@ -1,8 +1,8 @@
+ //! High-level ZGFX compression API for EGFX PDU preparation.
+ 
+-use super::ZgfxError;
+ use super::compressor::Compressor;
+-use super::wrapper::{ZGFX_SEGMENTED_MAXSIZE, wrap_compressed, wrap_uncompressed};
++use super::wrapper::{wrap_compressed, wrap_uncompressed, ZGFX_SEGMENTED_MAXSIZE};
++use super::ZgfxError;
+ 
+ /// Controls whether ZGFX compression is applied.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+diff --git a/crates/ironrdp-graphics/src/zgfx/compressor.rs b/crates/ironrdp-graphics/src/zgfx/compressor.rs
+index 9b793c6..1d1bceb 100644
+--- a/crates/ironrdp-graphics/src/zgfx/compressor.rs
++++ b/crates/ironrdp-graphics/src/zgfx/compressor.rs
+@@ -11,7 +11,7 @@ use std::collections::HashMap;
+ 
+ use bitvec::prelude::*;
+ 
+-use super::{HISTORY_SIZE, TOKEN_TABLE, ZgfxError};
++use super::{ZgfxError, HISTORY_SIZE, TOKEN_TABLE};
+ const MIN_MATCH_LENGTH: usize = 3;
+ const MAX_MATCH_LENGTH: usize = 65535;
+ /// Maximum back-reference distance (last token in MS-RDPEGFX table)
+diff --git a/crates/ironrdp-graphics/src/zgfx/mod.rs b/crates/ironrdp-graphics/src/zgfx/mod.rs
+index 8de349e..45610d5 100644
+--- a/crates/ironrdp-graphics/src/zgfx/mod.rs
++++ b/crates/ironrdp-graphics/src/zgfx/mod.rs
+@@ -9,7 +9,7 @@ mod wrapper;
+ use std::io::{self, Write as _};
+ use std::sync::LazyLock;
+ 
+-pub use api::{CompressionMode, compress_and_wrap_egfx};
++pub use api::{compress_and_wrap_egfx, CompressionMode};
+ use bitvec::bits;
+ use bitvec::field::BitField as _;
+ use bitvec::order::Msb0;
+diff --git a/crates/ironrdp-pdu/src/codecs/clearcodec/bands.rs b/crates/ironrdp-pdu/src/codecs/clearcodec/bands.rs
+new file mode 100644
+index 0000000..ae6fad0
+--- /dev/null
++++ b/crates/ironrdp-pdu/src/codecs/clearcodec/bands.rs
+@@ -0,0 +1,219 @@
++//! ClearCodec Layer 2: Bands (V-Bar Cached Columns) ([MS-RDPEGFX] 2.2.4.1.1.2).
++
++use ironrdp_core::{ensure_size, invalid_field_err, DecodeResult, ReadCursor};
++
++/// Maximum band height per the spec.
++pub const MAX_BAND_HEIGHT: u16 = 52;
++
++/// Number of entries in the full V-bar storage.
++pub const VBAR_CACHE_SIZE: usize = 32_768;
++
++/// Number of entries in the short V-bar storage.
++pub const SHORT_VBAR_CACHE_SIZE: usize = 16_384;
++
++/// A decoded band structure.
++#[derive(Debug, Clone)]
++pub struct Band<'a> {
++    pub x_start: u16,
++    pub x_end: u16,
++    pub y_start: u16,
++    pub y_end: u16,
++    /// Background color (BGR).
++    pub blue_bkg: u8,
++    pub green_bkg: u8,
++    pub red_bkg: u8,
++    /// One V-bar per column from x_start to x_end (inclusive).
++    pub vbars: Vec<VBar<'a>>,
++}
++
++impl Band<'_> {
++    const NAME: &'static str = "ClearCodecBand";
++    const HEADER_SIZE: usize = 11;
++}
++
++/// A V-bar reference within a band.
++#[derive(Debug, Clone)]
++pub enum VBar<'a> {
++    /// Full V-bar cache hit. Index into V-Bar Storage (0..32767).
++    CacheHit { index: u16 },
++    /// Short V-bar cache hit. Index into Short V-Bar Storage (0..16383)
++    /// plus a `yOn` offset byte for vertical positioning.
++    ShortCacheHit { index: u16, y_on: u8 },
++    /// Short V-bar cache miss. Contains inline pixel data.
++    ShortCacheMiss(ShortVBarCacheMiss<'a>),
++}
++
++/// Inline short V-bar data from a cache miss.
++#[derive(Debug, Clone)]
++pub struct ShortVBarCacheMiss<'a> {
++    /// First pixel row within the band where color data starts.
++    pub y_on: u8,
++    /// Number of pixel rows with color data (`shortVBarYOff - shortVBarYOn`).
++    pub y_off_delta: u8,
++    /// Raw BGR pixel data: `y_off_delta * 3` bytes.
++    pub pixel_data: &'a [u8],
++}
++
++/// Decode all bands from the bands layer data.
++pub fn decode_bands_layer<'a>(data: &'a [u8]) -> DecodeResult<Vec<Band<'a>>> {
++    let mut bands = Vec::new();
++    let mut src = ReadCursor::new(data);
++
++    while src.len() >= Band::HEADER_SIZE {
++        let band = decode_single_band(&mut src)?;
++        bands.push(band);
++    }
++
++    Ok(bands)
++}
++
++fn decode_single_band<'a>(src: &mut ReadCursor<'a>) -> DecodeResult<Band<'a>> {
++    ensure_size!(ctx: Band::NAME, in: src, size: Band::HEADER_SIZE);
++
++    let x_start = src.read_u16();
++    let x_end = src.read_u16();
++    let y_start = src.read_u16();
++    let y_end = src.read_u16();
++    let blue_bkg = src.read_u8();
++    let green_bkg = src.read_u8();
++    let red_bkg = src.read_u8();
++
++    let height = y_end
++        .checked_sub(y_start)
++        .and_then(|h| h.checked_add(1))
++        .ok_or_else(|| invalid_field_err!("yEnd", "yEnd < yStart"))?;
++
++    if height > MAX_BAND_HEIGHT {
++        return Err(invalid_field_err!("bandHeight", "band height exceeds 52"));
++    }
++
++    if x_end < x_start {
++        return Err(invalid_field_err!("xEnd", "xEnd < xStart"));
++    }
++
++    let column_count = usize::from(x_end - x_start) + 1;
++    let mut vbars = Vec::with_capacity(column_count);
++
++    for _ in 0..column_count {
++        let vbar = decode_vbar(src, height)?;
++        vbars.push(vbar);
++    }
++
++    Ok(Band {
++        x_start,
++        x_end,
++        y_start,
++        y_end,
++        blue_bkg,
++        green_bkg,
++        red_bkg,
++        vbars,
++    })
++}
++
++fn decode_vbar<'a>(src: &mut ReadCursor<'a>, band_height: u16) -> DecodeResult<VBar<'a>> {
++    ensure_size!(ctx: "VBar", in: src, size: 2);
++    let first_word = src.read_u16();
++
++    if first_word & 0x8000 != 0 {
++        let index = first_word & 0x7FFF;
++        return Ok(VBar::CacheHit { index });
++    }
++
++    if first_word & 0x4000 != 0 {
++        let index = first_word & 0x3FFF;
++        ensure_size!(ctx: "ShortVBarCacheHit", in: src, size: 1);
++        let y_on = src.read_u8();
++        return Ok(VBar::ShortCacheHit { index, y_on });
++    }
++
++    // SHORT_VBAR_CACHE_MISS: yOn(8 bits), yOff(6 bits), x(2 bits).
++    let y_on = u8::try_from(first_word & 0x00FF).expect("masked to 8 bits, always fits in u8");
++    let y_off = u8::try_from((first_word >> 8) & 0x3F).expect("masked to 6 bits, always fits in u8");
++
++    if y_off < y_on {
++        return Err(invalid_field_err!("shortVBarCacheMiss", "shortVBarYOff < shortVBarYOn"));
++    }
++
++    if u16::from(y_off) > band_height {
++        return Err(invalid_field_err!(
++            "shortVBarCacheMiss",
++            "shortVBarYOff exceeds band height"
++        ));
++    }
++
++    let pixel_count = y_off - y_on;
++    let pixel_byte_count = usize::from(pixel_count) * 3;
++    ensure_size!(ctx: "ShortVBarCacheMiss", in: src, size: pixel_byte_count);
++    let pixel_data = src.read_slice(pixel_byte_count);
++
++    Ok(VBar::ShortCacheMiss(ShortVBarCacheMiss {
++        y_on,
++        y_off_delta: pixel_count,
++        pixel_data,
++    }))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn decode_vbar_cache_hit() {
++        let data = (0x8000u16 | 42).to_le_bytes();
++        let mut cursor = ReadCursor::new(&data);
++        let vbar = decode_vbar(&mut cursor, 10).unwrap();
++        match vbar {
++            VBar::CacheHit { index } => assert_eq!(index, 42),
++            _ => panic!("expected CacheHit"),
++        }
++    }
++
++    #[test]
++    fn decode_vbar_short_cache_hit() {
++        let mut data = Vec::new();
++        data.extend_from_slice(&(0x4000u16 | 100).to_le_bytes());
++        data.push(5);
++        let mut cursor = ReadCursor::new(&data);
++        let vbar = decode_vbar(&mut cursor, 10).unwrap();
++        match vbar {
++            VBar::ShortCacheHit { index, y_on } => {
++                assert_eq!(index, 100);
++                assert_eq!(y_on, 5);
++            }
++            _ => panic!("expected ShortCacheHit"),
++        }
++    }
++
++    #[test]
++    fn decode_vbar_short_cache_miss() {
++        let y_on: u16 = 2;
++        let y_off: u16 = 5;
++        let first_word = y_on | (y_off << 8);
++        let mut data = Vec::new();
++        data.extend_from_slice(&first_word.to_le_bytes());
++        data.extend_from_slice(&[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF]);
++        let mut cursor = ReadCursor::new(&data);
++        let vbar = decode_vbar(&mut cursor, 10).unwrap();
++        match vbar {
++            VBar::ShortCacheMiss(miss) => {
++                assert_eq!(miss.y_on, 2);
++                assert_eq!(miss.y_off_delta, 3);
++                assert_eq!(miss.pixel_data.len(), 9);
++            }
++            _ => panic!("expected ShortCacheMiss"),
++        }
++    }
++
++    #[test]
++    fn decode_band_validates_height() {
++        let mut data = Vec::new();
++        data.extend_from_slice(&0u16.to_le_bytes());
++        data.extend_from_slice(&0u16.to_le_bytes());
++        data.extend_from_slice(&0u16.to_le_bytes());
++        data.extend_from_slice(&52u16.to_le_bytes());
++        data.extend_from_slice(&[0, 0, 0]);
++        let result = decode_bands_layer(&data);
++        assert!(result.is_err());
++    }
++}
+diff --git a/crates/ironrdp-pdu/src/codecs/clearcodec/mod.rs b/crates/ironrdp-pdu/src/codecs/clearcodec/mod.rs
+new file mode 100644
+index 0000000..61d71b6
+--- /dev/null
++++ b/crates/ironrdp-pdu/src/codecs/clearcodec/mod.rs
+@@ -0,0 +1,191 @@
++//! ClearCodec bitmap compression codec (MS-RDPEGFX 2.2.4.1).
++//!
++//! ClearCodec is a mandatory lossless codec for all EGFX versions (V8-V10.7).
++//! It uses a three-layer composite architecture: residual (BGR RLE), bands
++//! (V-bar cached columns), and subcodec (raw / NSCodec / RLEX).
++//!
++//! The codec is transported inside `WireToSurface1Pdu` with `codecId = 0x0008`.
++
++mod bands;
++mod residual;
++mod rlex;
++mod subcodec;
++
++use ironrdp_core::{cast_length, ensure_size, invalid_field_err, DecodeResult, ReadCursor};
++
++pub use self::bands::{
++    decode_bands_layer, Band, ShortVBarCacheMiss, VBar, MAX_BAND_HEIGHT, SHORT_VBAR_CACHE_SIZE, VBAR_CACHE_SIZE,
++};
++pub use self::residual::{decode_residual_layer, encode_residual_layer, RgbRunSegment};
++pub use self::rlex::{decode_rlex, RlexData, RlexSegment, MAX_PALETTE_COUNT};
++pub use self::subcodec::{decode_subcodec_layer, Subcodec, SubcodecId};
++
++/// `glyphIndex` field is present (bitmap area <= 1024 pixels).
++pub const FLAG_GLYPH_INDEX: u8 = 0x01;
++/// Use cached glyph at `glyphIndex`; no composite payload follows.
++pub const FLAG_GLYPH_HIT: u8 = 0x02;
++/// Reset V-Bar and Short V-Bar storage cursors to 0.
++pub const FLAG_CACHE_RESET: u8 = 0x04;
++
++/// Decoded ClearCodec bitmap stream ([MS-RDPEGFX] 2.2.4.1).
++#[derive(Debug, Clone)]
++pub struct ClearCodecBitmapStream<'a> {
++    /// Combination of `FLAG_GLYPH_INDEX`, `FLAG_GLYPH_HIT`, `FLAG_CACHE_RESET`.
++    pub flags: u8,
++    /// Sequence number (wraps 0xFF -> 0x00).
++    pub seq_number: u8,
++    /// Glyph cache index, present when `FLAG_GLYPH_INDEX` is set.
++    pub glyph_index: Option<u16>,
++    /// Composite payload (three layers), absent when `FLAG_GLYPH_HIT` is set.
++    pub composite: Option<CompositePayload<'a>>,
++}
++
++impl<'a> ClearCodecBitmapStream<'a> {
++    const NAME: &'static str = "ClearCodecBitmapStream";
++
++    /// Decode the complete bitmap stream from raw bytes.
++    pub fn decode(src: &mut ReadCursor<'a>) -> DecodeResult<Self> {
++        ensure_size!(ctx: Self::NAME, in: src, size: 2);
++        let flags = src.read_u8();
++        let seq_number = src.read_u8();
++
++        let glyph_index = if flags & FLAG_GLYPH_INDEX != 0 {
++            ensure_size!(ctx: Self::NAME, in: src, size: 2);
++            Some(src.read_u16())
++        } else {
++            None
++        };
++
++        // GLYPH_HIT means use cached glyph; no payload follows.
++        let composite = if flags & FLAG_GLYPH_HIT != 0 {
++            None
++        } else if src.is_empty() {
++            // No composite payload (valid for cache reset only messages).
++            None
++        } else {
++            Some(CompositePayload::decode(src)?)
++        };
++
++        Ok(Self {
++            flags,
++            seq_number,
++            glyph_index,
++            composite,
++        })
++    }
++
++    pub fn has_glyph_index(&self) -> bool {
++        self.flags & FLAG_GLYPH_INDEX != 0
++    }
++
++    pub fn is_glyph_hit(&self) -> bool {
++        self.flags & FLAG_GLYPH_HIT != 0
++    }
++
++    pub fn is_cache_reset(&self) -> bool {
++        self.flags & FLAG_CACHE_RESET != 0
++    }
++}
++
++/// The three-layer composite payload ([MS-RDPEGFX] 2.2.4.1.1).
++///
++/// Layers are applied in order: residual -> bands -> subcodec.
++/// Each layer composites on top of the previous result.
++#[derive(Debug, Clone)]
++pub struct CompositePayload<'a> {
++    /// Raw bytes for the residual (BGR RLE) layer.
++    pub residual_data: &'a [u8],
++    /// Raw bytes for the bands (V-bar cached columns) layer.
++    pub bands_data: &'a [u8],
++    /// Raw bytes for the subcodec layer.
++    pub subcodec_data: &'a [u8],
++}
++
++impl<'a> CompositePayload<'a> {
++    const NAME: &'static str = "CompositePayload";
++    const HEADER_SIZE: usize = 12;
++
++    pub fn decode(src: &mut ReadCursor<'a>) -> DecodeResult<Self> {
++        ensure_size!(ctx: Self::NAME, in: src, size: Self::HEADER_SIZE);
++
++        let residual_byte_count: usize = cast_length!("residualByteCount", src.read_u32())?;
++        let bands_byte_count: usize = cast_length!("bandsByteCount", src.read_u32())?;
++        let subcodec_byte_count: usize = cast_length!("subcodecByteCount", src.read_u32())?;
++
++        let total = residual_byte_count
++            .checked_add(bands_byte_count)
++            .and_then(|s| s.checked_add(subcodec_byte_count))
++            .ok_or_else(|| invalid_field_err!("byteCount", "layer byte counts overflow"))?;
++
++        ensure_size!(ctx: Self::NAME, in: src, size: total);
++
++        let residual_data = src.read_slice(residual_byte_count);
++        let bands_data = src.read_slice(bands_byte_count);
++        let subcodec_data = src.read_slice(subcodec_byte_count);
++
++        Ok(Self {
++            residual_data,
++            bands_data,
++            subcodec_data,
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn decode_glyph_hit() {
++        let data = [0x03, 0x05, 0x42, 0x00];
++        let mut cursor = ReadCursor::new(&data);
++        let stream = ClearCodecBitmapStream::decode(&mut cursor).unwrap();
++        assert!(stream.has_glyph_index());
++        assert!(stream.is_glyph_hit());
++        assert!(!stream.is_cache_reset());
++        assert_eq!(stream.seq_number, 5);
++        assert_eq!(stream.glyph_index, Some(0x0042));
++        assert!(stream.composite.is_none());
++    }
++
++    #[test]
++    fn decode_cache_reset_only() {
++        let data = [0x04, 0x00];
++        let mut cursor = ReadCursor::new(&data);
++        let stream = ClearCodecBitmapStream::decode(&mut cursor).unwrap();
++        assert!(stream.is_cache_reset());
++        assert!(!stream.has_glyph_index());
++        assert!(stream.composite.is_none());
++    }
++
++    #[test]
++    fn decode_composite_payload_empty_layers() {
++        let data = [
++            0x00, 0x01, // flags, seq
++            0x00, 0x00, 0x00, 0x00, // residualByteCount
++            0x00, 0x00, 0x00, 0x00, // bandsByteCount
++            0x00, 0x00, 0x00, 0x00, // subcodecByteCount
++        ];
++        let mut cursor = ReadCursor::new(&data);
++        let stream = ClearCodecBitmapStream::decode(&mut cursor).unwrap();
++        let composite = stream.composite.unwrap();
++        assert!(composite.residual_data.is_empty());
++        assert!(composite.bands_data.is_empty());
++        assert!(composite.subcodec_data.is_empty());
++    }
++
++    #[test]
++    fn decode_composite_with_residual_data() {
++        let data = [
++            0x00, 0x02, // flags, seq
++            0x04, 0x00, 0x00, 0x00, // residualByteCount
++            0x00, 0x00, 0x00, 0x00, // bandsByteCount
++            0x00, 0x00, 0x00, 0x00, // subcodecByteCount
++            0xFF, 0x00, 0x00, 0x01,
++        ];
++        let mut cursor = ReadCursor::new(&data);
++        let stream = ClearCodecBitmapStream::decode(&mut cursor).unwrap();
++        let composite = stream.composite.unwrap();
++        assert_eq!(composite.residual_data, &[0xFF, 0x00, 0x00, 0x01]);
++    }
++}
+diff --git a/crates/ironrdp-pdu/src/codecs/clearcodec/residual.rs b/crates/ironrdp-pdu/src/codecs/clearcodec/residual.rs
+new file mode 100644
+index 0000000..99cbcaa
+--- /dev/null
++++ b/crates/ironrdp-pdu/src/codecs/clearcodec/residual.rs
+@@ -0,0 +1,127 @@
++//! ClearCodec Layer 1: Residual (BGR RLE) ([MS-RDPEGFX] 2.2.4.1.1.1).
++
++use ironrdp_core::{ensure_size, DecodeResult, ReadCursor};
++
++/// A single BGR run-length segment.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct RgbRunSegment {
++    pub blue: u8,
++    pub green: u8,
++    pub red: u8,
++    pub run_length: u32,
++}
++
++impl RgbRunSegment {
++    const NAME: &'static str = "RgbRunSegment";
++    const MIN_SIZE: usize = 4;
++}
++
++/// Decode all residual run segments from the residual layer data.
++pub fn decode_residual_layer(data: &[u8]) -> DecodeResult<Vec<RgbRunSegment>> {
++    let mut segments = Vec::new();
++    let mut src = ReadCursor::new(data);
++
++    while src.len() >= RgbRunSegment::MIN_SIZE {
++        let blue = src.read_u8();
++        let green = src.read_u8();
++        let red = src.read_u8();
++        let factor1 = src.read_u8();
++
++        let run_length = if factor1 < 0xFF {
++            u32::from(factor1)
++        } else {
++            ensure_size!(ctx: RgbRunSegment::NAME, in: src, size: 2);
++            let factor2 = src.read_u16();
++            if factor2 < 0xFFFF {
++                u32::from(factor2)
++            } else {
++                ensure_size!(ctx: RgbRunSegment::NAME, in: src, size: 4);
++                src.read_u32()
++            }
++        };
++
++        segments.push(RgbRunSegment {
++            blue,
++            green,
++            red,
++            run_length,
++        });
++    }
++
++    Ok(segments)
++}
++
++/// Encode residual layer data from a sequence of BGR run segments.
++pub fn encode_residual_layer(segments: &[RgbRunSegment]) -> Vec<u8> {
++    let mut buf = Vec::with_capacity(segments.len() * 4);
++
++    for seg in segments {
++        buf.push(seg.blue);
++        buf.push(seg.green);
++        buf.push(seg.red);
++
++        if seg.run_length < 0xFF {
++            buf.push(u8::try_from(seg.run_length).expect("guarded by < 0xFF check"));
++        } else if seg.run_length < 0xFFFF {
++            buf.push(0xFF);
++            buf.extend_from_slice(
++                &u16::try_from(seg.run_length)
++                    .expect("guarded by < 0xFFFF check")
++                    .to_le_bytes(),
++            );
++        } else {
++            buf.push(0xFF);
++            buf.extend_from_slice(&0xFFFFu16.to_le_bytes());
++            buf.extend_from_slice(&seg.run_length.to_le_bytes());
++        }
++    }
++
++    buf
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn decode_single_short_run() {
++        let data = [0x10, 0x20, 0x30, 0x05];
++        let segments = decode_residual_layer(&data).unwrap();
++        assert_eq!(segments.len(), 1);
++        assert_eq!(
++            segments[0],
++            RgbRunSegment {
++                blue: 0x10,
++                green: 0x20,
++                red: 0x30,
++                run_length: 5
++            }
++        );
++    }
++
++    #[test]
++    fn decode_medium_run() {
++        let data = [0x00, 0x00, 0x00, 0xFF, 0x2C, 0x01];
++        let segments = decode_residual_layer(&data).unwrap();
++        assert_eq!(segments[0].run_length, 300);
++    }
++
++    #[test]
++    fn decode_long_run() {
++        let data = [0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x70, 0x11, 0x01, 0x00];
++        let segments = decode_residual_layer(&data).unwrap();
++        assert_eq!(segments[0].run_length, 70000);
++    }
++
++    #[test]
++    fn decode_multiple_segments() {
++        let data = [
++            0xFF, 0x00, 0x00, 0x03, // blue pixel, run=3
++            0x00, 0xFF, 0x00, 0x02, // green pixel, run=2
++        ];
++        let segments = decode_residual_layer(&data).unwrap();
++        assert_eq!(segments.len(), 2);
++        assert_eq!(segments[0].run_length, 3);
++        assert_eq!(segments[1].run_length, 2);
++    }
++}
+diff --git a/crates/ironrdp-pdu/src/codecs/clearcodec/rlex.rs b/crates/ironrdp-pdu/src/codecs/clearcodec/rlex.rs
+new file mode 100644
+index 0000000..f448aaa
+--- /dev/null
++++ b/crates/ironrdp-pdu/src/codecs/clearcodec/rlex.rs
+@@ -0,0 +1,189 @@
++//! ClearCodec RLEX subcodec ([MS-RDPEGFX] 2.2.4.1.1.3.1.3).
++
++use ironrdp_core::{ensure_size, invalid_field_err, DecodeResult, ReadCursor};
++
++/// Maximum palette size per spec.
++pub const MAX_PALETTE_COUNT: u8 = 127;
++
++/// A decoded RLEX segment (run + suite).
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct RlexSegment {
++    /// Palette index to repeat for the run portion.
++    pub start_index: u8,
++    /// Last palette index in the suite walk.
++    pub stop_index: u8,
++    /// Number of pixels in the run (repeated start color).
++    pub run_length: u32,
++}
++
++/// Decoded RLEX data: palette + segments.
++#[derive(Debug, Clone)]
++pub struct RlexData {
++    /// BGR palette entries (3 bytes each).
++    pub palette: Vec<[u8; 3]>,
++    /// Sequence of run+suite segments.
++    pub segments: Vec<RlexSegment>,
++}
++
++/// Decode RLEX subcodec data.
++pub fn decode_rlex(data: &[u8]) -> DecodeResult<RlexData> {
++    let mut src = ReadCursor::new(data);
++
++    ensure_size!(ctx: "RlexPalette", in: src, size: 1);
++    let palette_count = src.read_u8();
++
++    if palette_count == 0 {
++        return Err(invalid_field_err!("paletteCount", "palette count is 0"));
++    }
++
++    if palette_count > MAX_PALETTE_COUNT {
++        return Err(invalid_field_err!("paletteCount", "palette count exceeds 127"));
++    }
++
++    let palette_byte_count = usize::from(palette_count) * 3;
++    ensure_size!(ctx: "RlexPalette", in: src, size: palette_byte_count);
++
++    let mut palette = Vec::with_capacity(usize::from(palette_count));
++    for _ in 0..palette_count {
++        let b = src.read_u8();
++        let g = src.read_u8();
++        let r = src.read_u8();
++        palette.push([b, g, r]);
++    }
++
++    let stop_index_bits = if palette_count <= 1 {
++        0
++    } else {
++        bit_length(u32::from(palette_count - 1))
++    };
++    let suite_depth_bits = 8u8.saturating_sub(stop_index_bits);
++
++    let mut segments = Vec::new();
++    if stop_index_bits == 0 {
++        decode_single_palette_segments(&mut src, &mut segments)?;
++    } else {
++        decode_multi_palette_segments(&mut src, stop_index_bits, suite_depth_bits, &mut segments)?;
++    }
++
++    Ok(RlexData { palette, segments })
++}
++
++fn decode_single_palette_segments(src: &mut ReadCursor<'_>, segments: &mut Vec<RlexSegment>) -> DecodeResult<()> {
++    while !src.is_empty() {
++        ensure_size!(ctx: "RlexSegment", in: src, size: 1);
++        let packed = src.read_u8();
++        if packed != 0 {
++            return Err(invalid_field_err!(
++                "RlexSegment",
++                "single-palette segment must use zero stop/suite byte"
++            ));
++        }
++        let run_length = decode_run_length(src)?;
++        segments.push(RlexSegment {
++            start_index: 0,
++            stop_index: 0,
++            run_length,
++        });
++    }
++    Ok(())
++}
++
++fn decode_multi_palette_segments(
++    src: &mut ReadCursor<'_>,
++    stop_index_bits: u8,
++    suite_depth_bits: u8,
++    segments: &mut Vec<RlexSegment>,
++) -> DecodeResult<()> {
++    let stop_mask = (1u8 << stop_index_bits) - 1;
++    let depth_mask = (1u8 << suite_depth_bits) - 1;
++
++    while !src.is_empty() {
++        let packed = src.read_u8();
++        let stop_index = packed & stop_mask;
++        let suite_depth = (packed >> stop_index_bits) & depth_mask;
++        let start_index = stop_index.saturating_sub(suite_depth);
++        let run_length = decode_run_length(src)?;
++
++        segments.push(RlexSegment {
++            start_index,
++            stop_index,
++            run_length,
++        });
++    }
++
++    Ok(())
++}
++
++/// Decode a variable-length run length value.
++fn decode_run_length(src: &mut ReadCursor<'_>) -> DecodeResult<u32> {
++    ensure_size!(ctx: "RlexRunLength", in: src, size: 1);
++    let factor1 = src.read_u8();
++
++    if factor1 < 0xFF {
++        return Ok(u32::from(factor1));
++    }
++
++    ensure_size!(ctx: "RlexRunLength", in: src, size: 2);
++    let factor2 = src.read_u16();
++
++    if factor2 < 0xFFFF {
++        return Ok(u32::from(factor2));
++    }
++
++    ensure_size!(ctx: "RlexRunLength", in: src, size: 4);
++    Ok(src.read_u32())
++}
++
++fn bit_length(n: u32) -> u8 {
++    if n == 0 {
++        return 0;
++    }
++    u8::try_from(32 - n.leading_zeros()).expect("bit length of u32 always fits in u8")
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn bit_length_values() {
++        assert_eq!(bit_length(0), 0);
++        assert_eq!(bit_length(1), 1);
++        assert_eq!(bit_length(2), 2);
++        assert_eq!(bit_length(3), 2);
++        assert_eq!(bit_length(4), 3);
++    }
++
++    #[test]
++    fn decode_rlex_two_palette() {
++        let mut data = Vec::new();
++        data.push(2);
++        data.extend_from_slice(&[0x00, 0x00, 0x00]);
++        data.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
++        data.push(0x00);
++        data.push(5);
++        data.push(0x01);
++        data.push(3);
++
++        let rlex = decode_rlex(&data).unwrap();
++        assert_eq!(rlex.palette.len(), 2);
++        assert_eq!(rlex.segments.len(), 2);
++        assert_eq!(rlex.segments[0].stop_index, 0);
++        assert_eq!(rlex.segments[0].run_length, 5);
++        assert_eq!(rlex.segments[1].stop_index, 1);
++        assert_eq!(rlex.segments[1].run_length, 3);
++    }
++
++    #[test]
++    fn decode_rlex_single_palette_reads_segment_header() {
++        let data = [1, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x09];
++
++        let rlex = decode_rlex(&data).unwrap();
++
++        assert_eq!(rlex.palette, vec![[0x00, 0x00, 0x00]]);
++        assert_eq!(rlex.segments.len(), 1);
++        assert_eq!(rlex.segments[0].start_index, 0);
++        assert_eq!(rlex.segments[0].stop_index, 0);
++        assert_eq!(rlex.segments[0].run_length, 2559);
++    }
++}
+diff --git a/crates/ironrdp-pdu/src/codecs/clearcodec/subcodec.rs b/crates/ironrdp-pdu/src/codecs/clearcodec/subcodec.rs
+new file mode 100644
+index 0000000..51365bf
+--- /dev/null
++++ b/crates/ironrdp-pdu/src/codecs/clearcodec/subcodec.rs
+@@ -0,0 +1,130 @@
++//! ClearCodec Layer 3: Subcodecs ([MS-RDPEGFX] 2.2.4.1.1.3).
++
++use ironrdp_core::{cast_length, ensure_size, invalid_field_err, DecodeResult, ReadCursor};
++
++/// Subcodec identifier.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[repr(u8)]
++pub enum SubcodecId {
++    /// Uncompressed BGR pixels.
++    Raw = 0x00,
++    /// NSCodec bitmap compression (MS-RDPNSC).
++    NsCodec = 0x01,
++    /// Palette-indexed RLE with gradient suite encoding.
++    Rlex = 0x02,
++}
++
++impl SubcodecId {
++    fn from_u8(val: u8) -> DecodeResult<Self> {
++        match val {
++            0x00 => Ok(Self::Raw),
++            0x01 => Ok(Self::NsCodec),
++            0x02 => Ok(Self::Rlex),
++            _ => Err(invalid_field_err!("subCodecId", "unknown subcodec ID")),
++        }
++    }
++}
++
++/// A decoded subcodec region.
++#[derive(Debug, Clone)]
++pub struct Subcodec<'a> {
++    pub x_start: u16,
++    pub y_start: u16,
++    pub width: u16,
++    pub height: u16,
++    pub codec_id: SubcodecId,
++    /// Raw bitmap data for this region, interpreted according to `codec_id`.
++    pub bitmap_data: &'a [u8],
++}
++
++impl Subcodec<'_> {
++    const NAME: &'static str = "ClearCodecSubcodec";
++    const HEADER_SIZE: usize = 13;
++}
++
++/// Decode all subcodec regions from the subcodec layer data.
++pub fn decode_subcodec_layer<'a>(data: &'a [u8]) -> DecodeResult<Vec<Subcodec<'a>>> {
++    let mut regions = Vec::new();
++    let mut src = ReadCursor::new(data);
++
++    while src.len() >= Subcodec::HEADER_SIZE {
++        let region = decode_single_subcodec(&mut src)?;
++        regions.push(region);
++    }
++
++    Ok(regions)
++}
++
++fn decode_single_subcodec<'a>(src: &mut ReadCursor<'a>) -> DecodeResult<Subcodec<'a>> {
++    ensure_size!(ctx: Subcodec::NAME, in: src, size: Subcodec::HEADER_SIZE);
++
++    let x_start = src.read_u16();
++    let y_start = src.read_u16();
++    let width = src.read_u16();
++    let height = src.read_u16();
++    let bitmap_data_byte_count: usize = cast_length!("bitmapDataByteCount", src.read_u32())?;
++    let codec_id = SubcodecId::from_u8(src.read_u8())?;
++
++    if width == 0 || height == 0 {
++        return Err(invalid_field_err!("dimensions", "subcodec region has zero dimension"));
++    }
++
++    ensure_size!(ctx: Subcodec::NAME, in: src, size: bitmap_data_byte_count);
++    let bitmap_data = src.read_slice(bitmap_data_byte_count);
++
++    Ok(Subcodec {
++        x_start,
++        y_start,
++        width,
++        height,
++        codec_id,
++        bitmap_data,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn decode_raw_subcodec() {
++        let mut data = Vec::new();
++        data.extend_from_slice(&10u16.to_le_bytes());
++        data.extend_from_slice(&20u16.to_le_bytes());
++        data.extend_from_slice(&2u16.to_le_bytes());
++        data.extend_from_slice(&2u16.to_le_bytes());
++        data.extend_from_slice(&12u32.to_le_bytes());
++        data.push(0x00);
++        data.extend_from_slice(&[0xFF, 0x00, 0x00]);
++        data.extend_from_slice(&[0x00, 0xFF, 0x00]);
++        data.extend_from_slice(&[0x00, 0x00, 0xFF]);
++        data.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
++
++        let regions = decode_subcodec_layer(&data).unwrap();
++        assert_eq!(regions.len(), 1);
++        assert_eq!(regions[0].x_start, 10);
++        assert_eq!(regions[0].y_start, 20);
++        assert_eq!(regions[0].width, 2);
++        assert_eq!(regions[0].height, 2);
++        assert_eq!(regions[0].codec_id, SubcodecId::Raw);
++        assert_eq!(regions[0].bitmap_data.len(), 12);
++    }
++
++    #[test]
++    fn reject_zero_dimensions() {
++        let mut data = Vec::new();
++        data.extend_from_slice(&0u16.to_le_bytes());
++        data.extend_from_slice(&0u16.to_le_bytes());
++        data.extend_from_slice(&0u16.to_le_bytes());
++        data.extend_from_slice(&1u16.to_le_bytes());
++        data.extend_from_slice(&0u32.to_le_bytes());
++        data.push(0x00);
++        assert!(decode_subcodec_layer(&data).is_err());
++    }
++
++    #[test]
++    fn decode_empty_layer() {
++        let regions = decode_subcodec_layer(&[]).unwrap();
++        assert!(regions.is_empty());
++    }
++}
+diff --git a/crates/ironrdp-pdu/src/codecs/mod.rs b/crates/ironrdp-pdu/src/codecs/mod.rs
+index 6fb4906..df6e592 100644
+--- a/crates/ironrdp-pdu/src/codecs/mod.rs
++++ b/crates/ironrdp-pdu/src/codecs/mod.rs
+@@ -1 +1,2 @@
++pub mod clearcodec;
+ pub mod rfx;
+diff --git a/crates/ironrdp-pdu/src/codecs/rfx/data_messages.rs b/crates/ironrdp-pdu/src/codecs/rfx/data_messages.rs
+index a1262f1..68361fa 100644
+--- a/crates/ironrdp-pdu/src/codecs/rfx/data_messages.rs
++++ b/crates/ironrdp-pdu/src/codecs/rfx/data_messages.rs
+@@ -3,8 +3,8 @@ use core::iter;
+ use bit_field::BitField as _;
+ use bitflags::bitflags;
+ use ironrdp_core::{
+-    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_fixed_part_size,
+-    ensure_size, invalid_field_err,
++    cast_length, ensure_fixed_part_size, ensure_size, invalid_field_err, Decode, DecodeResult, Encode, EncodeResult,
++    ReadCursor, WriteCursor,
+ };
+ use num_derive::FromPrimitive;
+ use num_traits::FromPrimitive as _;
+diff --git a/crates/ironrdp-pdu/src/codecs/rfx/header_messages.rs b/crates/ironrdp-pdu/src/codecs/rfx/header_messages.rs
+index e7fcfd1..a2d22d3 100644
+--- a/crates/ironrdp-pdu/src/codecs/rfx/header_messages.rs
++++ b/crates/ironrdp-pdu/src/codecs/rfx/header_messages.rs
+@@ -1,6 +1,6 @@
+ use ironrdp_core::{
+-    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_fixed_part_size,
+-    invalid_field_err,
++    cast_length, ensure_fixed_part_size, invalid_field_err, Decode, DecodeResult, Encode, EncodeResult, ReadCursor,
++    WriteCursor,
+ };
+ 
+ const SYNC_MAGIC: u32 = 0xCACC_ACCA;
+diff --git a/crates/ironrdp-pdu/src/codecs/rfx/mod.rs b/crates/ironrdp-pdu/src/codecs/rfx/mod.rs
+index b86b55c..2746ffa 100644
+--- a/crates/ironrdp-pdu/src/codecs/rfx/mod.rs
++++ b/crates/ironrdp-pdu/src/codecs/rfx/mod.rs
+@@ -2,8 +2,8 @@ mod data_messages;
+ mod header_messages;
+ 
+ use ironrdp_core::{
+-    Decode, DecodeResult, Encode, EncodeResult, ReadCursor, WriteCursor, cast_length, ensure_fixed_part_size,
+-    ensure_size, invalid_field_err,
++    cast_length, ensure_fixed_part_size, ensure_size, invalid_field_err, Decode, DecodeResult, Encode, EncodeResult,
++    ReadCursor, WriteCursor,
+ };
+ use num_derive::FromPrimitive;
+ use num_traits::FromPrimitive as _;
 diff --git a/crates/ironrdp-rdpsnd-native/src/cpal.rs b/crates/ironrdp-rdpsnd-native/src/cpal.rs
 index ef33810..5c6331d 100644
 --- a/crates/ironrdp-rdpsnd-native/src/cpal.rs
@@ -290,7 +2632,7 @@ index ef33810..5c6331d 100644
              self.stream_ended.store(false, Ordering::Relaxed);
              let stream_ended = Arc::clone(&self.stream_ended);
 diff --git a/crates/ironrdp-rdpsnd/src/client.rs b/crates/ironrdp-rdpsnd/src/client.rs
-index ca640db..b42e93f 100644
+index ca640db..2d3882e 100644
 --- a/crates/ironrdp-rdpsnd/src/client.rs
 +++ b/crates/ironrdp-rdpsnd/src/client.rs
 @@ -1,11 +1,10 @@
@@ -302,7 +2644,7 @@ index ca640db..b42e93f 100644
  use ironrdp_pdu::{PduResult, decode_err, encode_err, pdu_other_err};
  use ironrdp_svc::{CompressionCondition, SvcClientProcessor, SvcMessage, SvcProcessor};
 -use tracing::{debug, error};
-+use tracing::{debug, error, warn};
++use tracing::{debug, error, trace, warn};
  
  use crate::pdu::{self, AudioFormat, PitchPdu, ServerAudioFormatPdu, TrainingPdu, VolumePdu};
  use crate::server::RdpsndSvcMessages;
@@ -437,7 +2779,7 @@ index ca640db..b42e93f 100644
                      pdu::ServerAudioOutputPdu::Wave2(pdu) => {
 -                        let format_no = usize::from(pdu.format_no);
 +                        let format = self.get_format(pdu.format_no)?.clone();
-+                        warn!(
++                        trace!(
 +                            "rdpsnd: wave2 format_no={} channels={} rate={} bits={}",
 +                            pdu.format_no, format.n_channels, format.n_samples_per_sec, format.bits_per_sample
 +                        );
@@ -448,7 +2790,7 @@ index ca640db..b42e93f 100644
 +                    }
 +                    pdu::ServerAudioOutputPdu::Wave(pdu) => {
 +                        let format = self.get_format(pdu.format_no)?.clone();
-+                        warn!(
++                        trace!(
 +                            "rdpsnd: wave format_no={} channels={} rate={} bits={}",
 +                            pdu.format_no, format.n_channels, format.n_samples_per_sec, format.bits_per_sample
 +                        );
@@ -601,10 +2943,10 @@ index e990555..e4fc07a 100644
  anyhow = "1"
  smallvec = "1.15"
 diff --git a/crates/ironrdp-web/src/canvas.rs b/crates/ironrdp-web/src/canvas.rs
-index 96b9df5..4bef937 100644
+index 96b9df5..94f5fa8 100644
 --- a/crates/ironrdp-web/src/canvas.rs
 +++ b/crates/ironrdp-web/src/canvas.rs
-@@ -1,93 +1,256 @@
+@@ -1,13 +1,36 @@
  use core::num::NonZeroU32;
  
 -use anyhow::Context as _;
@@ -646,12 +2988,7 @@ index 96b9df5..4bef937 100644
  }
  
  impl Canvas {
--    pub(crate) fn new(render_canvas: HtmlCanvasElement, width: NonZeroU32, height: NonZeroU32) -> anyhow::Result<Self> {
-+    pub(crate) fn new(
-+        render_canvas: HtmlCanvasElement,
-+        width: NonZeroU32,
-+        height: NonZeroU32,
-+    ) -> anyhow::Result<Self> {
+@@ -15,79 +38,205 @@ impl Canvas {
          render_canvas.set_width(width.get());
          render_canvas.set_height(height.get());
  
@@ -660,6 +2997,17 @@ index 96b9df5..4bef937 100644
 -            use softbuffer::SurfaceExtWeb as _;
 -            softbuffer::Surface::from_canvas(render_canvas).expect("surface")
 -        };
+-
+-        #[cfg(not(target_arch = "wasm32"))]
+-        let mut surface = {
+-            fn stub(_: HtmlCanvasElement) -> softbuffer::Surface<NoDisplayHandle, NoWindowHandle> {
+-                unimplemented!()
+-            }
+-
+-            stub(render_canvas)
+-        };
+-
+-        surface.resize(width, height).expect("surface resize");
 +        // preserveDrawingBuffer: true lets JS call toDataURL() for thumbnails
 +        let ctx_attrs = js_sys::Object::new();
 +        let _ = js_sys::Reflect::set(&ctx_attrs, &"preserveDrawingBuffer".into(), &true.into());
@@ -669,18 +3017,11 @@ index 96b9df5..4bef937 100644
 +            .ok_or_else(|| anyhow!("WebGL2 not supported"))?
 +            .dyn_into::<GL>()
 +            .map_err(|_| anyhow!("failed to cast to WebGl2RenderingContext"))?;
- 
--        #[cfg(not(target_arch = "wasm32"))]
--        let mut surface = {
--            fn stub(_: HtmlCanvasElement) -> softbuffer::Surface<NoDisplayHandle, NoWindowHandle> {
--                unimplemented!()
--            }
++
 +        // Compile shaders
 +        let vs = compile_shader(&gl, GL::VERTEX_SHADER, VERTEX_SHADER_SRC)?;
 +        let fs = compile_shader(&gl, GL::FRAGMENT_SHADER, FRAGMENT_SHADER_SRC)?;
- 
--            stub(render_canvas)
--        };
++
 +        let program = gl.create_program().context("create_program")?;
 +        gl.attach_shader(&program, &vs);
 +        gl.attach_shader(&program, &fs);
@@ -702,20 +3043,15 @@ index 96b9df5..4bef937 100644
 +        // Safety: f32 slice to u8 view for WebGL buffer upload
 +        unsafe {
 +            let view = js_sys::Float32Array::view(&verts);
-+            gl.buffer_data_with_array_buffer_view(
-+                GL::ARRAY_BUFFER,
-+                &view,
-+                GL::STATIC_DRAW,
-+            );
++            gl.buffer_data_with_array_buffer_view(GL::ARRAY_BUFFER, &view, GL::STATIC_DRAW);
 +        }
  
--        surface.resize(width, height).expect("surface resize");
+-        Ok(Self { width, surface })
 +        let vao = gl.create_vertex_array().context("create_vao")?;
 +        gl.bind_vertex_array(Some(&vao));
 +        gl.enable_vertex_attrib_array(0);
 +        gl.vertex_attrib_pointer_with_i32(0, 2, GL::FLOAT, false, 0, 0);
- 
--        Ok(Self { width, surface })
++
 +        // Create texture
 +        let texture = gl.create_texture().context("create_texture")?;
 +        gl.bind_texture(GL::TEXTURE_2D, Some(&texture));
@@ -774,8 +3110,7 @@ index 96b9df5..4bef937 100644
 +                None,
 +            );
 +
-+        self.gl
-+            .viewport(0, 0, self.width as i32, self.height as i32);
++        self.gl.viewport(0, 0, self.width as i32, self.height as i32);
      }
  
 -    pub(crate) fn draw(&mut self, buffer: &[u8], region: InclusiveRectangle) -> anyhow::Result<()> {
@@ -791,6 +3126,10 @@ index 96b9df5..4bef937 100644
 +        let y = i32::from(region.top);
 +        let w = i32::from(region.width());
 +        let h = i32::from(region.height());
++
++        if w == 0 || h == 0 {
++            return Ok(());
++        }
  
 -        let mut src = buffer.chunks_exact(4).map(|pixel| {
 -            let r = pixel[0];
@@ -798,12 +3137,29 @@ index 96b9df5..4bef937 100644
 -            let b = pixel[2];
 -            u32::from_be_bytes([0, r, g, b])
 -        });
-+        if w == 0 || h == 0 {
-+            return Ok(());
-+        }
++        self.gl.bind_texture(GL::TEXTURE_2D, Some(&self.texture));
++
++        // Upload only the dirty region to GPU texture
++        self.gl
++            .tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_u8_array(
++                GL::TEXTURE_2D,
++                0,
++                x,
++                y,
++                w,
++                h,
++                GL::RGBA,
++                GL::UNSIGNED_BYTE,
++                Some(buffer),
++            )
++            .map_err(|e| anyhow!("tex_sub_image_2d failed: {e:?}"))?;
++
++        // Draw full-screen quad (the shader samples the updated texture)
++        self.gl.draw_arrays(GL::TRIANGLE_STRIP, 0, 4);
  
 -        let mut dst = self.surface.buffer_mut().expect("surface buffer");
-+        self.gl.bind_texture(GL::TEXTURE_2D, Some(&self.texture));
++        Ok(())
++    }
  
 -        {
 -            // Copy src into dst
@@ -827,36 +3183,10 @@ index 96b9df5..4bef937 100644
 -                    .zip(src_row)
 -                    .for_each(|(dst, src)| *dst = src);
 -            }
-+        // Upload only the dirty region to GPU texture
-+        self.gl
-+            .tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_u8_array(
-+                GL::TEXTURE_2D,
-+                0,
-+                x,
-+                y,
-+                w,
-+                h,
-+                GL::RGBA,
-+                GL::UNSIGNED_BYTE,
-+                Some(buffer),
-+            )
-+            .map_err(|e| anyhow!("tex_sub_image_2d failed: {e:?}"))?;
-+
-+        // Draw full-screen quad (the shader samples the updated texture)
-+        self.gl.draw_arrays(GL::TRIANGLE_STRIP, 0, 4);
-+
-+        Ok(())
-+    }
-+
 +    /// Zero-copy upload: uses UNPACK_ROW_LENGTH to read a sub-rect from a strided buffer
 +    /// without copying pixel data. The `data` slice covers full rows of the image,
 +    /// and `image_width` is the stride in pixels.
-+    pub(crate) fn draw_strided(
-+        &self,
-+        data: &[u8],
-+        region: InclusiveRectangle,
-+        image_width: u32,
-+    ) -> anyhow::Result<()> {
++    pub(crate) fn draw_strided(&self, data: &[u8], region: InclusiveRectangle, image_width: u32) -> anyhow::Result<()> {
 +        let x = i32::from(region.left);
 +        let y = i32::from(region.top);
 +        let w = i32::from(region.width());
@@ -874,9 +3204,10 @@ index 96b9df5..4bef937 100644
 -            height: NonZeroU32::new(u32::from(region_height))
 -                .expect("per InclusiveRectangle invariants: 0 < region_height"),
 -        };
-+        self.gl.bind_texture(GL::TEXTURE_2D, Some(&self.texture));
- 
+-
 -        dst.present_with_damage(&[damage_rect]).expect("buffer present");
++        self.gl.bind_texture(GL::TEXTURE_2D, Some(&self.texture));
++
 +        // Tell WebGL2 the row stride of the source buffer
 +        self.gl.pixel_storei(GL::UNPACK_ROW_LENGTH, image_width as i32);
 +        self.gl.pixel_storei(GL::UNPACK_SKIP_PIXELS, x);
@@ -925,7 +3256,7 @@ index 96b9df5..4bef937 100644
 +    Ok(shader)
  }
 diff --git a/crates/ironrdp-web/src/clipboard.rs b/crates/ironrdp-web/src/clipboard.rs
-index 9557741..a5448fd 100644
+index 9557741..b68455c 100644
 --- a/crates/ironrdp-web/src/clipboard.rs
 +++ b/crates/ironrdp-web/src/clipboard.rs
 @@ -11,18 +11,23 @@
@@ -933,9 +3264,9 @@ index 9557741..a5448fd 100644
  //! will be requested, and when pasting into WordPad, "text/html" will be requested.
  
 -use std::collections::HashMap;
++use std::cell::{Cell, RefCell};
 +use std::collections::{HashMap, HashSet};
 +use std::rc::Rc;
-+use std::cell::{Cell, RefCell};
 +
 +use serde::{Deserialize, Serialize};
  
@@ -998,17 +3329,17 @@ index 9557741..a5448fd 100644
      remote_formats_to_read: Vec<ClipboardFormatId>,
  
 +    // File transfer state
-+    local_files: Vec<Vec<u8>>,               // Stored local file bytes (indexed by file order)
-+    local_file_paths: Vec<String>,           // File paths for lazy loading (indexed by file order)
-+    local_file_sizes: Vec<u64>,              // Actual file sizes (indexed by file order)
-+    remote_file_descriptors: Vec<FileInfo>,  // File descriptors from remote
++    local_files: Vec<Vec<u8>>,              // Stored local file bytes (indexed by file order)
++    local_file_paths: Vec<String>,          // File paths for lazy loading (indexed by file order)
++    local_file_sizes: Vec<u64>,             // Actual file sizes (indexed by file order)
++    remote_file_descriptors: Vec<FileInfo>, // File descriptors from remote
 +    pending_chunked_downloads: HashMap<u32, PendingChunkedDownload>, // stream_id -> chunked download state
 +    next_stream_id: u32,
 +    last_lock_data_id: Option<u32>,
-+    force_update_pending: bool, // Defer ForceClipboardUpdate until file download completes
++    force_update_pending: bool,     // Defer ForceClipboardUpdate until file download completes
 +    total_files_to_download: usize, // Total number of remote files expected
-+    files_completed: usize,        // Number of files fully downloaded
-+    download_generation: u64,      // Incremented on each new remote FormatList to detect stale responses
++    files_completed: usize,         // Number of files fully downloaded
++    download_generation: u64,       // Incremented on each new remote FormatList to detect stale responses
 +    last_committed_descriptors: Vec<FileInfo>, // Dedup: skip re-download if identical to last committed
 +
 +    /// Tracks in-flight async file reads to prevent clipboard update race conditions.
@@ -1071,8 +3402,8 @@ index 9557741..a5448fd 100644
 +    /// Connect to the file transfer WebSocket for large file bypass (≥2MB).
 +    /// Data is pushed directly to the Rust backend, skipping the JS callback path.
 +    pub(crate) fn set_file_transfer_ws_port(&mut self, port: u16) {
-+        use wasm_bindgen::closure::Closure;
 +        use wasm_bindgen::JsCast;
++        use wasm_bindgen::closure::Closure;
 +
 +        let url = format!("ws://127.0.0.1:{}", port);
 +        match web_sys::WebSocket::new(&url) {
@@ -1109,7 +3440,7 @@ index 9557741..a5448fd 100644
      fn handle_local_clipboard_changed(
          &mut self,
          clipboard_data: ClipboardData,
-@@ -173,10 +274,69 @@ impl WasmClipboard {
+@@ -173,10 +274,81 @@ impl WasmClipboard {
                          FORMAT_MIME_PNG.into(),
                      ]);
                  }
@@ -1123,8 +3454,10 @@ index 9557741..a5448fd 100644
  
 +        // --- Transfer lock: defer clipboard update if async file reads are in-flight ---
 +        if self.active_transfer_count.get() > 0 {
-+            warn!("handle_local_clipboard_changed: transfer in progress (count={}), deferring clipboard update",
-+                self.active_transfer_count.get());
++            warn!(
++                "handle_local_clipboard_changed: transfer in progress (count={}), deferring clipboard update",
++                self.active_transfer_count.get()
++            );
 +            self.pending_clipboard_update = Some(clipboard_data);
 +            return Ok(Vec::new());
 +        }
@@ -1141,10 +3474,16 @@ index 9557741..a5448fd 100644
 +                if let ClipboardItemValue::Binary(data) = &item.value {
 +                    if let Ok(json_str) = std::str::from_utf8(data) {
 +                        #[derive(Deserialize)]
-+                        struct FileDesc { size: u64 }
++                        struct FileDesc {
++                            size: u64,
++                        }
 +                        if let Ok(descs) = serde_json::from_str::<Vec<FileDesc>>(json_str) {
 +                            descriptor_sizes = descs.into_iter().map(|d| d.size).collect();
-+                            warn!("Parsed {} file descriptors with sizes: {:?}", descriptor_sizes.len(), descriptor_sizes);
++                            warn!(
++                                "Parsed {} file descriptors with sizes: {:?}",
++                                descriptor_sizes.len(),
++                                descriptor_sizes
++                            );
 +                        }
 +                    }
 +                }
@@ -1158,7 +3497,11 @@ index 9557741..a5448fd 100644
 +                match &item.value {
 +                    ClipboardItemValue::Binary(data) if !data.is_empty() => {
 +                        // Has data in memory
-+                        warn!("Stored local file (in-memory): {} ({} bytes)", item.mime_type, data.len());
++                        warn!(
++                            "Stored local file (in-memory): {} ({} bytes)",
++                            item.mime_type,
++                            data.len()
++                        );
 +                        self.local_file_sizes.push(data.len() as u64);
 +                        self.local_files.push(data.clone());
 +                        self.local_file_paths.push(String::new());
@@ -1179,7 +3522,7 @@ index 9557741..a5448fd 100644
          self.local_clipboard = Some(clipboard_data);
  
          trace!("Sending clipboard formats: {:?}", formats);
-@@ -249,6 +409,30 @@ impl WasmClipboard {
+@@ -249,6 +421,30 @@ impl WasmClipboard {
                  let png_data = find_binary_content_by_mime(MIME_PNG)?;
                  FormatDataResponse::new_data(png_data)
              }
@@ -1210,7 +3553,7 @@ index 9557741..a5448fd 100644
              _ => {
                  anyhow::bail!("Unknown format id requested: {}", format.value());
              }
-@@ -286,6 +470,7 @@ impl WasmClipboard {
+@@ -286,6 +482,7 @@ impl WasmClipboard {
                          FORMAT_MIME_HTML.name,
                          FORMAT_PNG.name,
                          FORMAT_MIME_PNG.name,
@@ -1218,7 +3561,7 @@ index 9557741..a5448fd 100644
                      ];
  
                      if !SUPPORTED_FORMATS.iter().any(|supported| *supported == name.value()) {
-@@ -406,6 +591,43 @@ impl WasmClipboard {
+@@ -406,6 +603,43 @@ impl WasmClipboard {
                      Some(FORMAT_MIME_PNG_NAME) | Some(FORMAT_PNG_NAME) => {
                          Some(ClipboardItem::new_binary(MIME_PNG, response.data().to_owned()))
                      }
@@ -1262,7 +3605,7 @@ index 9557741..a5448fd 100644
                      _ => {
                          // Not supported format
                          None
-@@ -427,9 +649,73 @@ impl WasmClipboard {
+@@ -427,9 +661,77 @@ impl WasmClipboard {
              let clipboard_data = core::mem::take(&mut self.remote_clipboard);
  
              if clipboard_data.is_empty() {
@@ -1286,47 +3629,51 @@ index 9557741..a5448fd 100644
 +                        self.fire_deferred_force_update();
 +                    }
 +                } else {
-+                // Increment generation to invalidate any in-flight downloads from previous clipboard
-+                self.download_generation += 1;
-+                self.total_files_to_download = self.remote_file_descriptors.len();
-+                self.files_completed = 0;
-+                self.pending_chunked_downloads.clear();
-+                let cur_gen = self.download_generation;
-+                warn!(
-+                    "Remote has {} files, starting direct DATA download (gen={})",
-+                    self.remote_file_descriptors.len(), cur_gen
-+                );
-+                use ironrdp::cliprdr::pdu::FileContentsFlags;
-+                // Skip SIZE phase — use fi.size from FileGroupDescriptorW directly
-+                for (i, fi) in self.remote_file_descriptors.clone().iter().enumerate() {
-+                    let file_size = fi.size;
-+                    let chunk_size = std::cmp::min(DOWNLOAD_CHUNK_SIZE, file_size);
-+                    let stream_id = self.next_stream_id;
-+                    self.next_stream_id += 1;
-+
-+                    self.pending_chunked_downloads.insert(stream_id, PendingChunkedDownload {
-+                        file_index: i,
-+                        file_name: fi.name.clone(),
-+                        total_size: file_size,
-+                        bytes_received: 0,
-+                        generation: cur_gen,
-+                    });
-+
++                    // Increment generation to invalidate any in-flight downloads from previous clipboard
++                    self.download_generation += 1;
++                    self.total_files_to_download = self.remote_file_descriptors.len();
++                    self.files_completed = 0;
++                    self.pending_chunked_downloads.clear();
++                    let cur_gen = self.download_generation;
 +                    warn!(
-+                        "Requesting file DATA chunk: stream_id={}, index={}, name={}, offset=0, chunk_size={}, total={}",
-+                        stream_id, i, fi.name, chunk_size, file_size
++                        "Remote has {} files, starting direct DATA download (gen={})",
++                        self.remote_file_descriptors.len(),
++                        cur_gen
 +                    );
-+                    let request = FileContentsRequest {
-+                        stream_id,
-+                        index: i as u32,
-+                        flags: FileContentsFlags::DATA,
-+                        position: 0,
-+                        requested_size: chunk_size as u32,
-+                        data_id: None,
-+                    };
-+                    self.proxy
-+                        .send_cliprdr_message(ClipboardMessage::SendFileContentsRequest(request));
-+                }
++                    use ironrdp::cliprdr::pdu::FileContentsFlags;
++                    // Skip SIZE phase — use fi.size from FileGroupDescriptorW directly
++                    for (i, fi) in self.remote_file_descriptors.clone().iter().enumerate() {
++                        let file_size = fi.size;
++                        let chunk_size = std::cmp::min(DOWNLOAD_CHUNK_SIZE, file_size);
++                        let stream_id = self.next_stream_id;
++                        self.next_stream_id += 1;
++
++                        self.pending_chunked_downloads.insert(
++                            stream_id,
++                            PendingChunkedDownload {
++                                file_index: i,
++                                file_name: fi.name.clone(),
++                                total_size: file_size,
++                                bytes_received: 0,
++                                generation: cur_gen,
++                            },
++                        );
++
++                        warn!(
++                            "Requesting file DATA chunk: stream_id={}, index={}, name={}, offset=0, chunk_size={}, total={}",
++                            stream_id, i, fi.name, chunk_size, file_size
++                        );
++                        let request = FileContentsRequest {
++                            stream_id,
++                            index: i as u32,
++                            flags: FileContentsFlags::DATA,
++                            position: 0,
++                            requested_size: chunk_size as u32,
++                            data_id: None,
++                        };
++                        self.proxy
++                            .send_cliprdr_message(ClipboardMessage::SendFileContentsRequest(request));
++                    }
 +                } // end else (not dedup)
 +            } else if self.force_update_pending {
 +                // No files to download, fire deferred update now
@@ -1336,7 +3683,7 @@ index 9557741..a5448fd 100644
              // Set clipboard when all formats were read.
              self.js_callbacks
                  .on_remote_clipboard_changed
-@@ -443,17 +729,52 @@ impl WasmClipboard {
+@@ -443,17 +745,52 @@ impl WasmClipboard {
          Ok(())
      }
  
@@ -1392,7 +3739,7 @@ index 9557741..a5448fd 100644
                          error!(error = format!("{e:#}"), "Failed to handle local clipboard change");
                      }
                  }
-@@ -495,16 +816,372 @@ impl WasmClipboard {
+@@ -495,16 +832,384 @@ impl WasmClipboard {
                  }
              }
              WasmClipboardBackendMessage::ForceClipboardUpdate => {
@@ -1403,8 +3750,10 @@ index 9557741..a5448fd 100644
 +                // throughout the entire transfer, unlike active_transfer_count which
 +                // resets between individual chunk reads.
 +                if !self.local_file_paths.is_empty() {
-+                    warn!("ForceClipboardUpdate: skipping (file transfer in progress, {} files staged)",
-+                        self.local_file_paths.len());
++                    warn!(
++                        "ForceClipboardUpdate: skipping (file transfer in progress, {} files staged)",
++                        self.local_file_paths.len()
++                    );
 +                    return Ok(());
 +                }
 +                // Defer only when remote clipboard sync/file download is actually in progress.
@@ -1418,8 +3767,8 @@ index 9557741..a5448fd 100644
 +                    warn!("ForceClipboardUpdate: no remote clipboard sync in progress, requesting local clipboard now");
 +                    self.force_update_pending = false;
 +                    self.request_local_clipboard_update();
-+                }
-+            }
+                 }
+             }
 +            WasmClipboardBackendMessage::FileContentsRequest(request) => {
 +                // Local → Remote: respond with stored local file data
 +                let index = request.index as usize;
@@ -1453,7 +3802,11 @@ index 9557741..a5448fd 100644
 +
 +                    if request.flags.contains(FileContentsFlags::SIZE) {
 +                        // SIZE request: use stored size (handles lazy files correctly)
-+                        let size = self.local_file_sizes.get(index).copied().unwrap_or(file_data.len() as u64);
++                        let size = self
++                            .local_file_sizes
++                            .get(index)
++                            .copied()
++                            .unwrap_or(file_data.len() as u64);
 +                        warn!("FileContentsRequest SIZE response: {} bytes", size);
 +                        let response = FileContentsResponse::new_size_response(request.stream_id, size);
 +                        self.proxy
@@ -1508,25 +3861,24 @@ index 9557741..a5448fd 100644
 +                                            let data = js_sys::Uint8Array::from(js_val).to_vec();
 +                                            trace!("[cliprdr] async read complete: {} bytes", data.len());
 +                                            let response = FileContentsResponse::new_data_response(stream_id, data);
-+                                            proxy.send_cliprdr_message(
-+                                                ClipboardMessage::SendFileContentsResponse(response),
-+                                            );
++                                            proxy.send_cliprdr_message(ClipboardMessage::SendFileContentsResponse(
++                                                response,
++                                            ));
 +                                        }
 +                                        Err(e) => {
 +                                            warn!("[cliprdr] async read failed: {:?}", e);
-+                                            let response = FileContentsResponse::new_data_response(stream_id, Vec::new());
-+                                            proxy.send_cliprdr_message(
-+                                                ClipboardMessage::SendFileContentsResponse(response),
-+                                            );
++                                            let response =
++                                                FileContentsResponse::new_data_response(stream_id, Vec::new());
++                                            proxy.send_cliprdr_message(ClipboardMessage::SendFileContentsResponse(
++                                                response,
++                                            ));
 +                                        }
 +                                    }
 +                                }
 +                                Err(e) => {
 +                                    warn!("[cliprdr] callback call failed: {:?}", e);
 +                                    let response = FileContentsResponse::new_data_response(stream_id, Vec::new());
-+                                    proxy.send_cliprdr_message(
-+                                        ClipboardMessage::SendFileContentsResponse(response),
-+                                    );
++                                    proxy.send_cliprdr_message(ClipboardMessage::SendFileContentsResponse(response));
 +                                }
 +                            }
 +
@@ -1538,8 +3890,8 @@ index 9557741..a5448fd 100644
 +                    } else {
 +                        warn!("FileContentsRequest DATA: no data and no callback for index {}", index);
 +                    }
-                 }
-             }
++                }
++            }
 +            WasmClipboardBackendMessage::FileContentsResponse(response) => {
 +                let stream_id = response.stream_id();
 +                let data = response.data();
@@ -1555,189 +3907,196 @@ index 9557741..a5448fd 100644
 +                        );
 +                        // Don't re-insert, just discard
 +                    } else {
-+                    let offset = download.bytes_received;
-+                    download.bytes_received += data.len() as u64;
-+                    let is_last_chunk = download.bytes_received >= download.total_size;
++                        let offset = download.bytes_received;
++                        download.bytes_received += data.len() as u64;
++                        let is_last_chunk = download.bytes_received >= download.total_size;
 +
-+                    let is_last_file = is_last_chunk && {
-+                        self.files_completed + 1 >= self.total_files_to_download
-+                            && self.pending_chunked_downloads.is_empty()
-+                    };
-+
-+                    trace!(
-+                        "DATA chunk: file_index={}, offset={}, chunk_len={}, received={}/{}, last_chunk={}, last_file={}",
-+                        download.file_index, offset, data.len(),
-+                        download.bytes_received, download.total_size,
-+                        is_last_chunk, is_last_file,
-+                    );
-+
-+                    // Pre-extract fields needed by both WS and JS paths (avoids move issues)
-+                    let dl_file_name = download.file_name.clone();
-+                    let dl_file_index = download.file_index;
-+                    let dl_total_size = download.total_size;
-+                    let dl_bytes_received = download.bytes_received;
-+
-+                    // === WS BYPASS: push large file chunks directly to Rust backend ===
-+                    let ws_handled = if download.total_size >= 2 * 1024 * 1024
-+                        && self.file_transfer_ws.is_some()
-+                        && self.file_transfer_ws_ready.get()
-+                    {
-+                        let ws = self.file_transfer_ws.as_ref().unwrap();
-+
-+                        // First chunk of this file → send FILE_BEGIN
-+                        if offset == 0 {
-+                            let name_bytes = download.file_name.as_bytes();
-+                            let session_id = format!("{:0>32}", "wasm-cliprdr");
-+                            let mut msg: Vec<u8> = Vec::with_capacity(1 + 2 + name_bytes.len() + 8 + 32);
-+                            msg.push(0x01); // FILE_BEGIN
-+                            msg.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-+                            msg.extend_from_slice(name_bytes);
-+                            msg.extend_from_slice(&download.total_size.to_le_bytes());
-+                            msg.extend_from_slice(session_id.as_bytes());
-+                            let _ = ws.send_with_u8_array(&msg);
-+                        }
-+
-+                        // Send FILE_CHUNK
-+                        if !data.is_empty() {
-+                            let session_id = format!("{:0>32}", "wasm-cliprdr");
-+                            let mut msg: Vec<u8> = Vec::with_capacity(1 + 32 + 4 + data.len());
-+                            msg.push(0x02); // FILE_CHUNK
-+                            msg.extend_from_slice(session_id.as_bytes());
-+                            msg.extend_from_slice(&(data.len() as u32).to_le_bytes());
-+                            msg.extend_from_slice(data);
-+                            let _ = ws.send_with_u8_array(&msg);
-+                        }
-+
-+                        if is_last_chunk {
-+                            let session_id = format!("{:0>32}", "wasm-cliprdr");
-+                            // FILE_COMPLETE
-+                            let mut msg = vec![0x03u8];
-+                            msg.extend_from_slice(session_id.as_bytes());
-+                            #[expect(clippy::as_conversions, clippy::cast_possible_truncation)]
-+                            {
-+                                msg.push(download.file_index as u8);
-+                                msg.push(self.total_files_to_download as u8);
-+                            }
-+                            let _ = ws.send_with_u8_array(&msg);
-+
-+                            self.files_completed += 1;
-+                            warn!(
-+                                "File {} complete via WS ({}/{})",
-+                                download.file_name, self.files_completed, self.total_files_to_download
-+                            );
-+
-+                            if is_last_file {
-+                                // TRANSFER_DONE
-+                                let mut done_msg = vec![0x04u8];
-+                                done_msg.extend_from_slice(session_id.as_bytes());
-+                                let _ = ws.send_with_u8_array(&done_msg);
-+
-+                                warn!("All files transferred via WS");
-+                                self.last_committed_descriptors = self.remote_file_descriptors.clone();
-+                                self.remote_file_descriptors.clear();
-+                                self.total_files_to_download = 0;
-+                                self.files_completed = 0;
-+
-+                                if self.force_update_pending {
-+                                    self.fire_deferred_force_update();
-+                                }
-+                            }
-+                        }
-+
-+                        // Request next chunk (same logic as existing path)
-+                        if !is_last_chunk {
-+                            use ironrdp::cliprdr::pdu::FileContentsFlags;
-+                            let remaining = download.total_size - download.bytes_received;
-+                            let chunk_size = std::cmp::min(DOWNLOAD_CHUNK_SIZE, remaining);
-+                            let next_stream_id = self.next_stream_id;
-+                            self.next_stream_id += 1;
-+
-+                            let request = FileContentsRequest {
-+                                stream_id: next_stream_id,
-+                                index: download.file_index as u32,
-+                                flags: FileContentsFlags::DATA,
-+                                position: download.bytes_received,
-+                                requested_size: chunk_size as u32,
-+                                data_id: None,
-+                            };
-+                            self.pending_chunked_downloads.insert(next_stream_id, download);
-+                            self.proxy
-+                                .send_cliprdr_message(ClipboardMessage::SendFileContentsRequest(request));
-+                        }
-+
-+                        true // WS handled
-+                    } else {
-+                        false
-+                    };
-+                    // === END WS BYPASS ===
-+
-+                    if !ws_handled {
-+                    // Stream chunk to JS immediately (no accumulation!)
-+                    if let Some(callback) = self.js_callbacks.on_file_chunk.as_mut() {
-+                        let chunk_js = FileChunkJs {
-+                            file_index: dl_file_index as u32,
-+                            file_name: dl_file_name.clone(),
-+                            total_size: dl_total_size,
-+                            offset,
-+                            data: data.to_vec(),
-+                            is_last: is_last_chunk,
-+                            is_last_file,
++                        let is_last_file = is_last_chunk && {
++                            self.files_completed + 1 >= self.total_files_to_download
++                                && self.pending_chunked_downloads.is_empty()
 +                        };
-+                        let js_val = serde_wasm_bindgen::to_value(&chunk_js).unwrap_or(JsValue::NULL);
-+                        let _ = callback.call1(&JsValue::NULL, &js_val);
-+                    }
 +
-+                    if is_last_chunk {
-+                        self.files_completed += 1;
-+                        warn!(
-+                            "File {} complete ({}/{})",
-+                            dl_file_name, self.files_completed, self.total_files_to_download
++                        trace!(
++                            "DATA chunk: file_index={}, offset={}, chunk_len={}, received={}/{}, last_chunk={}, last_file={}",
++                            download.file_index,
++                            offset,
++                            data.len(),
++                            download.bytes_received,
++                            download.total_size,
++                            is_last_chunk,
++                            is_last_file,
 +                        );
 +
-+                        // All files done?
-+                        if is_last_file {
-+                            warn!("All {} files downloaded via chunked protocol", self.total_files_to_download);
-+                            // Record for dedup (prevent feedback loop re-download)
-+                            self.last_committed_descriptors = self.remote_file_descriptors.clone();
-+                            self.remote_file_descriptors.clear();
-+                            self.total_files_to_download = 0;
-+                            self.files_completed = 0;
++                        // Pre-extract fields needed by both WS and JS paths (avoids move issues)
++                        let dl_file_name = download.file_name.clone();
++                        let dl_file_index = download.file_index;
++                        let dl_total_size = download.total_size;
++                        let dl_bytes_received = download.bytes_received;
 +
-+                            if self.force_update_pending {
-+                                self.fire_deferred_force_update();
++                        // === WS BYPASS: push large file chunks directly to Rust backend ===
++                        let ws_handled = if download.total_size >= 2 * 1024 * 1024
++                            && self.file_transfer_ws.is_some()
++                            && self.file_transfer_ws_ready.get()
++                        {
++                            let ws = self.file_transfer_ws.as_ref().unwrap();
++
++                            // First chunk of this file → send FILE_BEGIN
++                            if offset == 0 {
++                                let name_bytes = download.file_name.as_bytes();
++                                let session_id = format!("{:0>32}", "wasm-cliprdr");
++                                let mut msg: Vec<u8> = Vec::with_capacity(1 + 2 + name_bytes.len() + 8 + 32);
++                                msg.push(0x01); // FILE_BEGIN
++                                msg.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
++                                msg.extend_from_slice(name_bytes);
++                                msg.extend_from_slice(&download.total_size.to_le_bytes());
++                                msg.extend_from_slice(session_id.as_bytes());
++                                let _ = ws.send_with_u8_array(&msg);
 +                            }
-+                        }
-+                    } else {
-+                        // Request next chunk
-+                        use ironrdp::cliprdr::pdu::FileContentsFlags;
-+                        let remaining = dl_total_size - dl_bytes_received;
-+                        let chunk_size = std::cmp::min(DOWNLOAD_CHUNK_SIZE, remaining);
-+                        let next_stream_id = self.next_stream_id;
-+                        self.next_stream_id += 1;
 +
-+                        let request = FileContentsRequest {
-+                            stream_id: next_stream_id,
-+                            index: dl_file_index as u32,
-+                            flags: FileContentsFlags::DATA,
-+                            position: dl_bytes_received,
-+                            requested_size: chunk_size as u32,
-+                            data_id: None,
++                            // Send FILE_CHUNK
++                            if !data.is_empty() {
++                                let session_id = format!("{:0>32}", "wasm-cliprdr");
++                                let mut msg: Vec<u8> = Vec::with_capacity(1 + 32 + 4 + data.len());
++                                msg.push(0x02); // FILE_CHUNK
++                                msg.extend_from_slice(session_id.as_bytes());
++                                msg.extend_from_slice(&(data.len() as u32).to_le_bytes());
++                                msg.extend_from_slice(data);
++                                let _ = ws.send_with_u8_array(&msg);
++                            }
++
++                            if is_last_chunk {
++                                let session_id = format!("{:0>32}", "wasm-cliprdr");
++                                // FILE_COMPLETE
++                                let mut msg = vec![0x03u8];
++                                msg.extend_from_slice(session_id.as_bytes());
++                                #[expect(clippy::as_conversions, clippy::cast_possible_truncation)]
++                                {
++                                    msg.push(download.file_index as u8);
++                                    msg.push(self.total_files_to_download as u8);
++                                }
++                                let _ = ws.send_with_u8_array(&msg);
++
++                                self.files_completed += 1;
++                                warn!(
++                                    "File {} complete via WS ({}/{})",
++                                    download.file_name, self.files_completed, self.total_files_to_download
++                                );
++
++                                if is_last_file {
++                                    // TRANSFER_DONE
++                                    let mut done_msg = vec![0x04u8];
++                                    done_msg.extend_from_slice(session_id.as_bytes());
++                                    let _ = ws.send_with_u8_array(&done_msg);
++
++                                    warn!("All files transferred via WS");
++                                    self.last_committed_descriptors = self.remote_file_descriptors.clone();
++                                    self.remote_file_descriptors.clear();
++                                    self.total_files_to_download = 0;
++                                    self.files_completed = 0;
++
++                                    if self.force_update_pending {
++                                        self.fire_deferred_force_update();
++                                    }
++                                }
++                            }
++
++                            // Request next chunk (same logic as existing path)
++                            if !is_last_chunk {
++                                use ironrdp::cliprdr::pdu::FileContentsFlags;
++                                let remaining = download.total_size - download.bytes_received;
++                                let chunk_size = std::cmp::min(DOWNLOAD_CHUNK_SIZE, remaining);
++                                let next_stream_id = self.next_stream_id;
++                                self.next_stream_id += 1;
++
++                                let request = FileContentsRequest {
++                                    stream_id: next_stream_id,
++                                    index: download.file_index as u32,
++                                    flags: FileContentsFlags::DATA,
++                                    position: download.bytes_received,
++                                    requested_size: chunk_size as u32,
++                                    data_id: None,
++                                };
++                                self.pending_chunked_downloads.insert(next_stream_id, download);
++                                self.proxy
++                                    .send_cliprdr_message(ClipboardMessage::SendFileContentsRequest(request));
++                            }
++
++                            true // WS handled
++                        } else {
++                            false
 +                        };
++                        // === END WS BYPASS ===
 +
-+                        // Re-insert with updated bytes_received (use dl_* fields since download may have been moved by WS path)
-+                        let reinsert_download = PendingChunkedDownload {
-+                            file_index: dl_file_index,
-+                            file_name: dl_file_name.clone(),
-+                            total_size: dl_total_size,
-+                            bytes_received: dl_bytes_received,
-+                            generation: self.download_generation,
-+                        };
-+                        self.pending_chunked_downloads.insert(next_stream_id, reinsert_download);
++                        if !ws_handled {
++                            // Stream chunk to JS immediately (no accumulation!)
++                            if let Some(callback) = self.js_callbacks.on_file_chunk.as_mut() {
++                                let chunk_js = FileChunkJs {
++                                    file_index: dl_file_index as u32,
++                                    file_name: dl_file_name.clone(),
++                                    total_size: dl_total_size,
++                                    offset,
++                                    data: data.to_vec(),
++                                    is_last: is_last_chunk,
++                                    is_last_file,
++                                };
++                                let js_val = serde_wasm_bindgen::to_value(&chunk_js).unwrap_or(JsValue::NULL);
++                                let _ = callback.call1(&JsValue::NULL, &js_val);
++                            }
 +
-+                        self.proxy
-+                            .send_cliprdr_message(ClipboardMessage::SendFileContentsRequest(request));
-+                    }
-+                    } // end if !ws_handled
++                            if is_last_chunk {
++                                self.files_completed += 1;
++                                warn!(
++                                    "File {} complete ({}/{})",
++                                    dl_file_name, self.files_completed, self.total_files_to_download
++                                );
++
++                                // All files done?
++                                if is_last_file {
++                                    warn!(
++                                        "All {} files downloaded via chunked protocol",
++                                        self.total_files_to_download
++                                    );
++                                    // Record for dedup (prevent feedback loop re-download)
++                                    self.last_committed_descriptors = self.remote_file_descriptors.clone();
++                                    self.remote_file_descriptors.clear();
++                                    self.total_files_to_download = 0;
++                                    self.files_completed = 0;
++
++                                    if self.force_update_pending {
++                                        self.fire_deferred_force_update();
++                                    }
++                                }
++                            } else {
++                                // Request next chunk
++                                use ironrdp::cliprdr::pdu::FileContentsFlags;
++                                let remaining = dl_total_size - dl_bytes_received;
++                                let chunk_size = std::cmp::min(DOWNLOAD_CHUNK_SIZE, remaining);
++                                let next_stream_id = self.next_stream_id;
++                                self.next_stream_id += 1;
++
++                                let request = FileContentsRequest {
++                                    stream_id: next_stream_id,
++                                    index: dl_file_index as u32,
++                                    flags: FileContentsFlags::DATA,
++                                    position: dl_bytes_received,
++                                    requested_size: chunk_size as u32,
++                                    data_id: None,
++                                };
++
++                                // Re-insert with updated bytes_received (use dl_* fields since download may have been moved by WS path)
++                                let reinsert_download = PendingChunkedDownload {
++                                    file_index: dl_file_index,
++                                    file_name: dl_file_name.clone(),
++                                    total_size: dl_total_size,
++                                    bytes_received: dl_bytes_received,
++                                    generation: self.download_generation,
++                                };
++                                self.pending_chunked_downloads.insert(next_stream_id, reinsert_download);
++
++                                self.proxy
++                                    .send_cliprdr_message(ClipboardMessage::SendFileContentsRequest(request));
++                            }
++                        } // end if !ws_handled
 +                    } // end generation check
 +                } else {
 +                    warn!("Unknown stream_id in FileContentsResponse: {}", stream_id);
@@ -1770,7 +4129,7 @@ index 9557741..a5448fd 100644
          Ok(())
      }
  }
-@@ -530,8 +1207,9 @@ impl CliprdrBackend for WasmClipboardBackend {
+@@ -530,8 +1235,9 @@ impl CliprdrBackend for WasmClipboardBackend {
      }
  
      fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
@@ -1782,7 +4141,7 @@ index 9557741..a5448fd 100644
      }
  
      fn on_ready(&mut self) {}
-@@ -559,20 +1237,21 @@ impl CliprdrBackend for WasmClipboardBackend {
+@@ -559,20 +1265,21 @@ impl CliprdrBackend for WasmClipboardBackend {
          self.send_event(WasmClipboardBackendMessage::RemoteDataResponse(response.into_owned()));
      }
  
@@ -1812,7 +4171,7 @@ index 9557741..a5448fd 100644
      }
  }
  
-@@ -672,3 +1351,54 @@ impl iron_remote_desktop::ClipboardItem for ClipboardItem {
+@@ -672,3 +1379,54 @@ impl iron_remote_desktop::ClipboardItem for ClipboardItem {
          }
      }
  }
@@ -1869,12 +4228,16 @@ index 9557741..a5448fd 100644
 +}
 diff --git a/crates/ironrdp-web/src/gfx.rs b/crates/ironrdp-web/src/gfx.rs
 new file mode 100644
-index 0000000..f5cc6de
+index 0000000..a85a3b6
 --- /dev/null
 +++ b/crates/ironrdp-web/src/gfx.rs
-@@ -0,0 +1,142 @@
-+use ironrdp_egfx::client::GraphicsPipelineHandler;
-+use ironrdp_egfx::pdu::{Codec1Type, GfxPdu};
+@@ -0,0 +1,412 @@
++use std::fmt::Write as _;
++
++use ironrdp_egfx::client::{
++    ClearCodecFrameDecoder, GraphicsPipelineHandler, avc420_capabilities, extract_avc420_frame,
++};
++use ironrdp_egfx::pdu::{CapabilitySet, Codec1Type, GfxPdu};
 +use tracing::{debug, trace, warn};
 +use wasm_bindgen::JsValue;
 +
@@ -1883,11 +4246,15 @@ index 0000000..f5cc6de
 +pub(crate) struct WasmGfxHandler {
 +    /// JS callback: (type: string, data: Uint8Array | object) => void
 +    callback: js_sys::Function,
++    clearcodec_decoder: ClearCodecFrameDecoder,
 +}
 +
 +impl WasmGfxHandler {
 +    pub(crate) fn new(callback: js_sys::Function) -> Self {
-+        Self { callback }
++        Self {
++            callback,
++            clearcodec_decoder: ClearCodecFrameDecoder::new(),
++        }
 +    }
 +
 +    fn call_js(&self, event_type: &str, data: &JsValue) {
@@ -1900,10 +4267,26 @@ index 0000000..f5cc6de
 +    }
 +}
 +
++fn hex_prefix(bytes: &[u8], max_len: usize) -> String {
++    let mut hex = String::with_capacity(bytes.len().min(max_len) * 2);
++    for byte in bytes.iter().take(max_len) {
++        let _ = write!(&mut hex, "{byte:02x}");
++    }
++    hex
++}
++
++fn color_to_rgba_u32(color: &ironrdp_egfx::pdu::Color) -> u32 {
++    u32::from(color.r) | (u32::from(color.g) << 8) | (u32::from(color.b) << 16) | (u32::from(color.xa) << 24)
++}
++
 +// SAFETY: WASM is single-threaded, so Send is safe
 +unsafe impl Send for WasmGfxHandler {}
 +
 +impl GraphicsPipelineHandler for WasmGfxHandler {
++    fn capabilities(&self) -> Vec<CapabilitySet> {
++        avc420_capabilities()
++    }
++
 +    fn handle_pdu(&mut self, pdu: GfxPdu) -> Option<GfxPdu> {
 +        match pdu {
 +            GfxPdu::WireToSurface1(w2s) => {
@@ -1914,9 +4297,8 @@ index 0000000..f5cc6de
 +                    Codec1Type::Planar => "planar",
 +                    Codec1Type::Avc420 => "h264",
 +                    Codec1Type::Alpha => "alpha",
-+                    Codec1Type::Avc444 => "h264",
-+                    Codec1Type::Avc444v2 => "h264",
-+                    _ => "unknown",
++                    Codec1Type::Avc444 => "h264-avc444",
++                    Codec1Type::Avc444v2 => "h264-avc444v2",
 +                };
 +
 +                debug!(
@@ -1926,40 +4308,208 @@ index 0000000..f5cc6de
 +                    "GFX WireToSurface1"
 +                );
 +
-+                // For H.264 codecs, forward NAL data to JS for WebCodecs decoding
-+                let is_h264 = matches!(
-+                    w2s.codec_id,
-+                    Codec1Type::Avc420 | Codec1Type::Avc444 | Codec1Type::Avc444v2
-+                );
++                // The current web path supports one AVC420 stream. AVC444 needs a separate compositor.
++                let is_avc420 = matches!(w2s.codec_id, Codec1Type::Avc420);
++                let is_clearcodec = matches!(w2s.codec_id, Codec1Type::ClearCodec);
 +
-+                if is_h264 {
-+                    let data = js_sys::Uint8Array::from(w2s.bitmap_data.as_slice());
-+                    let obj = js_sys::Object::new();
-+                    let _ = js_sys::Reflect::set(&obj, &"surfaceId".into(), &w2s.surface_id.into());
-+                    let _ = js_sys::Reflect::set(&obj, &"codec".into(), &codec_name.into());
-+                    let _ = js_sys::Reflect::set(&obj, &"data".into(), &data);
-+                    let _ = js_sys::Reflect::set(
-+                        &obj,
-+                        &"left".into(),
-+                        &w2s.destination_rectangle.left.into(),
-+                    );
-+                    let _ = js_sys::Reflect::set(
-+                        &obj,
-+                        &"top".into(),
-+                        &w2s.destination_rectangle.top.into(),
-+                    );
-+                    let _ = js_sys::Reflect::set(
-+                        &obj,
-+                        &"right".into(),
-+                        &w2s.destination_rectangle.right.into(),
-+                    );
-+                    let _ = js_sys::Reflect::set(
-+                        &obj,
-+                        &"bottom".into(),
-+                        &w2s.destination_rectangle.bottom.into(),
-+                    );
-+                    self.call_js("h264_frame", &obj.into());
++                let codec_obj = js_sys::Object::new();
++                let _ = js_sys::Reflect::set(&codec_obj, &"surfaceId".into(), &w2s.surface_id.into());
++                let _ = js_sys::Reflect::set(&codec_obj, &"codec".into(), &codec_name.into());
++                let _ = js_sys::Reflect::set(&codec_obj, &"h264".into(), &JsValue::from_bool(is_avc420));
++                let _ = js_sys::Reflect::set(
++                    &codec_obj,
++                    &"dataLen".into(),
++                    &JsValue::from_f64(w2s.bitmap_data.len() as f64),
++                );
++                let _ = js_sys::Reflect::set(&codec_obj, &"left".into(), &w2s.destination_rectangle.left.into());
++                let _ = js_sys::Reflect::set(&codec_obj, &"top".into(), &w2s.destination_rectangle.top.into());
++                let _ = js_sys::Reflect::set(&codec_obj, &"right".into(), &w2s.destination_rectangle.right.into());
++                let _ = js_sys::Reflect::set(&codec_obj, &"bottom".into(), &w2s.destination_rectangle.bottom.into());
++                let codec_event: JsValue = codec_obj.into();
++                self.call_js("gfx_codec", &codec_event);
++
++                if is_avc420 {
++                    match extract_avc420_frame(&w2s.bitmap_data) {
++                        Ok(frame) => {
++                            let rect = frame.rectangles.first().unwrap_or(&w2s.destination_rectangle);
++                            let data = js_sys::Uint8Array::from(frame.data);
++                            let obj = js_sys::Object::new();
++                            let _ = js_sys::Reflect::set(&obj, &"surfaceId".into(), &w2s.surface_id.into());
++                            let _ = js_sys::Reflect::set(&obj, &"codec".into(), &codec_name.into());
++                            let _ = js_sys::Reflect::set(&obj, &"data".into(), &data);
++                            let _ = js_sys::Reflect::set(&obj, &"left".into(), &rect.left.into());
++                            let _ = js_sys::Reflect::set(&obj, &"top".into(), &rect.top.into());
++                            let _ = js_sys::Reflect::set(&obj, &"right".into(), &rect.right.into());
++                            let _ = js_sys::Reflect::set(&obj, &"bottom".into(), &rect.bottom.into());
++                            self.call_js("h264_frame", &obj.into());
++                        }
++                        Err(error) => {
++                            warn!(?error, "Failed to decode AVC420 bitmap stream");
++                            let obj = js_sys::Object::new();
++                            let _ = js_sys::Reflect::set(&obj, &"surfaceId".into(), &w2s.surface_id.into());
++                            let _ = js_sys::Reflect::set(&obj, &"codec".into(), &codec_name.into());
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"detail".into(),
++                                &format!("avc420 decode error: {error}").into(),
++                            );
++                            self.call_js("unsupported_codec", &obj.into());
++                        }
++                    }
++                } else if is_clearcodec {
++                    let clearcodec_width = w2s
++                        .destination_rectangle
++                        .right
++                        .saturating_sub(w2s.destination_rectangle.left);
++                    let clearcodec_height = w2s
++                        .destination_rectangle
++                        .bottom
++                        .saturating_sub(w2s.destination_rectangle.top);
++                    match self
++                        .clearcodec_decoder
++                        .decode_frame(&w2s.bitmap_data, clearcodec_width, clearcodec_height)
++                    {
++                        Ok(frame) => {
++                            let first_patch = frame.patches.first();
++                            let obj = js_sys::Object::new();
++                            let _ = js_sys::Reflect::set(&obj, &"surfaceId".into(), &w2s.surface_id.into());
++                            let _ = js_sys::Reflect::set(&obj, &"codec".into(), &codec_name.into());
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"width".into(),
++                                &first_patch.map_or(0, |patch| patch.width).into(),
++                            );
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"height".into(),
++                                &first_patch.map_or(0, |patch| patch.height).into(),
++                            );
++                            let _ = js_sys::Reflect::set(&obj, &"flags".into(), &frame.flags.into());
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"glyphIndex".into(),
++                                &JsValue::from_bool(frame.glyph_index_present),
++                            );
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"glyphHit".into(),
++                                &JsValue::from_bool(frame.glyph_hit_present),
++                            );
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"cacheReset".into(),
++                                &JsValue::from_bool(frame.cache_reset),
++                            );
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"residual".into(),
++                                &JsValue::from_bool(frame.residual_byte_count != 0),
++                            );
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"banding".into(),
++                                &JsValue::from_bool(frame.bands_byte_count != 0),
++                            );
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"subcodec".into(),
++                                &JsValue::from_bool(frame.subcodec_byte_count != 0),
++                            );
++                            let _ = js_sys::Reflect::set(&obj, &"sequenceNumber".into(), &frame.sequence_number.into());
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"payloadLen".into(),
++                                &JsValue::from_f64(frame.payload_len as f64),
++                            );
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"residualByteCount".into(),
++                                &JsValue::from_f64(frame.residual_byte_count as f64),
++                            );
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"bandsByteCount".into(),
++                                &JsValue::from_f64(frame.bands_byte_count as f64),
++                            );
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"subcodecByteCount".into(),
++                                &JsValue::from_f64(frame.subcodec_byte_count as f64),
++                            );
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"patchCount".into(),
++                                &JsValue::from_f64(frame.patches.len() as f64),
++                            );
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"bitmapHexPrefix".into(),
++                                &hex_prefix(&w2s.bitmap_data, 96).into(),
++                            );
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"payloadHexPrefix".into(),
++                                &hex_prefix(&w2s.bitmap_data[2..], 96).into(),
++                            );
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"hexPrefix".into(),
++                                &hex_prefix(&w2s.bitmap_data, 96).into(),
++                            );
++                            let _ = js_sys::Reflect::set(&obj, &"left".into(), &w2s.destination_rectangle.left.into());
++                            let _ = js_sys::Reflect::set(&obj, &"top".into(), &w2s.destination_rectangle.top.into());
++                            let _ =
++                                js_sys::Reflect::set(&obj, &"right".into(), &w2s.destination_rectangle.right.into());
++                            let _ =
++                                js_sys::Reflect::set(&obj, &"bottom".into(), &w2s.destination_rectangle.bottom.into());
++                            let clearcodec_event: JsValue = obj.into();
++                            self.call_js("clearcodec_frame", &clearcodec_event);
++
++                            for patch in &frame.patches {
++                                let left = w2s.destination_rectangle.left.saturating_add(patch.x);
++                                let top = w2s.destination_rectangle.top.saturating_add(patch.y);
++                                let right = left.saturating_add(patch.width);
++                                let bottom = top.saturating_add(patch.height);
++                                let data = js_sys::Uint8Array::from(patch.rgba.as_slice());
++                                let patch_obj = js_sys::Object::new();
++                                let _ = js_sys::Reflect::set(&patch_obj, &"surfaceId".into(), &w2s.surface_id.into());
++                                let _ = js_sys::Reflect::set(&patch_obj, &"codec".into(), &codec_name.into());
++                                let _ = js_sys::Reflect::set(&patch_obj, &"data".into(), &data);
++                                let _ = js_sys::Reflect::set(&patch_obj, &"left".into(), &left.into());
++                                let _ = js_sys::Reflect::set(&patch_obj, &"top".into(), &top.into());
++                                let _ = js_sys::Reflect::set(&patch_obj, &"right".into(), &right.into());
++                                let _ = js_sys::Reflect::set(&patch_obj, &"bottom".into(), &bottom.into());
++                                let _ = js_sys::Reflect::set(&patch_obj, &"width".into(), &patch.width.into());
++                                let _ = js_sys::Reflect::set(&patch_obj, &"height".into(), &patch.height.into());
++                                self.call_js("clearcodec_rgba_patch", &patch_obj.into());
++                            }
++                        }
++                        Err(error) => {
++                            warn!(?error, "Failed to decode ClearCodec bitmap data");
++                            let obj = js_sys::Object::new();
++                            let _ = js_sys::Reflect::set(&obj, &"surfaceId".into(), &w2s.surface_id.into());
++                            let _ = js_sys::Reflect::set(&obj, &"codec".into(), &codec_name.into());
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"detail".into(),
++                                &format!("clearcodec decode error: {error}").into(),
++                            );
++                            let _ = js_sys::Reflect::set(
++                                &obj,
++                                &"bitmapHexPrefix".into(),
++                                &hex_prefix(&w2s.bitmap_data, 96).into(),
++                            );
++                            let payload_hex = if w2s.bitmap_data.len() > 2 {
++                                hex_prefix(&w2s.bitmap_data[2..], 96)
++                            } else {
++                                String::new()
++                            };
++                            let _ = js_sys::Reflect::set(&obj, &"payloadHexPrefix".into(), &payload_hex.into());
++                            self.call_js("unsupported_codec", &obj.into());
++                        }
++                    }
 +                } else {
++                    self.call_js("unsupported_codec", &codec_event);
 +                    trace!(codec = codec_name, "Non-H.264 codec, skipping JS callback");
 +                }
 +            }
@@ -1975,6 +4525,85 @@ index 0000000..f5cc6de
 +                let _ = js_sys::Reflect::set(&obj, &"width".into(), &cs.width.into());
 +                let _ = js_sys::Reflect::set(&obj, &"height".into(), &cs.height.into());
 +                self.call_js("create_surface", &obj.into());
++            }
++            GfxPdu::SolidFill(pdu) => {
++                debug!(
++                    surface_id = pdu.surface_id,
++                    rect_count = pdu.rectangles.len(),
++                    "GFX SolidFill"
++                );
++                for rect in &pdu.rectangles {
++                    let obj = js_sys::Object::new();
++                    let _ = js_sys::Reflect::set(&obj, &"surfaceId".into(), &pdu.surface_id.into());
++                    let _ = js_sys::Reflect::set(&obj, &"left".into(), &rect.left.into());
++                    let _ = js_sys::Reflect::set(&obj, &"top".into(), &rect.top.into());
++                    let _ = js_sys::Reflect::set(&obj, &"right".into(), &rect.right.into());
++                    let _ = js_sys::Reflect::set(&obj, &"bottom".into(), &rect.bottom.into());
++                    let _ = js_sys::Reflect::set(
++                        &obj,
++                        &"color".into(),
++                        &JsValue::from_f64(color_to_rgba_u32(&pdu.fill_pixel) as f64),
++                    );
++                    self.call_js("solid_fill", &obj.into());
++                }
++            }
++            GfxPdu::SurfaceToSurface(pdu) => {
++                debug!(
++                    src_surface_id = pdu.source_surface_id,
++                    dst_surface_id = pdu.destination_surface_id,
++                    point_count = pdu.destination_points.len(),
++                    "GFX SurfaceToSurface"
++                );
++                for dest in &pdu.destination_points {
++                    let obj = js_sys::Object::new();
++                    let _ = js_sys::Reflect::set(&obj, &"srcSurfaceId".into(), &pdu.source_surface_id.into());
++                    let _ = js_sys::Reflect::set(&obj, &"dstSurfaceId".into(), &pdu.destination_surface_id.into());
++                    let _ = js_sys::Reflect::set(&obj, &"srcLeft".into(), &pdu.source_rectangle.left.into());
++                    let _ = js_sys::Reflect::set(&obj, &"srcTop".into(), &pdu.source_rectangle.top.into());
++                    let _ = js_sys::Reflect::set(&obj, &"srcRight".into(), &pdu.source_rectangle.right.into());
++                    let _ = js_sys::Reflect::set(&obj, &"srcBottom".into(), &pdu.source_rectangle.bottom.into());
++                    let _ = js_sys::Reflect::set(&obj, &"dstX".into(), &dest.x.into());
++                    let _ = js_sys::Reflect::set(&obj, &"dstY".into(), &dest.y.into());
++                    self.call_js("surface_to_surface", &obj.into());
++                }
++            }
++            GfxPdu::SurfaceToCache(pdu) => {
++                debug!(
++                    surface_id = pdu.surface_id,
++                    cache_slot = pdu.cache_slot,
++                    "GFX SurfaceToCache"
++                );
++                let obj = js_sys::Object::new();
++                let _ = js_sys::Reflect::set(&obj, &"surfaceId".into(), &pdu.surface_id.into());
++                let _ = js_sys::Reflect::set(&obj, &"cacheSlot".into(), &pdu.cache_slot.into());
++                let _ = js_sys::Reflect::set(&obj, &"cacheKey".into(), &pdu.cache_key.to_string().into());
++                let _ = js_sys::Reflect::set(&obj, &"left".into(), &pdu.source_rectangle.left.into());
++                let _ = js_sys::Reflect::set(&obj, &"top".into(), &pdu.source_rectangle.top.into());
++                let _ = js_sys::Reflect::set(&obj, &"right".into(), &pdu.source_rectangle.right.into());
++                let _ = js_sys::Reflect::set(&obj, &"bottom".into(), &pdu.source_rectangle.bottom.into());
++                self.call_js("surface_to_cache", &obj.into());
++            }
++            GfxPdu::CacheToSurface(pdu) => {
++                debug!(
++                    surface_id = pdu.surface_id,
++                    cache_slot = pdu.cache_slot,
++                    point_count = pdu.destination_points.len(),
++                    "GFX CacheToSurface"
++                );
++                for dest in &pdu.destination_points {
++                    let obj = js_sys::Object::new();
++                    let _ = js_sys::Reflect::set(&obj, &"surfaceId".into(), &pdu.surface_id.into());
++                    let _ = js_sys::Reflect::set(&obj, &"cacheSlot".into(), &pdu.cache_slot.into());
++                    let _ = js_sys::Reflect::set(&obj, &"dstX".into(), &dest.x.into());
++                    let _ = js_sys::Reflect::set(&obj, &"dstY".into(), &dest.y.into());
++                    self.call_js("cache_to_surface", &obj.into());
++                }
++            }
++            GfxPdu::EvictCacheEntry(pdu) => {
++                debug!(cache_slot = pdu.cache_slot, "GFX EvictCacheEntry");
++                let obj = js_sys::Object::new();
++                let _ = js_sys::Reflect::set(&obj, &"cacheSlot".into(), &pdu.cache_slot.into());
++                self.call_js("evict_cache", &obj.into());
 +            }
 +            GfxPdu::DeleteSurface(ds) => {
 +                debug!(surface_id = ds.surface_id, "GFX DeleteSurface");
@@ -2045,7 +4674,7 @@ index 13ac3fe..1d2459f 100644
      // PERF: needs actual benchmark to find a better heuristic
      if region.height() > 64 || region.width() > 512 {
 diff --git a/crates/ironrdp-web/src/lib.rs b/crates/ironrdp-web/src/lib.rs
-index b98ebb1..2aafbb9 100644
+index b98ebb1..0f9e881 100644
 --- a/crates/ironrdp-web/src/lib.rs
 +++ b/crates/ironrdp-web/src/lib.rs
 @@ -17,10 +17,14 @@ extern crate time as _;
@@ -2053,22 +4682,22 @@ index b98ebb1..2aafbb9 100644
  mod clipboard;
  mod error;
 +mod gfx;
-+mod rdpsnd_dvc;
  mod image;
  mod input;
  mod network_client;
  mod rdp_file;
 +mod rdpdr;
 +mod rdpsnd;
++mod rdpsnd_dvc;
  mod session;
  
  mod wasm_bridge {
 diff --git a/crates/ironrdp-web/src/rdpdr.rs b/crates/ironrdp-web/src/rdpdr.rs
 new file mode 100644
-index 0000000..1b26405
+index 0000000..1759465
 --- /dev/null
 +++ b/crates/ironrdp-web/src/rdpdr.rs
-@@ -0,0 +1,610 @@
+@@ -0,0 +1,602 @@
 +//! WASM-compatible RDPDR (Drive Redirection) backend.
 +//!
 +//! File reads are handled asynchronously: when Windows requests data for
@@ -2087,7 +4716,7 @@ index 0000000..1b26405
 +use ironrdp::rdpdr::pdu::efs::*;
 +use ironrdp::rdpdr::pdu::esc::{ScardCall, ScardIoCtlCode};
 +use ironrdp::svc::SvcMessage;
-+use tracing::{debug, warn, info};
++use tracing::{debug, info, warn};
 +use wasm_bindgen::prelude::*;
 +use wasm_bindgen_futures::JsFuture;
 +
@@ -2219,13 +4848,7 @@ index 0000000..1b26405
 +
 +    /// Spawn an async task to read file data via JS callback (returns Promise).
 +    /// The result is sent back through the deferred_tx channel as a DeviceReadResponse.
-+    fn spawn_deferred_read(
-+        &self,
-+        req_header: DeviceIoRequest,
-+        path: String,
-+        offset: u64,
-+        length: u32,
-+    ) {
++    fn spawn_deferred_read(&self, req_header: DeviceIoRequest, path: String, offset: u64, length: u32) {
 +        let cb = match self.read_callback.as_ref() {
 +            Some(cb) => cb.clone(),
 +            None => {
@@ -2266,15 +4889,15 @@ index 0000000..1b26405
 +
 +            info!(
 +                "[rdpdr-wasm] async read complete: {} offset={} got {} bytes",
-+                path, offset, read_data.len()
++                path,
++                offset,
++                read_data.len()
 +            );
 +
-+            let response = SvcMessage::from(RdpdrPdu::DeviceReadResponse(
-+                DeviceReadResponse {
-+                    device_io_reply: DeviceIoResponse::new(req_header, NtStatus::SUCCESS),
-+                    read_data,
-+                },
-+            ));
++            let response = SvcMessage::from(RdpdrPdu::DeviceReadResponse(DeviceReadResponse {
++                device_io_reply: DeviceIoResponse::new(req_header, NtStatus::SUCCESS),
++                read_data,
++            }));
 +
 +            let sender = tx.borrow();
 +            let _ = sender.unbounded_send(RdpdrDeferredMessage::Response(vec![response]));
@@ -2404,13 +5027,11 @@ index 0000000..1b26405
 +            } else if entry.size > 0 {
 +                // No data in memory — spawn async read, response will come later
 +                if let Some(path) = self.id_to_path.get(&fid).cloned() {
-+                    info!("[rdpdr-wasm] deferred read: {} offset={} len={}", path, req.offset, req.length);
-+                    self.spawn_deferred_read(
-+                        req.device_io_request,
-+                        path,
-+                        req.offset,
-+                        req.length,
++                    info!(
++                        "[rdpdr-wasm] deferred read: {} offset={} len={}",
++                        path, req.offset, req.length
 +                    );
++                    self.spawn_deferred_read(req.device_io_request, path, req.offset, req.length);
 +                    // Return empty vec — no synchronous response; async task will send it
 +                    Ok(Vec::new())
 +                } else {
@@ -2681,10 +5302,10 @@ index 0000000..1b26405
 +}
 diff --git a/crates/ironrdp-web/src/rdpsnd.rs b/crates/ironrdp-web/src/rdpsnd.rs
 new file mode 100644
-index 0000000..fabb2f0
+index 0000000..536446b
 --- /dev/null
 +++ b/crates/ironrdp-web/src/rdpsnd.rs
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,200 @@
 +use std::borrow::Cow;
 +
 +use ironrdp_rdpsnd::client::RdpsndClientHandler;
@@ -2793,10 +5414,7 @@ index 0000000..fabb2f0
 +    }
 +
 +    fn invoke(&self, event_type: &str, data: JsValue) {
-+        let args = js_sys::Array::from_iter([
-+            JsValue::from_str(event_type),
-+            data,
-+        ]);
++        let args = js_sys::Array::from_iter([JsValue::from_str(event_type), data]);
 +        if let Err(e) = self.callback.apply(&JsValue::NULL, &args) {
 +            warn!("rdpsnd callback error: {:?}", e);
 +        }
@@ -2826,17 +5444,20 @@ index 0000000..fabb2f0
 +                &format_info,
 +                &"channels".into(),
 +                &JsValue::from_f64(format.n_channels.into()),
-+            ).ok();
++            )
++            .ok();
 +            js_sys::Reflect::set(
 +                &format_info,
 +                &"sampleRate".into(),
 +                &JsValue::from_f64(format.n_samples_per_sec.into()),
-+            ).ok();
++            )
++            .ok();
 +            js_sys::Reflect::set(
 +                &format_info,
 +                &"bitsPerSample".into(),
 +                &JsValue::from_f64(format.bits_per_sample.into()),
-+            ).ok();
++            )
++            .ok();
 +            let format_tag = format.format;
 +            let tag_str = if format_tag == WaveFormat::PCM {
 +                "pcm"
@@ -2849,17 +5470,10 @@ index 0000000..fabb2f0
 +            } else {
 +                "unknown"
 +            };
-+            js_sys::Reflect::set(
-+                &format_info,
-+                &"formatTag".into(),
-+                &JsValue::from_str(tag_str),
-+            ).ok();
++            js_sys::Reflect::set(&format_info, &"formatTag".into(), &JsValue::from_str(tag_str)).ok();
 +            info!(
 +                "rdpsnd: format changed - {} ch, {} Hz, {} bit, tag={}",
-+                format.n_channels,
-+                format.n_samples_per_sec,
-+                format.bits_per_sample,
-+                tag_str
++                format.n_channels, format.n_samples_per_sec, format.bits_per_sample, tag_str
 +            );
 +            self.invoke("format", format_info.into());
 +        }
@@ -2872,16 +5486,13 @@ index 0000000..fabb2f0
 +    fn set_volume(&mut self, volume: VolumePdu) {
 +        debug!("rdpsnd: set_volume {:?}", volume);
 +        let vol_obj = js_sys::Object::new();
-+        js_sys::Reflect::set(
-+            &vol_obj,
-+            &"left".into(),
-+            &JsValue::from_f64(volume.volume_left.into()),
-+        ).ok();
++        js_sys::Reflect::set(&vol_obj, &"left".into(), &JsValue::from_f64(volume.volume_left.into())).ok();
 +        js_sys::Reflect::set(
 +            &vol_obj,
 +            &"right".into(),
 +            &JsValue::from_f64(volume.volume_right.into()),
-+        ).ok();
++        )
++        .ok();
 +        self.invoke("volume", vol_obj.into());
 +    }
 +
@@ -2897,22 +5508,22 @@ index 0000000..fabb2f0
 +}
 diff --git a/crates/ironrdp-web/src/rdpsnd_dvc.rs b/crates/ironrdp-web/src/rdpsnd_dvc.rs
 new file mode 100644
-index 0000000..bb4bea5
+index 0000000..5a547d5
 --- /dev/null
 +++ b/crates/ironrdp-web/src/rdpsnd_dvc.rs
-@@ -0,0 +1,99 @@
+@@ -0,0 +1,93 @@
++use ironrdp::pdu::PduResult;
 +/// RDPSND Dynamic Virtual Channel (DVC) wrapper.
 +///
 +/// Modern Windows RDP servers (Windows 10+) prefer sending audio over the
 +/// `AUDIO_PLAYBACK_DVC` dynamic virtual channel instead of the legacy `rdpsnd`
 +/// static virtual channel. This module wraps the existing `Rdpsnd` protocol
 +/// state machine so that it can run over DRDYNVC.
-+use ironrdp_core::{Encode, EncodeResult, WriteCursor, ensure_size, impl_as_any, AsAny};
-+use ironrdp::pdu::PduResult;
++use ironrdp_core::{AsAny, Encode, EncodeResult, WriteCursor, ensure_size, impl_as_any};
 +use ironrdp_rdpsnd::client::{Rdpsnd, RdpsndClientHandler};
 +use tracing::warn;
 +
-+use ironrdp::dvc::{DvcProcessor, DvcMessage, DvcEncode};
++use ironrdp::dvc::{DvcEncode, DvcMessage, DvcProcessor};
 +use ironrdp::svc::SvcProcessor;
 +
 +/// The DVC channel name used by Windows 10+ for audio playback
@@ -2971,11 +5582,7 @@ index 0000000..bb4bea5
 +        Ok(Vec::new())
 +    }
 +
-+    fn process(
-+        &mut self,
-+        _channel_id: u32,
-+        payload: &[u8],
-+    ) -> PduResult<Vec<DvcMessage>> {
++    fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
 +        // Delegate to the inner Rdpsnd SvcProcessor.
 +        // It returns Vec<SvcMessage> — we need to convert
 +        // each to DvcMessage by encoding the inner PDU bytes.
@@ -2985,11 +5592,9 @@ index 0000000..bb4bea5
 +        for svc_msg in svc_messages {
 +            // SvcMessage::encode_unframed_pdu() gives us the raw
 +            // PDU bytes without SVC channel framing headers.
-+            let raw_bytes = svc_msg.encode_unframed_pdu()
-+                .map_err(|e| ironrdp::pdu::pdu_other_err!(
-+                    "RdpsndDvc",
-+                    "failed to encode response PDU: {e}"
-+                ))?;
++            let raw_bytes = svc_msg
++                .encode_unframed_pdu()
++                .map_err(|e| ironrdp::pdu::pdu_other_err!("RdpsndDvc", "failed to encode response PDU: {e}"))?;
 +            dvc_messages.push(Box::new(RawRdpsndDvcMsg(raw_bytes)));
 +        }
 +
@@ -3001,10 +5606,14 @@ index 0000000..bb4bea5
 +    }
 +}
 diff --git a/crates/ironrdp-web/src/session.rs b/crates/ironrdp-web/src/session.rs
-index 13da806..373f6ea 100644
+index 13da806..ad828b2 100644
 --- a/crates/ironrdp-web/src/session.rs
 +++ b/crates/ironrdp-web/src/session.rs
-@@ -24,6 +24,8 @@ use ironrdp::graphics::image_processing::PixelFormat;
+@@ -21,9 +21,12 @@ use ironrdp::connector::{self, ClientConnector, Credentials};
+ use ironrdp::displaycontrol::client::DisplayControlClient;
+ use ironrdp::dvc::DrdynvcClient;
+ use ironrdp::graphics::image_processing::PixelFormat;
++use ironrdp::pdu::geometry::Rectangle as _;
  use ironrdp::pdu::input::fast_path::FastPathInputEvent;
  use ironrdp::pdu::rdp::capability_sets::client_codecs_capabilities;
  use ironrdp::pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
@@ -3013,19 +5622,22 @@ index 13da806..373f6ea 100644
  use ironrdp::session::image::DecodedImage;
  use ironrdp::session::{ActiveStage, ActiveStageOutput, GracefulDisconnectReason, fast_path};
  use ironrdp_core::WriteBuf;
-@@ -32,6 +34,7 @@ use rgb::AsPixels as _;
+@@ -31,6 +34,7 @@ use ironrdp_futures::{FramedWrite, single_sequence_step_read};
+ use rgb::AsPixels as _;
  use tap::prelude::*;
  use tracing::{debug, error, info, trace, warn};
- use wasm_bindgen::JsValue;
 +use wasm_bindgen::JsCast as _;
+ use wasm_bindgen::JsValue;
  use wasm_bindgen_futures::spawn_local;
  use web_sys::HtmlCanvasElement;
- 
-@@ -42,6 +45,19 @@ use crate::error::IronError;
- use crate::image::extract_partial_image;
+@@ -39,9 +43,21 @@ use crate::canvas::Canvas;
+ use crate::clipboard;
+ use crate::clipboard::{ClipboardData, WasmClipboard, WasmClipboardBackend, WasmClipboardBackendMessage};
+ use crate::error::IronError;
+-use crate::image::extract_partial_image;
  use crate::input::InputTransaction;
  use crate::network_client::WasmNetworkClient;
-+use crate::rdpdr::{WasmRdpdrBackend, RdpdrDeferredMessage};
++use crate::rdpdr::{RdpdrDeferredMessage, WasmRdpdrBackend};
 +use crate::rdpsnd::WasmRdpsndBackend;
 +
 +/// JSON representation of a drive entry passed from JS via extension.
@@ -3041,7 +5653,7 @@ index 13da806..373f6ea 100644
  
  const DEFAULT_WIDTH: u16 = 1280;
  const DEFAULT_HEIGHT: u16 = 720;
-@@ -66,10 +82,20 @@ struct SessionBuilderInner {
+@@ -66,10 +82,36 @@ struct SessionBuilderInner {
      set_cursor_style_callback_context: Option<JsValue>,
      remote_clipboard_changed_callback: Option<js_sys::Function>,
      force_clipboard_update_callback: Option<js_sys::Function>,
@@ -3057,12 +5669,28 @@ index 13da806..373f6ea 100644
  
      use_display_control: bool,
      enable_credssp: bool,
++    visual_quality: VisualQuality,
      outbound_message_size_limit: Option<usize>,
 +    shared_drives: Vec<(String, Vec<crate::rdpdr::MemFileEntry>)>,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum VisualQuality {
++    Balanced,
++    Rich,
++}
++
++impl VisualQuality {
++    fn from_extension_value(value: &str) -> Self {
++        match value.trim().to_ascii_lowercase().as_str() {
++            "rich" | "full" | "full-color" | "full_color" | "lan" => Self::Rich,
++            _ => Self::Balanced,
++        }
++    }
  }
  
  impl Default for SessionBuilderInner {
-@@ -83,7 +109,7 @@ impl Default for SessionBuilderInner {
+@@ -83,7 +125,7 @@ impl Default for SessionBuilderInner {
              auth_token: None,
              pcb: None,
              kdc_proxy_url: None,
@@ -3071,7 +5699,7 @@ index 13da806..373f6ea 100644
              desktop_size: DesktopSize {
                  width: DEFAULT_WIDTH,
                  height: DEFAULT_HEIGHT,
-@@ -94,10 +120,20 @@ impl Default for SessionBuilderInner {
+@@ -94,10 +136,21 @@ impl Default for SessionBuilderInner {
              set_cursor_style_callback_context: None,
              remote_clipboard_changed_callback: None,
              force_clipboard_update_callback: None,
@@ -3087,12 +5715,13 @@ index 13da806..373f6ea 100644
  
              use_display_control: false,
              enable_credssp: true,
++            visual_quality: VisualQuality::Balanced,
              outbound_message_size_limit: None,
 +            shared_drives: Vec::new(),
          }
      }
  }
-@@ -207,6 +243,21 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+@@ -207,6 +260,21 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
          self.clone()
      }
  
@@ -3114,7 +5743,19 @@ index 13da806..373f6ea 100644
      fn extension(&self, ext: Extension) -> Self {
          iron_remote_desktop::extension_match! {
              match ext;
-@@ -224,6 +275,78 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+@@ -214,6 +282,11 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+             |kdc_proxy_url: String| { self.0.borrow_mut().kdc_proxy_url = Some(kdc_proxy_url) };
+             |display_control: bool| { self.0.borrow_mut().use_display_control = display_control };
+             |enable_credssp: bool| { self.0.borrow_mut().enable_credssp = enable_credssp };
++            |visual_quality: String| {
++                let parsed = VisualQuality::from_extension_value(&visual_quality);
++                info!("RDP visual quality configured: {:?}", parsed);
++                self.0.borrow_mut().visual_quality = parsed;
++            };
+             |outbound_message_size_limit: f64| {
+                 let limit = if outbound_message_size_limit >= 0.0 && outbound_message_size_limit <= f64::from(u32::MAX) {
+                     #[expect(clippy::as_conversions, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+@@ -224,6 +297,78 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
                  };
                  self.0.borrow_mut().outbound_message_size_limit = if limit > 0 { Some(limit) } else { None };
              };
@@ -3193,7 +5834,39 @@ index 13da806..373f6ea 100644
          }
  
          self.clone()
-@@ -288,13 +411,25 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+@@ -241,6 +386,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+             kdc_proxy_url,
+             client_name,
+             desktop_size,
++            visual_quality,
+             render_canvas,
+             set_cursor_style_callback,
+             set_cursor_style_callback_context,
+@@ -262,6 +408,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+             kdc_proxy_url = inner.kdc_proxy_url.clone();
+             client_name = inner.client_name.clone();
+             desktop_size = inner.desktop_size;
++            visual_quality = inner.visual_quality;
+ 
+             render_canvas = inner.render_canvas.clone().context("render_canvas missing")?;
+ 
+@@ -280,7 +427,14 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+ 
+         info!("Connect to RDP host");
+ 
+-        let mut config = build_config(username, password, server_domain, client_name, desktop_size);
++        let mut config = build_config(
++            username,
++            password,
++            server_domain,
++            client_name,
++            desktop_size,
++            visual_quality,
++        );
+ 
+         let enable_credssp = self.0.borrow().enable_credssp;
+         config.enable_credssp = enable_credssp;
+@@ -288,13 +442,25 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
          let (input_events_tx, input_events_rx) = mpsc::unbounded();
  
          let clipboard = remote_clipboard_changed_callback.clone().map(|callback| {
@@ -3221,7 +5894,7 @@ index 13da806..373f6ea 100644
          });
  
          let ws = WebSocket::open(&proxy_address).context("couldn't open WebSocket")?;
-@@ -325,6 +460,33 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+@@ -325,6 +491,33 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
  
          let use_display_control = self.0.borrow().use_display_control;
  
@@ -3255,7 +5928,7 @@ index 13da806..373f6ea 100644
          let (connection_result, ws) = connect(ConnectParams {
              ws,
              config,
-@@ -334,6 +496,10 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+@@ -334,6 +527,10 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
              kdc_proxy_url,
              clipboard_backend: clipboard.as_ref().map(|clip| clip.backend()),
              use_display_control,
@@ -3266,7 +5939,7 @@ index 13da806..373f6ea 100644
          })
          .await?;
  
-@@ -359,6 +525,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
+@@ -359,6 +556,7 @@ impl iron_remote_desktop::SessionBuilder for SessionBuilder {
              rdp_reader: RefCell::new(Some(rdp_reader)),
              connection_result: RefCell::new(Some(connection_result)),
              clipboard: RefCell::new(Some(clipboard)),
@@ -3274,7 +5947,17 @@ index 13da806..373f6ea 100644
          })
      }
  }
-@@ -404,6 +571,7 @@ pub(crate) struct Session {
+@@ -370,6 +568,9 @@ pub(crate) enum RdpInputEvent {
+     Cliprdr(ClipboardMessage),
+     ClipboardBackend(WasmClipboardBackendMessage),
+     FastPath(FastPathInputEvents),
++    SnapshotThumbnail {
++        callback: js_sys::Function,
++    },
+     Resize {
+         width: u32,
+         height: u32,
+@@ -404,6 +605,7 @@ pub(crate) struct Session {
      connection_result: RefCell<Option<connector::ConnectionResult>>,
      rdp_reader: RefCell<Option<ReadHalf<WebSocket>>>,
      clipboard: RefCell<Option<Option<WasmClipboard>>>,
@@ -3282,7 +5965,7 @@ index 13da806..373f6ea 100644
  }
  
  impl Session {
-@@ -473,6 +641,9 @@ impl iron_remote_desktop::Session for Session {
+@@ -473,6 +675,9 @@ impl iron_remote_desktop::Session for Session {
  
          let mut clipboard = self.clipboard.borrow_mut().take().expect("run called only once");
  
@@ -3292,7 +5975,35 @@ index 13da806..373f6ea 100644
          let mut framed = ironrdp_futures::LocalFuturesFramed::new(rdp_reader);
  
          debug!("Initialize canvas");
-@@ -592,8 +763,33 @@ impl iron_remote_desktop::Session for Session {
+@@ -494,6 +699,7 @@ impl iron_remote_desktop::Session for Session {
+             connection_result.desktop_size.width,
+             connection_result.desktop_size.height,
+         );
++        let mut graphics_update_count: u64 = 0;
+ 
+         let mut requested_resize = None;
+ 
+@@ -570,6 +776,19 @@ impl iron_remote_desktop::Session for Session {
+                             active_stage.process_fastpath_input(&mut image, &events)
+                                 .context("fast path input events processing")?
+                         }
++                        RdpInputEvent::SnapshotThumbnail { callback } => {
++                            match encode_snapshot_thumbnail_data_url(&image) {
++                                Ok(thumbnail_url) => {
++                                    let args = js_sys::Array::new();
++                                    args.push(&JsValue::from_str(&thumbnail_url));
++                                    if let Err(error) = callback.apply(&JsValue::NULL, &args) {
++                                        warn!(?error, "snapshot_thumbnail callback failed");
++                                    }
++                                }
++                                Err(error) => warn!(%error, "snapshot_thumbnail encoding failed"),
++                            }
++                            Vec::new()
++                        }
+                         RdpInputEvent::Resize { width, height, scale_factor, physical_size } => {
+                             debug!(width, height, scale_factor, "Resize event received");
+                             if width == 0 || height == 0 {
+@@ -592,8 +811,33 @@ impl iron_remote_desktop::Session for Session {
                          }
                      }
                  }
@@ -3326,13 +6037,24 @@ index 13da806..373f6ea 100644
              for out in outputs {
                  match out {
                      ActiveStageOutput::ResponseFrame(frame) => {
-@@ -602,9 +798,11 @@ impl iron_remote_desktop::Session for Session {
+@@ -602,9 +846,22 @@ impl iron_remote_desktop::Session for Session {
                              .context("Send frame to writer task")?;
                      }
                      ActiveStageOutput::GraphicsUpdate(region) => {
 -                        // PERF: some copies and conversion could be optimized
 -                        let (region, buffer) = extract_partial_image(&image, region);
 -                        gui.draw(&buffer, region).context("draw updated region")?;
++                        graphics_update_count = graphics_update_count.saturating_add(1);
++                        if graphics_update_count <= 3 || graphics_update_count % 60 == 0 {
++                            info!(
++                                graphics_update_count,
++                                left = region.left,
++                                top = region.top,
++                                width = region.width(),
++                                height = region.height(),
++                                "Official canvas graphics update"
++                            );
++                        }
 +                        // Zero-copy: reference image data directly, no Vec allocation
 +                        let (data, image_width) = crate::image::extract_partial_image_ref(&image, &region);
 +                        gui.draw_strided(data, region, image_width)
@@ -3341,7 +6063,19 @@ index 13da806..373f6ea 100644
                      }
                      ActiveStageOutput::PointerDefault => {
                          self.set_cursor_style(CursorStyle::Default)?;
-@@ -772,6 +970,13 @@ impl iron_remote_desktop::Session for Session {
+@@ -717,6 +974,11 @@ impl iron_remote_desktop::Session for Session {
+                             self.render_canvas.set_width(width.get());
+                             self.render_canvas.set_height(height.get());
+                             gui.resize(width, height);
++                            info!(
++                                width = width.get(),
++                                height = height.get(),
++                                "Official canvas resize applied after DeactivateAll"
++                            );
+                             requested_resize = None;
+                         }
+ 
+@@ -772,6 +1034,13 @@ impl iron_remote_desktop::Session for Session {
                      ActiveStageOutput::Terminate(reason) => break 'outer reason,
                  }
              }
@@ -3355,24 +6089,157 @@ index 13da806..373f6ea 100644
          };
  
          info!(%disconnect_reason, "RDP session terminated");
-@@ -911,13 +1116,13 @@ fn build_config(
+@@ -862,6 +1131,21 @@ impl iron_remote_desktop::Session for Session {
+     }
+ 
+     fn invoke_extension(&self, ext: Extension) -> Result<JsValue, Self::Error> {
++        if ext.ident() == "snapshot_thumbnail" {
++            let callback = ext.into_value().dyn_into::<js_sys::Function>().map_err(|_| {
++                IronError::from(anyhow::Error::msg(
++                    "snapshot_thumbnail extension value must be a function",
++                ))
++                .with_kind(IronErrorKind::General)
++            })?;
++
++            self.input_events_tx
++                .unbounded_send(RdpInputEvent::SnapshotThumbnail { callback })
++                .context("Send snapshot_thumbnail event")?;
++
++            return Ok(JsValue::from_bool(true));
++        }
++
+         Err(
+             IronError::from(anyhow::Error::msg(format!("unknown extension: {}", ext.ident())))
+                 .with_kind(IronErrorKind::General),
+@@ -869,12 +1153,74 @@ impl iron_remote_desktop::Session for Session {
+     }
+ }
+ 
++fn encode_snapshot_thumbnail_data_url(image: &DecodedImage) -> anyhow::Result<String> {
++    const MAX_THUMBNAIL_WIDTH: u32 = 640;
++    const MAX_THUMBNAIL_HEIGHT: u32 = 360;
++
++    let src_width = u32::from(image.width());
++    let src_height = u32::from(image.height());
++    if src_width == 0 || src_height == 0 {
++        anyhow::bail!("source image is empty");
++    }
++
++    let mut dst_width = src_width;
++    let mut dst_height = src_height;
++    if dst_width > MAX_THUMBNAIL_WIDTH {
++        dst_height = (dst_height * MAX_THUMBNAIL_WIDTH / dst_width).max(1);
++        dst_width = MAX_THUMBNAIL_WIDTH;
++    }
++    if dst_height > MAX_THUMBNAIL_HEIGHT {
++        dst_width = (dst_width * MAX_THUMBNAIL_HEIGHT / dst_height).max(1);
++        dst_height = MAX_THUMBNAIL_HEIGHT;
++    }
++
++    let src = image.data();
++    let expected_len = usize::try_from(src_width * src_height * 4).context("thumbnail source size overflow")?;
++    if src.len() < expected_len {
++        anyhow::bail!("source image buffer is too small");
++    }
++
++    let dst_len = usize::try_from(dst_width * dst_height * 4).context("thumbnail destination size overflow")?;
++    let mut dst = vec![0u8; dst_len];
++
++    for y in 0..dst_height {
++        let src_y = y * src_height / dst_height;
++        for x in 0..dst_width {
++            let src_x = x * src_width / dst_width;
++            let src_offset = usize::try_from((src_y * src_width + src_x) * 4).context("source offset overflow")?;
++            let dst_offset = usize::try_from((y * dst_width + x) * 4).context("destination offset overflow")?;
++
++            dst[dst_offset] = src[src_offset];
++            dst[dst_offset + 1] = src[src_offset + 1];
++            dst[dst_offset + 2] = src[src_offset + 2];
++            dst[dst_offset + 3] = 255;
++        }
++    }
++
++    let mut png_buffer = Vec::new();
++    {
++        let mut encoder = png::Encoder::new(&mut png_buffer, dst_width, dst_height);
++        encoder.set_color(png::ColorType::Rgba);
++        encoder.set_depth(png::BitDepth::Eight);
++        encoder.set_compression(png::Compression::Fast);
++        let mut writer = encoder.write_header().context("PNG encoder header write failed")?;
++        writer
++            .write_image_data(&dst)
++            .context("failed to encode snapshot thumbnail PNG")?;
++    }
++
++    let mut data_url = "data:image/png;base64,".to_owned();
++    base64::engine::general_purpose::STANDARD.encode_string(png_buffer, &mut data_url);
++    Ok(data_url)
++}
++
+ fn build_config(
+     username: String,
+     password: String,
+     domain: Option<String>,
+     client_name: String,
+     desktop_size: DesktopSize,
++    visual_quality: VisualQuality,
+ ) -> connector::Config {
+     connector::Config {
+         credentials: Credentials::UsernamePassword { username, password },
+@@ -893,7 +1239,7 @@ fn build_config(
+             height: desktop_size.height,
+         },
+         bitmap: Some(connector::BitmapConfig {
+-            color_depth: 16,
++            color_depth: 32,
+             lossy_compression: true,
+             codecs: client_codecs_capabilities(&[]).expect("can't panic for &[]"),
+         }),
+@@ -910,14 +1256,18 @@ fn build_config(
+         // https://github.com/FreeRDP/FreeRDP/blob/4e24b966c86fdf494a782f0dfcfc43a057a2ea60/libfreerdp/core/settings.c#LL49C34-L49C70
          client_dir: "C:\\Windows\\System32\\mstscax.dll".to_owned(),
          platform: ironrdp::pdu::rdp::capability_sets::MajorPlatformType::UNSPECIFIED,
++        // Keep web-mode bulk compression disabled. The native NextDesk path
++        // owns a bulk decompressor, but the official web session path does not.
++        // Advertising RDP 6.1 compression here makes Windows send compressed
++        // FastPath payloads that are later decoded as corrupt pointer updates.
          compression_type: None,
 -        enable_server_pointer: false,
-+        enable_server_pointer: true,
-         autologon: false,
+-        autologon: false,
 -        enable_audio_playback: false,
++        enable_server_pointer: true,
++        autologon: true,
 +        enable_audio_playback: true,
          request_data: None,
          pointer_software_rendering: false,
          multitransport_flags: None,
 -        performance_flags: PerformanceFlags::default(),
-+        performance_flags: PerformanceFlags::DISABLE_WALLPAPER,
++        performance_flags: performance_flags_for_visual_quality(visual_quality),
          desktop_scale_factor: 0,
          hardware_id: None,
          license_cache: None,
-@@ -974,6 +1179,10 @@ struct ConnectParams {
+@@ -927,6 +1277,20 @@ fn build_config(
+     }
+ }
+ 
++fn performance_flags_for_visual_quality(visual_quality: VisualQuality) -> PerformanceFlags {
++    match visual_quality {
++        VisualQuality::Rich => PerformanceFlags::ENABLE_FONT_SMOOTHING | PerformanceFlags::ENABLE_DESKTOP_COMPOSITION,
++        VisualQuality::Balanced => {
++            PerformanceFlags::ENABLE_FONT_SMOOTHING
++                | PerformanceFlags::DISABLE_WALLPAPER
++                | PerformanceFlags::DISABLE_FULLWINDOWDRAG
++                | PerformanceFlags::DISABLE_MENUANIMATIONS
++                | PerformanceFlags::DISABLE_THEMING
++                | PerformanceFlags::DISABLE_CURSOR_SHADOW
++        }
++    }
++}
++
+ async fn writer_task(
+     rx: mpsc::UnboundedReceiver<Vec<u8>>,
+     rdp_writer: WriteHalf<WebSocket>,
+@@ -974,6 +1338,10 @@ struct ConnectParams {
      kdc_proxy_url: Option<String>,
      clipboard_backend: Option<WasmClipboardBackend>,
      use_display_control: bool,
@@ -3383,7 +6250,7 @@ index 13da806..373f6ea 100644
  }
  
  async fn connect(
-@@ -986,6 +1195,10 @@ async fn connect(
+@@ -986,6 +1354,10 @@ async fn connect(
          kdc_proxy_url,
          clipboard_backend,
          use_display_control,
@@ -3394,7 +6261,7 @@ index 13da806..373f6ea 100644
      }: ConnectParams,
  ) -> Result<(connector::ConnectionResult, WebSocket), IronError> {
      let mut framed = ironrdp_futures::LocalFuturesFramed::new(ws);
-@@ -993,16 +1206,66 @@ async fn connect(
+@@ -993,16 +1365,66 @@ async fn connect(
      // In web browser environments, we do not have an easy access to the local address of the socket.
      let dummy_client_addr = core::net::SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 33899));
  
@@ -3441,7 +6308,7 @@ index 13da806..373f6ea 100644
 +            let handler = crate::gfx::WasmGfxHandler::new(gfx_cb);
 +            dvc = dvc.with_dynamic_channel(GraphicsPipelineClient::new(Box::new(handler)));
 +            has_dvc = true;
-+            info!("GFX graphics pipeline channel registered");
++            info!("GFX graphics pipeline channel registered (H.264-only JS renderer with fallback diagnostics)");
 +        }
 +
 +        if use_display_control {
@@ -3465,7 +6332,7 @@ index 13da806..373f6ea 100644
      }
  
      let (upgraded, server_public_key) =
-@@ -1028,6 +1291,11 @@ async fn connect(
+@@ -1028,6 +1450,11 @@ async fn connect(
  
      let ws = framed.into_inner_no_leftover();
  

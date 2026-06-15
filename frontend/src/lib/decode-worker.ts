@@ -12,6 +12,11 @@
  */
 
 let decoder: VideoDecoder | null = null;
+type PendingFrameMeta = {
+  surfaceId: number;
+  rect: { left: number; top: number; right: number; bottom: number };
+} | undefined;
+const pendingFrames: PendingFrameMeta[] = [];
 
 function hasAnnexBStartCode(data: Uint8Array): boolean {
   for (let i = 0; i < data.length - 4; i++) {
@@ -71,11 +76,13 @@ function initDecoder(codec = 'avc1.64001f') {
   if (decoder && decoder.state !== 'closed') {
     decoder.close();
   }
+  pendingFrames.length = 0;
 
   decoder = new VideoDecoder({
     output: (frame: VideoFrame) => {
+      const meta = pendingFrames.shift();
       // Transfer VideoFrame back to main thread (zero-copy)
-      self.postMessage({ type: 'frame', frame }, [frame] as any);
+      self.postMessage({ type: 'frame', frame, surfaceId: meta?.surfaceId, rect: meta?.rect }, [frame] as any);
     },
     error: (err: DOMException) => {
       self.postMessage({ type: 'error', message: err.message });
@@ -107,9 +114,11 @@ self.onmessage = (e: MessageEvent) => {
         timestamp: msg.timestamp,
         data,
       });
+      pendingFrames.push({ surfaceId: Number(msg.surfaceId ?? 0), rect: msg.rect });
       try {
         decoder!.decode(chunk);
       } catch (err: any) {
+        pendingFrames.pop();
         self.postMessage({
           type: 'error', message: err?.message || String(err),
         });
@@ -122,6 +131,7 @@ self.onmessage = (e: MessageEvent) => {
         decoder.reset();
         initDecoder();
       }
+      pendingFrames.length = 0;
       break;
     }
 
@@ -130,6 +140,7 @@ self.onmessage = (e: MessageEvent) => {
         decoder.close();
       }
       decoder = null;
+      pendingFrames.length = 0;
       break;
     }
   }

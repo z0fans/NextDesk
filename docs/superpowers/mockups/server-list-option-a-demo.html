@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NextDesk Server List Option A Demo</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f9fc;
+      --panel: #ffffff;
+      --line: #dfe7f2;
+      --line-strong: #c9d7ea;
+      --text: #071124;
+      --muted: #6d7c92;
+      --soft: #f1f5fa;
+      --blue: #3d8bff;
+      --blue-soft: #e9f2ff;
+      --orange: #f59e0b;
+      --orange-soft: #fff5df;
+      --slate: #64748b;
+      --green: #18b87a;
+      --red: #e85c5c;
+      --cyan: #23c7df;
+      --shadow: 0 18px 40px rgba(25, 43, 70, 0.08);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    button {
+      font: inherit;
+      border: 0;
+      cursor: pointer;
+    }
+
+    .page {
+      min-height: 100vh;
+      padding: 40px;
+    }
+
+    .shell {
+      max-width: 1180px;
+      margin: 0 auto;
+    }
+
+    .header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 26px;
+    }
+
+    .title h1 {
+      margin: 0;
+      font-size: 38px;
+      line-height: 1.08;
+      letter-spacing: 0;
+    }
+
+    .title p {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .icon-button,
+    .toolbar-button {
+      height: 42px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--slate);
+      box-shadow: 0 8px 18px rgba(26, 45, 75, 0.08);
+    }
+
+    .icon-button {
+      width: 42px;
+      display: grid;
+      place-items: center;
+      font-size: 19px;
+    }
+
+    .toolbar-button {
+      padding: 0 16px;
+      font-weight: 700;
+      color: #2d5f9c;
+    }
+
+    .toolbar-button.primary {
+      color: #ffffff;
+      border-color: transparent;
+      background: linear-gradient(135deg, #2f7dff, #28b7d6);
+    }
+
+    .groups {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+      margin-bottom: 22px;
+    }
+
+    .group-card {
+      position: relative;
+      min-height: 172px;
+      padding: 24px;
+      border-radius: 22px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      box-shadow: none;
+      text-align: left;
+      overflow: hidden;
+    }
+
+    .group-card::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 5px;
+      background: var(--accent);
+    }
+
+    .group-card.active {
+      border-color: var(--line-strong);
+      box-shadow: var(--shadow);
+    }
+
+    .group-card .top {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
+    }
+
+    .group-icon {
+      width: 50px;
+      height: 50px;
+      border-radius: 16px;
+      background: var(--accent-soft);
+      display: grid;
+      place-items: center;
+      font-size: 25px;
+      flex: 0 0 auto;
+    }
+
+    .group-meta {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .group-meta h2 {
+      margin: 0;
+      font-size: 21px;
+      line-height: 1.1;
+      letter-spacing: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .group-meta p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .select-pill {
+      align-self: flex-start;
+      padding: 5px 11px;
+      border-radius: 999px;
+      border: 1px solid rgba(35, 199, 223, 0.35);
+      color: #13afc7;
+      background: #eafcff;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+      flex: 0 0 auto;
+    }
+
+    .current-node {
+      margin-top: 22px;
+      padding: 15px 16px;
+      border-radius: 18px;
+      border: 1px solid #edf1f7;
+      background: #fbfdff;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 0 5px var(--accent-soft);
+      flex: 0 0 auto;
+    }
+
+    .current-label {
+      color: var(--muted);
+      font-weight: 700;
+      flex: 0 0 auto;
+    }
+
+    .current-name {
+      min-width: 0;
+      flex: 1;
+      color: var(--accent);
+      font-weight: 850;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .delay {
+      flex: 0 0 auto;
+      font-size: 13px;
+      font-weight: 850;
+      color: var(--green);
+    }
+
+    .content {
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: var(--panel);
+      overflow: hidden;
+      box-shadow: 0 8px 20px rgba(25, 43, 70, 0.05);
+    }
+
+    .content-head {
+      padding: 22px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .content-title {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
+    }
+
+    .content-title h3 {
+      margin: 0;
+      font-size: 23px;
+      letter-spacing: 0;
+    }
+
+    .content-title p {
+      margin: 5px 0 0;
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    .content-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex: 0 0 auto;
+    }
+
+    .segmented {
+      display: flex;
+      padding: 4px;
+      border-radius: 999px;
+      background: var(--soft);
+      border: 1px solid var(--line);
+    }
+
+    .segmented button {
+      height: 34px;
+      padding: 0 13px;
+      border-radius: 999px;
+      background: transparent;
+      color: var(--muted);
+      font-weight: 800;
+    }
+
+    .segmented button.active {
+      background: var(--panel);
+      color: #2d5f9c;
+      box-shadow: 0 4px 10px rgba(25, 43, 70, 0.08);
+    }
+
+    .node-list {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      padding: 22px 24px 26px;
+    }
+
+    .node-card {
+      min-height: 86px;
+      padding: 18px;
+      border-radius: 18px;
+      background: #f8fbff;
+      border: 1px solid transparent;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+    }
+
+    .node-card.selected {
+      background: var(--blue-soft);
+      border-color: #9bc3ff;
+    }
+
+    .node-info {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .flag {
+      width: 34px;
+      height: 34px;
+      border-radius: 999px;
+      background: #ffffff;
+      display: grid;
+      place-items: center;
+      box-shadow: inset 0 0 0 1px var(--line);
+      flex: 0 0 auto;
+    }
+
+    .node-name {
+      min-width: 0;
+      font-size: 17px;
+      font-weight: 850;
+      color: #477cc7;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .node-meta {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .node-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex: 0 0 auto;
+    }
+
+    .node-delay {
+      min-width: 54px;
+      text-align: right;
+      color: #e8b900;
+      font-size: 14px;
+      font-weight: 900;
+    }
+
+    .node-delay.good { color: var(--green); }
+    .node-delay.bad { color: var(--red); }
+
+    .small-button {
+      width: 34px;
+      height: 34px;
+      border-radius: 999px;
+      background: #ffffff;
+      color: var(--slate);
+      border: 1px solid var(--line);
+      display: grid;
+      place-items: center;
+    }
+
+    .status-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 15px 24px;
+      border-top: 1px solid var(--line);
+      background: #fbfdff;
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .status-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .pulse {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+    }
+
+    .note {
+      margin-top: 16px;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.65;
+    }
+
+    @media (max-width: 920px) {
+      .page { padding: 24px; }
+      .header {
+        flex-direction: column;
+      }
+      .toolbar {
+        justify-content: flex-start;
+      }
+      .groups,
+      .node-list {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 560px) {
+      .page { padding: 16px; }
+      .title h1 { font-size: 31px; }
+      .content-head {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+      .content-actions {
+        width: 100%;
+        justify-content: space-between;
+      }
+      .node-card {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+      .node-actions {
+        width: 100%;
+        justify-content: space-between;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="shell" aria-label="NextDesk server list option A demo">
+      <header class="header">
+        <div class="title">
+          <h1>服务器列表</h1>
+          <p>管理可用连接节点</p>
+        </div>
+        <div class="toolbar" aria-label="测速工具栏">
+          <button class="toolbar-button" id="test-current">测速当前分组</button>
+          <button class="toolbar-button primary" id="test-all">测速全部</button>
+          <button class="icon-button" title="刷新订阅" aria-label="刷新订阅">↻</button>
+        </div>
+      </header>
+
+      <section class="groups" aria-label="服务器分组">
+        <button class="group-card active" data-group="americas" style="--accent: var(--blue); --accent-soft: var(--blue-soft);">
+          <div class="top">
+            <div class="group-icon">🌎</div>
+            <div class="group-meta">
+              <h2>Server-Americas</h2>
+              <p>加速欧美地区 RDP 连接</p>
+            </div>
+            <span class="select-pill">SELECT</span>
+          </div>
+          <div class="current-node">
+            <span class="dot"></span>
+            <span class="current-label">当前节点</span>
+            <span class="current-name">🇺🇸 US Server Only 01</span>
+            <span class="delay">168ms</span>
+          </div>
+        </button>
+
+        <button class="group-card" data-group="asia" style="--accent: var(--orange); --accent-soft: var(--orange-soft);">
+          <div class="top">
+            <div class="group-icon">🌏</div>
+            <div class="group-meta">
+              <h2>Server-Asia</h2>
+              <p>加速亚洲地区 RDP 连接</p>
+            </div>
+            <span class="select-pill">SELECT</span>
+          </div>
+          <div class="current-node">
+            <span class="dot"></span>
+            <span class="current-label">当前节点</span>
+            <span class="current-name">🇭🇰 HK Server Only 01</span>
+            <span class="delay">47ms</span>
+          </div>
+        </button>
+
+        <button class="group-card" data-group="global" style="--accent: var(--slate); --accent-soft: #eef2f7;">
+          <div class="top">
+            <div class="group-icon">🌐</div>
+            <div class="group-meta">
+              <h2>Server-Global</h2>
+              <p>兜底规则 · 未匹配区域的流量</p>
+            </div>
+            <span class="select-pill">SELECT</span>
+          </div>
+          <div class="current-node">
+            <span class="dot"></span>
+            <span class="current-label">当前节点</span>
+            <span class="current-name">🇭🇰 HK Server Only 01</span>
+            <span class="delay">47ms</span>
+          </div>
+        </button>
+      </section>
+
+      <section class="content" aria-label="当前分组节点">
+        <div class="content-head">
+          <div class="content-title">
+            <div class="group-icon" id="detail-icon" style="background: var(--blue-soft);">🌎</div>
+            <div>
+              <h3 id="detail-title">Server-Americas</h3>
+              <p id="detail-subtitle">当前节点：🇺🇸 US Server Only 01</p>
+            </div>
+          </div>
+          <div class="content-actions">
+            <div class="segmented" aria-label="排序">
+              <button class="active">默认</button>
+              <button>延迟</button>
+              <button>名称</button>
+            </div>
+            <button class="icon-button" title="测速当前分组" aria-label="测速当前分组">⚡</button>
+          </div>
+        </div>
+
+        <div class="node-list" id="node-list"></div>
+
+        <div class="status-bar">
+          <div class="status-left">
+            <span class="pulse"></span>
+            <span id="status-text">延迟数据独立保存，切换分组或折叠视图不会影响测速目标。</span>
+          </div>
+          <span id="last-tested">上次测速：刚刚</span>
+        </div>
+      </section>
+
+      <p class="note">
+        设计重点：顶部卡片只负责选择分组和展示当前节点；下方区域只展示一个当前分组的节点列表；
+        测速按钮固定在工具栏，不再依赖任何折叠状态。这样“看什么”和“测什么”是两个独立状态。
+      </p>
+    </section>
+  </main>
+
+  <script>
+    const groups = {
+      americas: {
+        title: "Server-Americas",
+        icon: "🌎",
+        accent: "var(--blue-soft)",
+        current: "🇺🇸 US Server Only 01",
+        nodes: [
+          { name: "🇺🇸 US Server Only 01", route: "RDP · Americas", delay: 168, selected: true },
+          { name: "🇺🇸 US Server Only 02", route: "RDP · Americas", delay: 158, selected: false },
+        ],
+      },
+      asia: {
+        title: "Server-Asia",
+        icon: "🌏",
+        accent: "var(--orange-soft)",
+        current: "🇭🇰 HK Server Only 01",
+        nodes: [
+          { name: "🇭🇰 HK Server Only 01", route: "RDP · Asia-Pacific", delay: 47, selected: true },
+        ],
+      },
+      global: {
+        title: "Server-Global",
+        icon: "🌐",
+        accent: "#eef2f7",
+        current: "🇭🇰 HK Server Only 01",
+        nodes: [
+          { name: "🇭🇰 HK Server Only 01", route: "Fallback", delay: 47, selected: true },
+          { name: "🇺🇸 US Server Only 01", route: "Fallback", delay: 168, selected: false },
+          { name: "🇺🇸 US Server Only 02", route: "Fallback", delay: 158, selected: false },
+        ],
+      },
+    };
+
+    const cards = document.querySelectorAll(".group-card");
+    const nodeList = document.getElementById("node-list");
+    const detailIcon = document.getElementById("detail-icon");
+    const detailTitle = document.getElementById("detail-title");
+    const detailSubtitle = document.getElementById("detail-subtitle");
+    const statusText = document.getElementById("status-text");
+    const lastTested = document.getElementById("last-tested");
+    let activeGroup = "americas";
+
+    function renderGroup(groupKey) {
+      const group = groups[groupKey];
+      activeGroup = groupKey;
+      cards.forEach((card) => card.classList.toggle("active", card.dataset.group === groupKey));
+      detailIcon.textContent = group.icon;
+      detailIcon.style.background = group.accent;
+      detailTitle.textContent = group.title;
+      detailSubtitle.textContent = `当前节点：${group.current}`;
+      nodeList.innerHTML = group.nodes.map((node) => `
+        <button class="node-card ${node.selected ? "selected" : ""}">
+          <span class="node-info">
+            <span class="flag">${node.name.slice(0, 4)}</span>
+            <span>
+              <span class="node-name">${node.name}</span>
+              <span class="node-meta">${node.route}</span>
+            </span>
+          </span>
+          <span class="node-actions">
+            <span class="node-delay ${node.delay < 120 ? "good" : ""}">${node.delay}ms</span>
+            <span class="small-button">✓</span>
+          </span>
+        </button>
+      `).join("");
+    }
+
+    function simulateTest(scope) {
+      statusText.textContent = scope === "all" ? "正在测速全部 RDP 节点..." : `正在测速 ${groups[activeGroup].title}...`;
+      lastTested.textContent = "测速中";
+      document.querySelectorAll(".node-delay, .delay").forEach((item) => {
+        item.textContent = "...";
+      });
+      setTimeout(() => {
+        Object.values(groups).forEach((group) => {
+          group.nodes.forEach((node) => {
+            const base = node.name.includes("HK") ? 42 : node.name.includes("02") ? 156 : 166;
+            node.delay = base + Math.floor(Math.random() * 30);
+          });
+        });
+        renderGroup(activeGroup);
+        statusText.textContent = scope === "all" ? "全部节点测速完成。" : "当前分组测速完成。";
+        lastTested.textContent = "上次测速：刚刚";
+        cards.forEach((card) => {
+          const group = groups[card.dataset.group];
+          const delayNode = card.querySelector(".delay");
+          const current = group.nodes.find((node) => node.name === group.current) || group.nodes[0];
+          delayNode.textContent = `${current.delay}ms`;
+        });
+      }, 800);
+    }
+
+    cards.forEach((card) => card.addEventListener("click", () => renderGroup(card.dataset.group)));
+    document.getElementById("test-current").addEventListener("click", () => simulateTest("current"));
+    document.getElementById("test-all").addEventListener("click", () => simulateTest("all"));
+    document.querySelector(".content-actions .icon-button").addEventListener("click", () => simulateTest("current"));
+
+    renderGroup(activeGroup);
+  </script>
+</body>
+</html>
