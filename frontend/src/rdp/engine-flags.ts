@@ -1,7 +1,11 @@
-export type RdpEngineMode = 'native' | 'official-web';
+export type RdpEngineMode = 'native' | 'native-drift' | 'official-web';
+export type RdpWasmLogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error';
 
 export const RDP_ENGINE_STORAGE_KEY = 'nextdesk_rdp_engine';
 export const RDP_EXPERIMENTAL_NATIVE_STORAGE_KEY = 'nextdesk_experimental_native_rdp';
+export const RDP_WASM_LOG_LEVEL_STORAGE_KEY = 'nextdesk_rdp_wasm_log_level';
+export const DEFAULT_RDP_ENGINE_MODE: RdpEngineMode = 'native-drift';
+export const DEFAULT_EXPERIMENTAL_NATIVE_RDP = true;
 
 type RuntimeGlobal = typeof globalThis & {
   __NEXTDESK_RDP_ENGINE__?: unknown;
@@ -19,6 +23,12 @@ type ResolveRdpRuntimeBooleanFlagOptions = {
   storageValue?: string | null;
   envValue?: string | null;
   defaultValue: boolean;
+};
+
+type ResolveRdpWasmLogLevelOptions = {
+  isDev: boolean;
+  storageValue?: string | null;
+  envValue?: string | null;
 };
 
 export type OfficialWebFeatureFlags = {
@@ -78,6 +88,14 @@ export function parseRdpEngineMode(value: string | null | undefined): RdpEngineM
   if (!normalized) return null;
   if (normalized === 'native' || normalized === 'ironrdp-native') return 'native';
   if (
+    normalized === 'native-drift' ||
+    normalized === 'native-fast' ||
+    normalized === 'ironrdp-native-drift' ||
+    normalized === 'drift'
+  ) {
+    return 'native-drift';
+  }
+  if (
     normalized === 'official-web' ||
     normalized === 'web' ||
     normalized === 'wasm' ||
@@ -110,6 +128,26 @@ export function parseRdpBooleanFlag(value: string | null | undefined, defaultVal
     return false;
   }
   return defaultValue;
+}
+
+export function parseRdpWasmLogLevel(value: string | null | undefined): RdpWasmLogLevel | null {
+  const normalized = value?.trim().toLowerCase();
+  if (
+    normalized === 'trace' ||
+    normalized === 'debug' ||
+    normalized === 'info' ||
+    normalized === 'warn' ||
+    normalized === 'error'
+  ) {
+    return normalized;
+  }
+  return null;
+}
+
+export function resolveRdpWasmLogLevel(options: ResolveRdpWasmLogLevelOptions): RdpWasmLogLevel {
+  return parseRdpWasmLogLevel(options.storageValue) ??
+    parseRdpWasmLogLevel(options.envValue) ??
+    (options.isDev ? 'debug' : 'warn');
 }
 
 export function resolveRdpRuntimeBooleanFlag(options: ResolveRdpRuntimeBooleanFlagOptions): boolean {
@@ -146,15 +184,18 @@ function resolveExperimentalNativeFlag(
   storage: Storage | null,
 ): boolean {
   const fromGlobal = readGlobalValue('__NEXTDESK_EXPERIMENTAL_NATIVE_RDP__');
-  if (typeof fromGlobal === 'string') return parseRdpBooleanFlag(fromGlobal, false);
+  if (typeof fromGlobal === 'string') return parseRdpBooleanFlag(fromGlobal, DEFAULT_EXPERIMENTAL_NATIVE_RDP);
   if (typeof fromGlobal === 'boolean') return fromGlobal;
   const experimentalNativeValue = readOption(options, 'experimentalNativeValue');
   if (experimentalNativeValue !== undefined) {
-    return parseRdpBooleanFlag(experimentalNativeValue, false);
+    return parseRdpBooleanFlag(experimentalNativeValue, DEFAULT_EXPERIMENTAL_NATIVE_RDP);
   }
   const fromStorage = readStorageItem(storage, RDP_EXPERIMENTAL_NATIVE_STORAGE_KEY);
-  if (fromStorage !== null) return parseRdpBooleanFlag(fromStorage, false);
-  return parseRdpBooleanFlag(readEnvValue('VITE_NEXTDESK_EXPERIMENTAL_NATIVE_RDP'), false);
+  if (fromStorage !== null) return parseRdpBooleanFlag(fromStorage, DEFAULT_EXPERIMENTAL_NATIVE_RDP);
+  return parseRdpBooleanFlag(
+    readEnvValue('VITE_NEXTDESK_EXPERIMENTAL_NATIVE_RDP'),
+    DEFAULT_EXPERIMENTAL_NATIVE_RDP,
+  );
 }
 
 export function resolveRdpEngineMode(options: ResolveRdpEngineModeOptions = {}): RdpEngineMode {
@@ -176,14 +217,18 @@ export function resolveRdpEngineMode(options: ResolveRdpEngineModeOptions = {}):
   for (const candidate of candidates) {
     const mode = parseRdpEngineMode(candidate);
     if (mode === 'official-web') return 'official-web';
-    if (mode === 'native' && experimentalNative) return 'native';
+    if ((mode === 'native' || mode === 'native-drift') && experimentalNative) return mode;
   }
 
-  return 'official-web';
+  return experimentalNative ? DEFAULT_RDP_ENGINE_MODE : 'official-web';
 }
 
 export function isNativeRdpMode(mode: RdpEngineMode): boolean {
-  return mode === 'native';
+  return mode === 'native' || mode === 'native-drift';
+}
+
+export function isNativeDriftRdpMode(mode: RdpEngineMode): boolean {
+  return mode === 'native-drift';
 }
 
 export function isOfficialIronRdpWebMode(mode: RdpEngineMode): boolean {

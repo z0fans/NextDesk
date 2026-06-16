@@ -80,6 +80,7 @@ pub struct NextDeskCliprdrFactory {
     action_tx: mpsc::UnboundedSender<CliprdrAction>,
     app_handle: AppHandle,
     temp_dir: String,
+    session_id: String,
 }
 
 impl NextDeskCliprdrFactory {
@@ -87,11 +88,13 @@ impl NextDeskCliprdrFactory {
         action_tx: mpsc::UnboundedSender<CliprdrAction>,
         app_handle: AppHandle,
         temp_dir: String,
+        session_id: String,
     ) -> Self {
         Self {
             action_tx,
             app_handle,
             temp_dir,
+            session_id,
         }
     }
 }
@@ -99,9 +102,14 @@ impl NextDeskCliprdrFactory {
 impl CliprdrBackendFactory for NextDeskCliprdrFactory {
     fn build_cliprdr_backend(&self) -> Box<dyn CliprdrBackend> {
         let os: Arc<dyn OsClipboard> = Arc::from(create_os_clipboard());
-        let watcher = ClipboardWatcher::new(Arc::clone(&os), self.action_tx.clone());
+        let watcher = ClipboardWatcher::new(
+            Arc::clone(&os),
+            self.action_tx.clone(),
+            self.session_id.clone(),
+        );
 
         Box::new(NextDeskCliprdrBackend {
+            session_id: self.session_id.clone(),
             os,
             watcher,
             action_tx: self.action_tx.clone(),
@@ -122,6 +130,7 @@ impl CliprdrBackendFactory for NextDeskCliprdrFactory {
 // ── Backend ──
 
 pub struct NextDeskCliprdrBackend {
+    session_id: String,
     os: Arc<dyn OsClipboard>,
     watcher: ClipboardWatcher,
     action_tx: mpsc::UnboundedSender<CliprdrAction>,
@@ -420,7 +429,10 @@ impl CliprdrBackend for NextDeskCliprdrBackend {
     }
 
     fn on_ready(&mut self) {
-        log::info!("[cliprdr] CLIPRDR channel ready — starting watcher");
+        log::info!(
+            "[cliprdr] session={} CLIPRDR channel ready — starting watcher",
+            self.session_id
+        );
         self.watcher.start();
     }
 
@@ -428,19 +440,28 @@ impl CliprdrBackend for NextDeskCliprdrBackend {
         &mut self,
         capabilities: ClipboardGeneralCapabilityFlags,
     ) {
-        log::info!("[cliprdr] Negotiated capabilities: {capabilities:?}");
+        log::info!(
+            "[cliprdr] session={} Negotiated capabilities: {capabilities:?}",
+            self.session_id
+        );
         self.capabilities = capabilities;
     }
 
     /// Called during initialization — report local clipboard formats once.
     fn on_request_format_list(&mut self) {
-        log::debug!("[cliprdr] on_request_format_list");
+        log::debug!(
+            "[cliprdr] session={} on_request_format_list",
+            self.session_id
+        );
         let os_formats = self.os.available_formats();
         let rdp_formats = map_os_formats_to_rdp(&os_formats);
-        log::debug!(
-            "[cliprdr] Initial format list: {} OS formats → {} RDP formats",
+        log::info!(
+            "[cliprdr] session={} Initial format list: {} OS formats {:?} -> {} RDP formats [{}]",
+            self.session_id,
             os_formats.len(),
-            rdp_formats.len()
+            os_formats,
+            rdp_formats.len(),
+            describe_clipboard_formats(&rdp_formats)
         );
         if !rdp_formats.is_empty() {
             let _ = self
@@ -451,7 +472,16 @@ impl CliprdrBackend for NextDeskCliprdrBackend {
 
     /// Remote performed copy — pick best format and request data.
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
-        log::info!("[cliprdr] Remote copy: {} formats", available_formats.len());
+        log::info!(
+            "[cliprdr] session={} Remote copy: {} formats",
+            self.session_id,
+            available_formats.len()
+        );
+        log::info!(
+            "[cliprdr] session={} Remote formats: {}",
+            self.session_id,
+            describe_clipboard_formats(available_formats)
+        );
 
         // Don't kick off another file paste while a download is still running.
         // The cleanest signal is the FormatDataResponse we'd request next, but
@@ -499,7 +529,11 @@ impl CliprdrBackend for NextDeskCliprdrBackend {
     /// Server requests data from our local clipboard.
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
         let format_id = request.format.value();
-        log::info!("[cliprdr] Server requests format id={}", format_id);
+        log::info!(
+            "[cliprdr] session={} Server requests format id={}",
+            self.session_id,
+            format_id
+        );
 
         let response = match self.read_format_for_request(format_id) {
             Ok(data) => {
@@ -529,7 +563,11 @@ impl CliprdrBackend for NextDeskCliprdrBackend {
         }
 
         let data = response.data();
-        log::info!("[cliprdr] Received {} bytes from remote", data.len());
+        log::info!(
+            "[cliprdr] session={} Received {} bytes from remote",
+            self.session_id,
+            data.len()
+        );
 
         // Check if this is a FileGroupDescriptorW response (Win→Mac file paste)
         let is_file_group = self.pending_paste_format_id != 0
@@ -609,6 +647,19 @@ impl CliprdrBackend for NextDeskCliprdrBackend {
 
         tokio::task::spawn_blocking(move || {
             let is_data_request = flags.contains(FileContentsFlags::DATA);
+            #[cfg(target_os = "macos")]
+            if let Err(e) = super::os::macos_presenter::fetch_registered_path(&path) {
+                log::debug!(
+                    "[cliprdr] FileContentsRequest lazy fetch failed: {}: {}",
+                    path.display(),
+                    e
+                );
+                let _ = action_tx.send(CliprdrAction::SubmitFileContents(
+                    FileContentsResponse::new_error(stream_id),
+                ));
+                return;
+            }
+
             let response = if flags.contains(FileContentsFlags::SIZE) {
                 match std::fs::metadata(&path) {
                     Ok(meta) => {
@@ -804,6 +855,12 @@ impl CliprdrBackend for NextDeskCliprdrBackend {
 }
 
 impl NextDeskCliprdrBackend {
+    /// Run an explicit local clipboard check for tab/window focus changes.
+    /// The watcher still owns throttling and feedback-loop prevention.
+    pub async fn force_local_clipboard_check(&self) {
+        self.watcher.force_check().await;
+    }
+
     /// Read format data from OS clipboard for a server request.
     fn read_format_for_request(&mut self, format_id: u32) -> Result<Vec<u8>, String> {
         match format_id {
@@ -895,6 +952,11 @@ impl NextDeskCliprdrBackend {
             //                                 Without it the paste finishes silently.
             let flags: u32 = 0x4 | 0x20 | 0x40 | 0x4000;
             fd[0..4].copy_from_slice(&flags.to_le_bytes());
+
+            #[cfg(target_os = "macos")]
+            if let Err(e) = super::os::macos_presenter::fetch_registered_path(path) {
+                return Err(format!("fetch lazy clipboard file {}: {}", path.display(), e));
+            }
 
             // Read file metadata
             let metadata = std::fs::metadata(path)
@@ -1686,6 +1748,20 @@ fn pick_preferred_format(formats: &[ClipboardFormat]) -> Option<ClipboardFormatI
         }
     }
     None
+}
+
+fn describe_clipboard_formats(formats: &[ClipboardFormat]) -> String {
+    formats
+        .iter()
+        .map(|format| {
+            let name = format
+                .name()
+                .map(|name| name.value().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            format!("id={} name={}", format.id().value(), name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Convert OS clipboard formats to RDP advertisement formats.

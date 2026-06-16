@@ -9,8 +9,12 @@ mod macos_file_promise;
 mod macos_item_provider;
 mod macos_pasteboard_promise;
 mod rdp_audio;
+mod rdp_frame;
+mod rdp_gpu_renderer;
+mod rdp_native_view;
 mod rdp_proxy;
 mod rdp_session;
+mod rdp_shared_frame;
 mod rdpdr_backend;
 mod relay;
 mod state;
@@ -992,6 +996,7 @@ async fn rdp_native_connect(
     domain: Option<String>,
     width: u16,
     height: u16,
+    render_profile: Option<String>,
     app_state: State<'_, AppState>,
 ) -> Result<u16, String> {
     if is_private_or_reserved_host(&host) {
@@ -1008,6 +1013,15 @@ async fn rdp_native_connect(
             .await
             .map_err(|e| format!("Failed to start frame WS: {e}"))?;
     let socks_port = *app_state.proxy_port.lock().unwrap();
+    let frame_transport =
+        rdp_session::native_frame_transport_from_profile(render_profile.as_deref());
+    log::info!(
+        "[rdp-native] connect profile tab={} host={} mode={} transport={}",
+        tab_id,
+        host,
+        render_profile.as_deref().unwrap_or("native"),
+        frame_transport.label()
+    );
 
     let handle = rdp_session::spawn_session(
         app,
@@ -1023,10 +1037,58 @@ async fn rdp_native_connect(
         frame_tx,
         ws_port,
         frame_ws_shutdown,
+        frame_transport,
     );
     let mut mgr = app_state.native_sessions.lock().unwrap();
     mgr.insert(tab_id, handle);
     Ok(ws_port)
+}
+
+#[tauri::command]
+fn rdp_native_set_view_bounds(
+    app: tauri::AppHandle,
+    tab_id: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    scale_factor: f64,
+    visible: bool,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    let bounds =
+        rdp_native_view::NativeViewBounds::new(x, y, width, height, scale_factor, visible)?;
+    let changed =
+        rdp_native_view::set_bounds(&app_state.native_view_bounds, tab_id.clone(), bounds)?;
+    let host_update =
+        rdp_native_view::update_host_state(&app_state.native_view_hosts, tab_id.clone(), bounds)?;
+    if changed {
+        log::debug!(
+            "[rdp-native-view] bounds tab={} x={:.1} y={:.1} w={:.1} h={:.1} scale={:.2} visible={}",
+            tab_id,
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
+            bounds.scale_factor,
+            bounds.visible
+        );
+    }
+    if host_update.created || host_update.changed {
+        log::debug!(
+            "[rdp-native-view] host-state tab={} created={} changed={} visible={} generation={}",
+            tab_id,
+            host_update.created,
+            host_update.changed,
+            host_update.visible,
+            host_update.generation
+        );
+    }
+    if bounds.visible {
+        rdp_native_view::prepare_native_host(&app, &tab_id)?;
+        rdp_native_view::mark_host_prepared(&app_state.native_view_hosts, &tab_id)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1057,6 +1119,25 @@ fn rdp_native_input(
     let event = FastPathInputEvent::KeyboardEvent(flags, code);
     tx.send(rdp_session::NativeRdpInput::FastPath(smallvec![event]))
         .map_err(|e| format!("Send input failed: {e}"))
+}
+
+#[tauri::command]
+fn rdp_native_force_clipboard_check(
+    tab_id: String,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    let mgr = app_state.native_sessions.lock().unwrap();
+    let tx = mgr
+        .get_input_tx(&tab_id)
+        .ok_or_else(|| format!("Session not found: {tab_id}"))?;
+
+    tx.send(rdp_session::NativeRdpInput::ForceClipboardCheck)
+        .map_err(|e| format!("Send clipboard check failed: {e}"))
+}
+
+#[tauri::command]
+fn rdp_native_set_active_clipboard_session(tab_id: Option<String>) {
+    cliprdr::watcher::set_active_clipboard_session(tab_id);
 }
 
 #[tauri::command]
@@ -1174,6 +1255,10 @@ fn rdp_native_wheel(
 
 #[tauri::command]
 fn rdp_native_disconnect(tab_id: String, app_state: State<'_, AppState>) -> Result<(), String> {
+    rdp_native_view::remove_bounds(&app_state.native_view_bounds, &tab_id)?;
+    if rdp_native_view::remove_host(&app_state.native_view_hosts, &tab_id)? {
+        log::debug!("[rdp-native-view] removed host-state tab={tab_id}");
+    }
     let mut mgr = app_state.native_sessions.lock().unwrap();
     mgr.disconnect(&tab_id);
     Ok(())
@@ -1503,7 +1588,10 @@ pub fn run() {
             rdp_audio_push_raw,
             rdp_audio_close,
             rdp_native_connect,
+            rdp_native_set_view_bounds,
             rdp_native_input,
+            rdp_native_force_clipboard_check,
+            rdp_native_set_active_clipboard_session,
             rdp_native_mouse,
             rdp_native_wheel,
             rdp_native_disconnect,

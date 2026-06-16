@@ -10,6 +10,7 @@
 import { useEffect, useRef } from 'react';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { RdpPointerEvent, RdpStatusEvent } from '@/api';
+import { isPotentialDriftFramePacket, parseDriftFramePacket, type DriftFramePacket } from '@/lib/drift-frame-protocol';
 import { compactNativeFrameQueue } from '@/lib/native-frame-queue';
 import { rdpLog } from '@/lib/rdp-logger';
 
@@ -469,6 +470,15 @@ export function connectFrameWebSocket(
       return;
     }
 
+    if (isPotentialDriftFramePacket(raw)) {
+      try {
+        if (handleDriftFrame(parseDriftFramePacket(raw))) return;
+      } catch {
+        // Legacy raw bitmap frames can share the same first byte as a Drift
+        // packet. Fall through to the existing 12B header parser on mismatch.
+      }
+    }
+
     const hdr = new DataView(raw, 0, HEADER_SIZE);
     if (hdr.getUint16(0, true) === GFX_FRAME_MAGIC) {
       handleGfxFrame(raw);
@@ -501,22 +511,7 @@ export function connectFrameWebSocket(
       });
     }
 
-    if (currentW !== desktopW || currentH !== desktopH) {
-      canvas.width = desktopW;
-      canvas.height = desktopH;
-      gl.viewport(0, 0, desktopW, desktopH);
-      currentW = desktopW;
-      currentH = desktopH;
-
-      gl.bindTexture(gl.TEXTURE_2D, texture);
-      gl.texImage2D(
-        gl.TEXTURE_2D, 0, gl.RGBA,
-        desktopW, desktopH, 0,
-        gl.RGBA, gl.UNSIGNED_BYTE, null,
-      );
-      textureInitialized = true;
-      needsDraw = false;
-    }
+    ensureBitmapTexture(desktopW, desktopH);
 
     if (!textureInitialized) return;
 
@@ -553,6 +548,92 @@ export function connectFrameWebSocket(
     processedBitmapFrames++;
     onFrame?.({ desktopW, desktopH, x, y, width, height });
     logFps();
+  }
+
+  function ensureBitmapTexture(width: number, height: number) {
+    if (currentW === width && currentH === height && textureInitialized) return;
+
+    canvas.width = width;
+    canvas.height = height;
+    gl.viewport(0, 0, width, height);
+    currentW = width;
+    currentH = height;
+
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.RGBA,
+      width, height, 0,
+      gl.RGBA, gl.UNSIGNED_BYTE, null,
+    );
+    textureInitialized = true;
+    needsDraw = false;
+  }
+
+  function handleDriftFrame(packet: DriftFramePacket): boolean {
+    if (packet.kind === 'h264') {
+      rdpLog.debug('render', 'native drift H.264 frame ignored by canvas renderer', {
+        ...logContext,
+        width: packet.width,
+        height: packet.height,
+        bytes: packet.payload.byteLength,
+      });
+      return true;
+    }
+
+    if (!firstBitmapFrameLogged) {
+      firstBitmapFrameLogged = true;
+      rdpLog.info('render', 'first native drift frame received', {
+        ...logContext,
+        kind: packet.kind,
+        desktopW: packet.width,
+        desktopH: packet.height,
+        byteLength: packet.kind === 'full'
+          ? packet.rgba.byteLength
+          : packet.rects.reduce((sum, rect) => sum + rect.rgba.byteLength, 0),
+      });
+    }
+
+    ensureBitmapTexture(packet.width, packet.height);
+    if (!textureInitialized) return true;
+
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    if (packet.kind === 'full') {
+      gl.texSubImage2D(
+        gl.TEXTURE_2D, 0,
+        0, 0, packet.width, packet.height,
+        gl.RGBA, gl.UNSIGNED_BYTE, packet.rgba,
+      );
+      onFrame?.({
+        desktopW: packet.width,
+        desktopH: packet.height,
+        x: 0,
+        y: 0,
+        width: packet.width,
+        height: packet.height,
+      });
+    } else {
+      for (const rect of packet.rects) {
+        gl.texSubImage2D(
+          gl.TEXTURE_2D, 0,
+          rect.x, rect.y, rect.width, rect.height,
+          gl.RGBA, gl.UNSIGNED_BYTE, rect.rgba,
+        );
+      }
+      const last = packet.rects[packet.rects.length - 1];
+      onFrame?.({
+        desktopW: packet.width,
+        desktopH: packet.height,
+        x: last?.x ?? 0,
+        y: last?.y ?? 0,
+        width: last?.width ?? packet.width,
+        height: last?.height ?? packet.height,
+      });
+    }
+
+    markNeedsDraw();
+    processedBitmapFrames++;
+    logFps();
+    return true;
   }
 
   function handleGfxFrame(raw: ArrayBuffer) {
@@ -656,15 +737,12 @@ export function useNativeRdp({
   }, [onStatus]);
 
   useEffect(() => {
-    if (!tabId) return;
-
     let disposed = false;
     let unlistenStatus: UnlistenFn | null = null;
 
     const setupStatusListener = async () => {
       const unStatus = await listen<RdpStatusEvent>('rdp://status', (e) => {
         const s = e.payload;
-        if (s.tab_id !== tabId) return;
         onStatusRef.current?.(s.tab_id, s.status, s.message ?? undefined);
       });
       if (disposed) {
@@ -680,7 +758,7 @@ export function useNativeRdp({
       disposed = true;
       unlistenStatus?.();
     };
-  }, [tabId]);
+  }, []);
 
   useEffect(() => {
     if (!tabId || !canvas) return;

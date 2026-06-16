@@ -1,5 +1,9 @@
 import { invoke } from '@tauri-apps/api/core';
 import { rdpLog } from '@/lib/rdp-logger';
+import {
+  RDP_WASM_LOG_LEVEL_STORAGE_KEY,
+  resolveRdpWasmLogLevel,
+} from './engine-flags';
 import type {
   RdpConnectionParams,
   RdpEngine,
@@ -51,12 +55,24 @@ type IronRdpGfxH264Callbacks = {
 let wasmModule: IronRdpWasm | null = null;
 let wasmReady = false;
 
+function readStorageFlag(key: string): string | null {
+  try {
+    return typeof window === 'undefined' ? null : window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
 export async function loadIronRdpWebWasm(): Promise<IronRdpWasm> {
   if (wasmModule && wasmReady) return wasmModule;
   const mod = await import('../wasm/ironrdp_web.js');
   const url = new URL('../wasm/ironrdp_web_bg.wasm', import.meta.url).href;
   await mod.default(url);
-  mod.setup('debug');
+  mod.setup(resolveRdpWasmLogLevel({
+    isDev: import.meta.env.DEV,
+    storageValue: readStorageFlag(RDP_WASM_LOG_LEVEL_STORAGE_KEY),
+    envValue: import.meta.env.VITE_NEXTDESK_RDP_WASM_LOG_LEVEL ?? null,
+  }));
   wasmModule = mod;
   wasmReady = true;
   return mod;

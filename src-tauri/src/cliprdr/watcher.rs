@@ -12,7 +12,7 @@
 //!    Skip the bump that matches `last_remote_write_count + 1`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -43,6 +43,28 @@ const FORMAT_NAME_PNG: &str = "PNG";
 const FORMAT_NAME_FILE_GROUP: &str = "FileGroupDescriptorW";
 const FORMAT_NAME_TEXT_HTML: &str = "text/html";
 
+static ACTIVE_CLIPBOARD_SESSION: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
+
+fn active_clipboard_session() -> &'static StdMutex<Option<String>> {
+    ACTIVE_CLIPBOARD_SESSION.get_or_init(|| StdMutex::new(None))
+}
+
+pub fn set_active_clipboard_session(session_id: Option<String>) {
+    if let Ok(mut active) = active_clipboard_session().lock() {
+        *active = session_id;
+    }
+}
+
+fn is_active_clipboard_session(session_id: &str) -> bool {
+    active_clipboard_session()
+        .lock()
+        .map(|active| match active.as_deref() {
+            Some(active_session_id) => active_session_id == session_id,
+            None => true,
+        })
+        .unwrap_or(true)
+}
+
 /// Watcher for local clipboard changes.
 ///
 /// Spawns a background task that polls `os.change_count()` every 500ms.
@@ -54,6 +76,7 @@ pub struct ClipboardWatcher {
 }
 
 pub(crate) struct WatcherInner {
+    session_id: String,
     os: Arc<dyn OsClipboard>,
     action_tx: mpsc::UnboundedSender<CliprdrAction>,
     last_change_count: AtomicU64,
@@ -66,10 +89,15 @@ pub(crate) struct WatcherInner {
 
 impl ClipboardWatcher {
     /// Create a new watcher. Call `start()` to begin polling.
-    pub fn new(os: Arc<dyn OsClipboard>, action_tx: mpsc::UnboundedSender<CliprdrAction>) -> Self {
+    pub fn new(
+        os: Arc<dyn OsClipboard>,
+        action_tx: mpsc::UnboundedSender<CliprdrAction>,
+        session_id: String,
+    ) -> Self {
         let initial_count = os.change_count();
         Self {
             inner: Arc::new(WatcherInner {
+                session_id,
                 os,
                 action_tx,
                 last_change_count: AtomicU64::new(initial_count),
@@ -88,7 +116,10 @@ impl ClipboardWatcher {
         if self.handle.is_some() {
             return;
         }
-        log::debug!("[cliprdr-watcher] start() — spawning poll task (init cooldown 10s)");
+        log::debug!(
+            "[cliprdr-watcher] session={} start() — spawning poll task (init cooldown 10s)",
+            self.inner.session_id
+        );
         let inner = Arc::clone(&self.inner);
         let handle = tokio::spawn(async move {
             poll_loop(inner).await;
@@ -96,11 +127,18 @@ impl ClipboardWatcher {
         self.handle = Some(handle);
     }
 
-    /// Force an immediate check (e.g., on window focus).
-    /// Bypasses the poll interval but still respects throttling.
-    #[cfg(test)]
+    /// Force an immediate check (e.g., on window focus/tab switch).
+    /// Bypasses the poll interval and initial connection cooldown, while still
+    /// respecting transfer locks, feedback-loop suppression, change detection,
+    /// and the 5s FormatList throttle.
     pub async fn force_check(&self) {
-        check_and_send(&self.inner).await;
+        check_and_send_with_options(
+            &self.inner,
+            CheckOptions {
+                bypass_init_cooldown: true,
+            },
+        )
+        .await;
     }
 
     /// Stop the watcher and cancel the polling task.
@@ -153,7 +191,10 @@ async fn poll_loop(inner: Arc<WatcherInner>) {
     loop {
         tokio::select! {
             _ = inner.cancel.cancelled() => {
-                log::debug!("[cliprdr-watcher] cancelled");
+                log::debug!(
+                    "[cliprdr-watcher] session={} cancelled",
+                    inner.session_id
+                );
                 return;
             }
             _ = ticker.tick() => {
@@ -165,6 +206,25 @@ async fn poll_loop(inner: Arc<WatcherInner>) {
 
 /// Check clipboard and send InitiateCopy if all throttle rules pass.
 async fn check_and_send(inner: &Arc<WatcherInner>) {
+    check_and_send_with_options(
+        inner,
+        CheckOptions {
+            bypass_init_cooldown: false,
+        },
+    )
+    .await;
+}
+
+struct CheckOptions {
+    bypass_init_cooldown: bool,
+}
+
+/// Check clipboard and send InitiateCopy if all throttle rules pass.
+async fn check_and_send_with_options(inner: &Arc<WatcherInner>, options: CheckOptions) {
+    if !is_active_clipboard_session(&inner.session_id) {
+        return;
+    }
+
     // 1. Skip if file transfer is in progress
     if inner.transfer_in_progress.load(Ordering::SeqCst) {
         return;
@@ -172,7 +232,7 @@ async fn check_and_send(inner: &Arc<WatcherInner>) {
 
     // 2. Init cooldown: skip during the first 10s
     let elapsed = inner.connected_at.elapsed();
-    if elapsed < INIT_COOLDOWN {
+    if !options.bypass_init_cooldown && elapsed < INIT_COOLDOWN {
         return;
     }
 
@@ -225,14 +285,18 @@ async fn check_and_send(inner: &Arc<WatcherInner>) {
     }
 
     log::info!(
-        "[cliprdr-watcher] Sending FormatList ({} formats from {:?})",
+        "[cliprdr-watcher] session={} Sending FormatList ({} formats from {:?}) [{}]",
+        inner.session_id,
         rdp_formats.len(),
-        os_formats
+        os_formats,
+        describe_clipboard_formats(&rdp_formats)
     );
     log::debug!(
-        "[cliprdr-watcher] Sending FormatList ({} formats from {:?})",
+        "[cliprdr-watcher] session={} Sending FormatList ({} formats from {:?}) [{}]",
+        inner.session_id,
         rdp_formats.len(),
-        os_formats
+        os_formats,
+        describe_clipboard_formats(&rdp_formats)
     );
 
     if let Err(e) = inner
@@ -311,6 +375,20 @@ fn push_named_format(formats: &mut Vec<ClipboardFormat>, id: u32, name: &'static
     );
 }
 
+fn describe_clipboard_formats(formats: &[ClipboardFormat]) -> String {
+    formats
+        .iter()
+        .map(|format| {
+            let name = format
+                .name()
+                .map(|name| name.value().to_string())
+                .unwrap_or_else(|| "-".to_string());
+            format!("id={} name={}", format.id().value(), name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Advertise PNG + CF_DIBV5 + CF_DIB for maximum compatibility (memory #58).
 fn advertise_image_formats(formats: &mut Vec<ClipboardFormat>) {
     push_named_format(formats, CF_PRIVATE_PNG, FORMAT_NAME_PNG);
@@ -322,6 +400,8 @@ fn advertise_image_formats(formats: &mut Vec<ClipboardFormat>) {
 mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
+
+    static ACTIVE_SESSION_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     /// Mock OsClipboard for testing.
     struct MockClipboard {
@@ -403,11 +483,13 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_init_cooldown_blocks_send() {
+        let _active_session_guard = ACTIVE_SESSION_TEST_LOCK.lock().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mock = Arc::new(MockClipboard::new());
         mock.bump(vec![ClipFormat::PlainText]);
 
-        let watcher = ClipboardWatcher::new(mock.clone(), tx);
+        set_active_clipboard_session(None);
+        let watcher = ClipboardWatcher::new(mock.clone(), tx, "test-session".to_string());
 
         // Reset last_change_count so the bump is detected
         watcher.inner.last_change_count.store(0, Ordering::SeqCst);
@@ -433,11 +515,13 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_min_interval_throttle() {
+        let _active_session_guard = ACTIVE_SESSION_TEST_LOCK.lock().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mock = Arc::new(MockClipboard::new());
         mock.bump(vec![ClipFormat::PlainText]);
 
-        let watcher = ClipboardWatcher::new(mock.clone(), tx);
+        set_active_clipboard_session(None);
+        let watcher = ClipboardWatcher::new(mock.clone(), tx, "test-session".to_string());
         watcher.inner.last_change_count.store(0, Ordering::SeqCst);
 
         // Skip cooldown
@@ -468,11 +552,13 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_transfer_lock_blocks_send() {
+        let _active_session_guard = ACTIVE_SESSION_TEST_LOCK.lock().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mock = Arc::new(MockClipboard::new());
         mock.bump(vec![ClipFormat::PlainText]);
 
-        let watcher = ClipboardWatcher::new(mock.clone(), tx);
+        set_active_clipboard_session(None);
+        let watcher = ClipboardWatcher::new(mock.clone(), tx, "test-session".to_string());
         watcher.inner.last_change_count.store(0, Ordering::SeqCst);
 
         tokio::time::advance(INIT_COOLDOWN + Duration::from_secs(1)).await;
@@ -494,10 +580,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn test_feedback_loop_prevention() {
+        let _active_session_guard = ACTIVE_SESSION_TEST_LOCK.lock().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mock = Arc::new(MockClipboard::new());
 
-        let watcher = ClipboardWatcher::new(mock.clone(), tx);
+        set_active_clipboard_session(None);
+        let watcher = ClipboardWatcher::new(mock.clone(), tx, "test-session".to_string());
         tokio::time::advance(INIT_COOLDOWN + Duration::from_secs(1)).await;
 
         // Simulate remote write: bump first (OS clipboard now changed), then notify
@@ -519,25 +607,66 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn test_force_check_bypasses_poll_but_respects_throttle() {
+    async fn test_force_check_bypasses_init_cooldown_but_respects_throttle() {
+        let _active_session_guard = ACTIVE_SESSION_TEST_LOCK.lock().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mock = Arc::new(MockClipboard::new());
         mock.bump(vec![ClipFormat::PlainText]);
 
-        let watcher = ClipboardWatcher::new(mock.clone(), tx);
+        set_active_clipboard_session(None);
+        let watcher = ClipboardWatcher::new(mock.clone(), tx, "test-session".to_string());
         watcher.inner.last_change_count.store(0, Ordering::SeqCst);
 
-        // During cooldown, force_check should still respect cooldown
+        // Explicit focus/tab-switch checks should bypass the initial poll
+        // cooldown so copy/paste between two active sessions is available
+        // immediately after switching tabs.
+        watcher.force_check().await;
+        assert!(matches!(rx.try_recv(), Ok(CliprdrAction::InitiateCopy(_))));
+
+        mock.bump(vec![ClipFormat::PlainText]);
         watcher.force_check().await;
         assert!(
             rx.try_recv().is_err(),
-            "force_check during cooldown should still throttle"
+            "force_check should still preserve the 5s FormatList throttle"
         );
+    }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_inactive_session_does_not_send_clipboard_formats() {
+        let _active_session_guard = ACTIVE_SESSION_TEST_LOCK.lock().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mock = Arc::new(MockClipboard::new());
+        mock.bump(vec![ClipFormat::PlainText]);
+
+        set_active_clipboard_session(Some("active-session".to_string()));
+        let watcher = ClipboardWatcher::new(mock.clone(), tx, "inactive-session".to_string());
+        watcher.inner.last_change_count.store(0, Ordering::SeqCst);
         tokio::time::advance(INIT_COOLDOWN + Duration::from_secs(1)).await;
 
-        // After cooldown, force_check should fire
-        watcher.force_check().await;
+        check_and_send(&watcher.inner).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "inactive RDP sessions must not advertise the shared macOS clipboard"
+        );
+
+        set_active_clipboard_session(None);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_active_session_sends_clipboard_formats() {
+        let _active_session_guard = ACTIVE_SESSION_TEST_LOCK.lock().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mock = Arc::new(MockClipboard::new());
+        mock.bump(vec![ClipFormat::PlainText]);
+
+        set_active_clipboard_session(Some("active-session".to_string()));
+        let watcher = ClipboardWatcher::new(mock.clone(), tx, "active-session".to_string());
+        watcher.inner.last_change_count.store(0, Ordering::SeqCst);
+        tokio::time::advance(INIT_COOLDOWN + Duration::from_secs(1)).await;
+
+        check_and_send(&watcher.inner).await;
         assert!(matches!(rx.try_recv(), Ok(CliprdrAction::InitiateCopy(_))));
+
+        set_active_clipboard_session(None);
     }
 }

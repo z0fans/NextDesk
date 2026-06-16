@@ -8,7 +8,7 @@ import { useTranslation } from '@/i18n/useTranslation';
 export interface SessionControls {
   resMode: string;
   resolution: string;
-  fps: number;
+  fps: number | null;
   presets: readonly { label: string; value: string }[];
   macClipboardStrategy: 'session-file-url' | 'pasteboard-promise';
   hasClipboardFolder: boolean;
@@ -217,7 +217,9 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
                   <span className="text-cyan-400/80">
                     {sessionControls.resMode === 'adaptive' ? t('rdpAuto') : (sessionControls.resolution || '—')}
                   </span>
-                  <span className="text-emerald-400/80">{sessionControls.fps} fps</span>
+                  {sessionControls.fps !== null && (
+                    <span className="text-emerald-400/80">{sessionControls.fps} fps</span>
+                  )}
                 </div>
 
                 <div className="h-px bg-border/60 my-0.5" />

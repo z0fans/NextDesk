@@ -19,6 +19,7 @@
 
 use crate::cliprdr as cliprdr_module;
 use crate::frame_ws::{FrameSender, FrameServerShutdown};
+use crate::rdp_frame::{self, DirtyRect};
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -77,6 +78,35 @@ enum NativeRenderMode {
     Bitmap,
     GfxH264Auto,
     GfxH264Force,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeFrameTransport {
+    RawBitmap,
+    DriftDirtyRects,
+}
+
+impl NativeFrameTransport {
+    pub fn label(self) -> &'static str {
+        match self {
+            NativeFrameTransport::RawBitmap => "raw-bitmap",
+            NativeFrameTransport::DriftDirtyRects => "drift-dirty-rect",
+        }
+    }
+}
+
+pub fn native_frame_transport_from_profile(profile: Option<&str>) -> NativeFrameTransport {
+    match profile.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value)
+            if value == "native-drift"
+                || value == "native-fast"
+                || value == "drift"
+                || value == "dirty-rect" =>
+        {
+            NativeFrameTransport::DriftDirtyRects
+        }
+        _ => NativeFrameTransport::RawBitmap,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1154,6 +1184,7 @@ pub enum NativeRdpInput {
     FastPath(SmallVec<[FastPathInputEvent; 2]>),
     MouseMove { x: u16, y: u16 },
     Resize { width: u16, height: u16 },
+    ForceClipboardCheck,
     Close,
 }
 
@@ -1411,6 +1442,7 @@ pub fn spawn_session(
     frame_tx: FrameSender,
     frame_ws_port: u16,
     frame_ws_shutdown: FrameServerShutdown,
+    frame_transport: NativeFrameTransport,
 ) -> SessionHandle {
     let (input_tx, input_rx) = mpsc::unbounded_channel::<NativeRdpInput>();
 
@@ -1440,6 +1472,7 @@ pub fn spawn_session(
                 input_rx,
                 frame_tx,
                 frame_ws_port,
+                frame_transport,
             )
             .await;
 
@@ -1500,12 +1533,14 @@ async fn run_session(
     mut input_rx: mpsc::UnboundedReceiver<NativeRdpInput>,
     frame_tx: FrameSender,
     frame_ws_port: u16,
+    frame_transport: NativeFrameTransport,
 ) -> Result<GracefulDisconnectReason, String> {
     let route = choose_native_rdp_route(&host, socks_port);
     let render_mode = native_render_mode_for_route(route, width, height);
     let route_label = native_rdp_route_label(route);
     log::info!(
-        "[rdp-native] Session starting tab={tab_id} ws_port={frame_ws_port} host={host}:{port} route={route_label} size={width}x{height} render={render_mode:?}"
+        "[rdp-native] Session starting tab={tab_id} ws_port={frame_ws_port} host={host}:{port} route={route_label} size={width}x{height} render={render_mode:?} transport={}",
+        frame_transport.label()
     );
     let config = connect_config_for_route(
         &username,
@@ -1535,6 +1570,7 @@ async fn run_session(
         &config,
         cliprdr_tx,
         &temp_dir_str,
+        &tab_id,
         frame_tx.clone(),
         gfx_frame_seen.clone(),
         gfx_error.clone(),
@@ -1574,6 +1610,7 @@ async fn run_session(
         render_mode,
         frame_ws_port,
         route,
+        frame_transport,
     )
     .await
     .map_err(|e| format!("Session error: {e}"))
@@ -1591,6 +1628,7 @@ async fn connect_tcp(
     config: &connector::Config,
     cliprdr_action_tx: mpsc::UnboundedSender<CliprdrAction>,
     temp_dir: &str,
+    session_id: &str,
     frame_tx: FrameSender,
     gfx_frame_seen: Arc<AtomicBool>,
     gfx_error: SharedGfxError,
@@ -1629,8 +1667,12 @@ async fn connect_tcp(
     );
     log::info!("[rdp-native] DrdynvcClient channels: {:?}", drdynvc);
 
-    let cliprdr_factory =
-        cliprdr_module::build_factory(cliprdr_action_tx, app_handle.clone(), temp_dir.to_string());
+    let cliprdr_factory = cliprdr_module::build_factory(
+        cliprdr_action_tx,
+        app_handle.clone(),
+        temp_dir.to_string(),
+        session_id.to_string(),
+    );
     let cliprdr = cliprdr::Cliprdr::new(cliprdr_factory.build_cliprdr_backend());
 
     let mut connector = connector::ClientConnector::new(config.clone(), client_addr)
@@ -1833,6 +1875,7 @@ fn process_native_input(
                 Ok(Vec::new())
             }
         }
+        NativeRdpInput::ForceClipboardCheck => Ok(Vec::new()),
         NativeRdpInput::Close => active_stage.graceful_shutdown(),
     }
 }
@@ -1853,6 +1896,7 @@ async fn active_session(
     render_mode: NativeRenderMode,
     frame_ws_port: u16,
     route: NativeRdpRoute,
+    frame_transport: NativeFrameTransport,
 ) -> SessionResult<GracefulDisconnectReason> {
     use ironrdp::connector::connection_activation::ConnectionActivationState;
     use ironrdp::session::fast_path;
@@ -1923,6 +1967,29 @@ async fn active_session(
                 let inputs = drain_coalesced_inputs(ev, input_rx);
                 let mut outputs = Vec::new();
                 for input in inputs {
+                    if matches!(input, NativeRdpInput::ForceClipboardCheck) {
+                        use ironrdp::cliprdr::Cliprdr;
+                        use ironrdp::cliprdr::Client as CliprdrClient;
+
+                        if let Some(cliprdr) =
+                            active_stage.get_svc_processor_mut::<Cliprdr<CliprdrClient>>()
+                        {
+                            if let Some(backend) = cliprdr.downcast_backend_mut::<
+                                cliprdr_module::backend::NextDeskCliprdrBackend,
+                            >() {
+                                backend.force_local_clipboard_check().await;
+                            } else {
+                                log::warn!(
+                                    "[cliprdr] force clipboard check skipped: backend downcast failed"
+                                );
+                            }
+                        } else {
+                            log::debug!(
+                                "[cliprdr] force clipboard check skipped: processor not ready"
+                            );
+                        }
+                        continue;
+                    }
                     outputs.extend(process_native_input(
                         &mut active_stage,
                         &mut image,
@@ -1962,17 +2029,32 @@ async fn active_session(
 
                     let svc_messages = match action {
                         CliprdrAction::InitiateCopy(formats) => {
-                            log::info!("[cliprdr] Sending FormatList ({} formats)", formats.len());
+                            let format_summary = formats
+                                .iter()
+                                .map(|format| {
+                                    let name = format
+                                        .name()
+                                        .map(|name| name.value().to_string())
+                                        .unwrap_or_else(|| "-".to_string());
+                                    format!("id={} name={}", format.id().value(), name)
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            log::info!(
+                                "[cliprdr] tab={tab_id} Sending FormatList ({} formats) [{}]",
+                                formats.len(),
+                                format_summary
+                            );
                             cliprdr.initiate_copy(&formats)
                                 .map_err(|e| session::custom_err!("cliprdr initiate_copy", e))?
                         }
                         CliprdrAction::InitiatePaste(format_id) => {
-                            log::info!("[cliprdr] Requesting format {:?}", format_id);
+                            log::info!("[cliprdr] tab={tab_id} Requesting format {:?}", format_id);
                             cliprdr.initiate_paste(format_id)
                                 .map_err(|e| session::custom_err!("cliprdr initiate_paste", e))?
                         }
                         CliprdrAction::SubmitFormatData(response) => {
-                            log::info!("[cliprdr] Submitting format data");
+                            log::info!("[cliprdr] tab={tab_id} Submitting format data");
                             cliprdr.submit_format_data(response)
                                 .map_err(|e| session::custom_err!("cliprdr submit_format_data", e))?
                         }
@@ -1980,13 +2062,13 @@ async fn active_session(
                             let stream_id = response.stream_id();
                             let data_len = response.data().len();
                             log::info!(
-                                "[cliprdr] Submitting file contents stream_id={stream_id} data_len={data_len}"
+                                "[cliprdr] tab={tab_id} Submitting file contents stream_id={stream_id} data_len={data_len}"
                             );
                             cliprdr.submit_file_contents(response)
                                 .map_err(|e| session::custom_err!("cliprdr submit_file_contents", e))?
                         }
                         CliprdrAction::RequestFileContents(request) => {
-                            log::info!("[cliprdr] Requesting file contents");
+                            log::info!("[cliprdr] tab={tab_id} Requesting file contents");
                             cliprdr.request_file_contents(request)
                                 .map_err(|e| session::custom_err!("cliprdr request_file_contents", e))?
                         }
@@ -2011,8 +2093,9 @@ async fn active_session(
                     .map(|t| now.duration_since(t).as_millis().to_string())
                     .unwrap_or_else(|| "never".to_string());
                 log::info!(
-                    "[rdp-native][loop-heartbeat] tab={tab_id} ws_port={frame_ws_port} route={route_label} render={:?} uptime_s={} since_pdu_ms={} since_graphics_ms={} since_frame_ms={} total_pdu={} total_graphics={} total_frames_sent={} total_response_frames={} receivers={} desktop={}x{}",
+                    "[rdp-native][loop-heartbeat] tab={tab_id} ws_port={frame_ws_port} route={route_label} render={:?} transport={} uptime_s={} since_pdu_ms={} since_graphics_ms={} since_frame_ms={} total_pdu={} total_graphics={} total_frames_sent={} total_response_frames={} receivers={} desktop={}x{}",
                     render_mode,
+                    frame_transport.label(),
                     now.duration_since(session_started_at).as_secs(),
                     now.duration_since(last_pdu_at).as_millis(),
                     since_graphics_ms,
@@ -2085,15 +2168,36 @@ async fn active_session(
 
                     // Send via Channel as LZ4-compressed binary frame
                     let raw_len = region_data.len();
-                    let frame = build_raw_frame(
-                        image.width(),
-                        image.height(),
-                        region.left,
-                        region.top,
-                        rw,
-                        rh,
-                        &region_data,
-                    );
+                    let frame = match frame_transport {
+                        NativeFrameTransport::RawBitmap => build_raw_frame(
+                            image.width(),
+                            image.height(),
+                            region.left,
+                            region.top,
+                            rw,
+                            rh,
+                            &region_data,
+                        ),
+                        NativeFrameTransport::DriftDirtyRects => rdp_frame::encode_dirty_rects(
+                            image.width(),
+                            image.height(),
+                            &[DirtyRect {
+                                x: region.left,
+                                y: region.top,
+                                width: rw,
+                                height: rh,
+                                stride: row_bytes,
+                                rgba: &region_data,
+                            }],
+                        )
+                        .map_err(|e| {
+                            session::reason_err!(
+                                "RDP frame",
+                                "encode drift dirty rect frame failed: {}",
+                                e
+                            )
+                        })?,
+                    };
 
                     bitmap_frame_stats.record(BitmapFrameStatsEvent {
                         tab_id,

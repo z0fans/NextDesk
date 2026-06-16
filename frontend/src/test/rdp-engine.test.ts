@@ -60,8 +60,8 @@ describe('RDP engine mode selection', () => {
     expect(RDP_ENGINE_STORAGE_KEY).toBe('nextdesk_rdp_engine');
   });
 
-  it('defaults to official-web when no override is present', () => {
-    expect(resolveRdpEngineMode({ envValue: null, storage: null, globalValue: null })).toBe('official-web');
+  it('defaults to native-drift when no override is present', () => {
+    expect(resolveRdpEngineMode({ envValue: null, storage: null, globalValue: null })).toBe('native-drift');
   });
 
   it('parses official web aliases', () => {
@@ -124,7 +124,7 @@ describe('RDP engine mode selection', () => {
     runtimeGlobal.__NEXTDESK_RDP_ENGINE__ = 'official-web';
 
     try {
-      expect(resolveRdpEngineMode({ envValue: null, storage: null, globalValue: null })).toBe('official-web');
+      expect(resolveRdpEngineMode({ envValue: null, storage: null, globalValue: null })).toBe('native-drift');
     } finally {
       runtimeGlobal.__NEXTDESK_RDP_ENGINE__ = previous;
     }
@@ -156,12 +156,12 @@ describe('RDP engine mode selection', () => {
     })).toBe('official-web');
   });
 
-  it('falls back from throwing storage to official-web when env is absent', () => {
+  it('falls back from throwing storage to native-drift when env is absent', () => {
     expect(resolveRdpEngineMode({
       envValue: null,
       storage: createThrowingStorage(),
       globalValue: null,
-    })).toBe('official-web');
+    })).toBe('native-drift');
   });
 
   it('falls back from a blocked default localStorage getter to env', () => {
@@ -194,7 +194,7 @@ describe('RDP engine mode selection', () => {
       globalValue: null,
     };
 
-    expect(resolveRdpEngineMode(options)).toBe('official-web');
+    expect(resolveRdpEngineMode(options)).toBe('native-drift');
   });
 
   it('exposes boolean helpers', () => {

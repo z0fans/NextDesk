@@ -11,6 +11,7 @@ import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useTranslation } from '@/i18n/useTranslation';
 import { codeToScancode } from '@/lib/scancodeMap';
+import { NativePressedKeyTracker } from '@/lib/native-key-state';
 
 import DecodeWorkerUrl from '@/lib/decode-worker.ts?worker&url';
 import { rdpLog } from '@/lib/rdp-logger';
@@ -31,10 +32,13 @@ import {
 } from '@/lib/rdp-clipboard-snapshot';
 import {
   isNativeRdpMode,
+  isNativeDriftRdpMode,
   isOfficialIronRdpWebMode,
   parseRdpBooleanFlag,
   resolveOfficialWebFeatureFlags,
   resolveRdpEngineMode,
+  resolveRdpWasmLogLevel,
+  RDP_WASM_LOG_LEVEL_STORAGE_KEY,
 } from '@/rdp/engine-flags';
 import { GfxSurfaceCompositor } from '@/rdp/gfx-compositor';
 import { describeOfficialWebGfxFallback, type OfficialWebGfxFallbackInput } from '@/rdp/gfx-fallback';
@@ -49,12 +53,18 @@ import {
 
 /**
  * RDP engine mode.
- * Defaults to official-web; DevTools/localStorage can temporarily switch to native.
+ * Defaults to native-drift canvas; DevTools/localStorage can switch back to official-web.
  */
 const RDP_ENGINE_MODE = resolveRdpEngineMode();
 const USE_NATIVE_RDP = isNativeRdpMode(RDP_ENGINE_MODE);
+const USE_NATIVE_DRIFT_RDP = isNativeDriftRdpMode(RDP_ENGINE_MODE);
 if (USE_NATIVE_RDP) {
-  rdpLog.warn('native', 'Native RDP engine is running in experimental mode');
+  rdpLog.warn(
+    'native',
+    USE_NATIVE_DRIFT_RDP
+      ? 'Native RDP engine is running in native-drift canvas mode'
+      : 'Native RDP engine is running in experimental mode',
+  );
 }
 const USE_OFFICIAL_IRONRDP_WEB = isOfficialIronRdpWebMode(RDP_ENGINE_MODE);
 const USE_NATIVE_GFX_H264 = USE_NATIVE_RDP;
@@ -65,10 +75,13 @@ const OFFICIAL_WEB_FEATURES = resolveOfficialWebFeatureFlags((storageKey, envKey
 const ADAPTIVE_RESIZE_DEBOUNCE_MS = 800;
 const ADAPTIVE_RESIZE_THRESHOLD_PX = 20;
 const NATIVE_CONNECT_RESIZE_COOLDOWN_MS = 2500;
+const PUBLIC_NATIVE_ADAPTIVE_SETTLE_MS = 20_000;
+const PUBLIC_NATIVE_ADAPTIVE_RECONNECT_MIN_INTERVAL_MS = 20_000;
 const CANVAS_SIZE_DEBUG_LOG_MS = 5000;
 const PUBLIC_NATIVE_MAX_DESKTOP_WIDTH = 1920;
 const PUBLIC_NATIVE_MAX_DESKTOP_HEIGHT = 1080;
-const ENABLE_RDP_FRAME_DIAGNOSTICS = import.meta.env.DEV || parseRdpBooleanFlag(
+const CLIPBOARD_POLL_INPUT_IDLE_MS = 2000;
+const ENABLE_RDP_FRAME_DIAGNOSTICS = parseRdpBooleanFlag(
   readRdpRuntimeStorageFlag('nextdesk_rdp_frame_diagnostics') ??
   readRdpRuntimeEnvFlag('VITE_NEXTDESK_RDP_FRAME_DIAGNOSTICS'),
   false,
@@ -400,9 +413,11 @@ async function loadWasm(): Promise<IronRdpWasm> {
   // @ts-ignore
   const url = new URL('../wasm/ironrdp_web_bg.wasm', import.meta.url).href;
   await mod.default(url);
-  // Diagnostic mode: keep WASM tracing at debug so RDPSND/DRDYNVC
-  // initialization details are visible while investigating audio redirection.
-  mod.setup('debug');
+  mod.setup(resolveRdpWasmLogLevel({
+    isDev: import.meta.env.DEV,
+    storageValue: readRdpRuntimeStorageFlag(RDP_WASM_LOG_LEVEL_STORAGE_KEY),
+    envValue: readRdpRuntimeEnvFlag('VITE_NEXTDESK_RDP_WASM_LOG_LEVEL'),
+  }));
   wasmModule = mod as unknown as IronRdpWasm;
   wasmReady = true;
   return wasmModule;
@@ -426,6 +441,8 @@ export function RdpManager({
   const nativeResolutionByTabRef = useRef<Map<string, string>>(new Map());
   const nativeActualSizeByTabRef = useRef<Map<string, NativeResizeSize>>(new Map());
   const nativeResizePendingByTabRef = useRef<Map<string, NativeResizePending>>(new Map());
+  const nativeConnectedAtByTabRef = useRef<Map<string, number>>(new Map());
+  const nativePublicAdaptiveReconnectAtRef = useRef<Map<string, number>>(new Map());
   const canvasSizeLogRef = useRef({ w: 0, h: 0, loggedAt: 0 });
   // Resolution mode: 'adaptive' or '1920x1080' etc.
   const RESOLUTION_PRESETS = [
@@ -513,6 +530,8 @@ export function RdpManager({
   }, []);
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasWrapRef = useRef<HTMLDivElement>(null);
+  const nativeViewBoundsRafRef = useRef<number | null>(null);
+  const nativeViewLastBoundsRef = useRef<string>('');
   const isRdpViewVisibleRef = useRef(isRdpViewVisible);
   const activeTabIdRef = useRef<string | null>(null);
   const tabsRef = useRef(store.tabs);
@@ -536,6 +555,8 @@ export function RdpManager({
 
   const fileTransferInProgressRef = useRef<Set<string>>(new Set());
   const clipboardPollInFlightRef = useRef<Set<string>>(new Set());
+  const lastRdpInputAtRef = useRef<Map<string, number>>(new Map());
+  const lastNativeClipboardForceAtRef = useRef<Map<string, number>>(new Map());
   // Track file keys received from remote to prevent feedback loop:
   // remote download → write to clipboard → Poll/Focus detects → sends FormatList back
   const remoteClipboardFileKeyRef = useRef<Map<string, string>>(new Map());
@@ -623,6 +644,9 @@ export function RdpManager({
     nativeResolutionByTabRef.current.delete(tabId);
     nativeActualSizeByTabRef.current.delete(tabId);
     nativeResizePendingByTabRef.current.delete(tabId);
+    nativeConnectedAtByTabRef.current.delete(tabId);
+    nativePublicAdaptiveReconnectAtRef.current.delete(tabId);
+    lastNativeClipboardForceAtRef.current.delete(tabId);
   }, []);
 
   const updateNativeResolution = useCallback((tabId: string, w: number, h: number, source: string) => {
@@ -636,6 +660,32 @@ export function RdpManager({
     setRdpStats(prev => (prev.resolution === resolution ? prev : { ...prev, resolution }));
   }, [isNativeTabRenderable]);
 
+  const markNativeTabConnected = useCallback((tabId: string, source: string) => {
+    const current = tabsRef.current.find(t => t.id === tabId);
+    if (current?.status !== 'connected' || !nativeTabsRef.current.has(tabId)) {
+      rdpLog.info('native', 'mark native tab connected', { tabId, source });
+    }
+    store.updateTabStatus(tabId, 'connected');
+    setRdpStats(prev => ({ ...prev, status: 'connected' }));
+    nativeTabsRef.current.add(tabId);
+    nativeConnectedAtByTabRef.current.set(tabId, Date.now());
+    resizeCooldownRef.current = true;
+    setTimeout(() => {
+      if (activeTabIdRef.current === tabId) {
+        const wrap = canvasWrapRef.current;
+        if (wrap) {
+          const rect = wrap.getBoundingClientRect();
+          const w = Math.floor(rect.width || wrap.clientWidth);
+          const h = Math.floor(rect.height || wrap.clientHeight);
+          const tab = tabsRef.current.find(t => t.id === tabId);
+          const server = tab ? store.getServerById(tab.serverId) : null;
+          if (w > 0 && h > 0) lastSizeRef.current = normalizeNativeDesktopSizeForHost(w, h, server?.host);
+        }
+      }
+      resizeCooldownRef.current = false;
+    }, NATIVE_CONNECT_RESIZE_COOLDOWN_MS);
+  }, [store]);
+
   // ── Native RDP event rendering hook ──
   // Only active when USE_NATIVE_RDP is enabled
   const activeCanvas = store.activeTabId
@@ -645,24 +695,7 @@ export function RdpManager({
   const handleNativeStatus = useCallback((tabId: string, status: string, message?: string) => {
     rdpLog.info('native', `status event: ${status}`, { tabId, message });
     if (status === 'connected') {
-      store.updateTabStatus(tabId, 'connected');
-      setRdpStats(prev => ({ ...prev, status: 'connected' }));
-      nativeTabsRef.current.add(tabId);
-      resizeCooldownRef.current = true;
-      setTimeout(() => {
-        if (activeTabIdRef.current === tabId) {
-          const wrap = canvasWrapRef.current;
-          if (wrap) {
-            const rect = wrap.getBoundingClientRect();
-            const w = Math.floor(rect.width || wrap.clientWidth);
-            const h = Math.floor(rect.height || wrap.clientHeight);
-            const tab = tabsRef.current.find(t => t.id === tabId);
-            const server = tab ? store.getServerById(tab.serverId) : null;
-            if (w > 0 && h > 0) lastSizeRef.current = normalizeNativeDesktopSizeForHost(w, h, server?.host);
-          }
-        }
-        resizeCooldownRef.current = false;
-      }, NATIVE_CONNECT_RESIZE_COOLDOWN_MS);
+      markNativeTabConnected(tabId, 'status-event');
     } else if (status === 'disconnected') {
       nativeTabsRef.current.delete(tabId);
       cleanupNativeFrameStream(tabId);
@@ -704,7 +737,7 @@ export function RdpManager({
       store.updateTabStatus(tabId, 'error', friendlyRdpError(message ?? '', t));
       rdpLog.error('native', `session error: ${message}`, { tabId });
     }
-  }, [store, cleanupH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, stopFpsCounter, t]);
+  }, [store, cleanupH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, markNativeTabConnected, stopFpsCounter, t]);
 
   useNativeRdp({
     tabId: USE_NATIVE_RDP ? store.activeTabId : null,
@@ -810,6 +843,136 @@ export function RdpManager({
     }
     return { w: Math.max(w, 320), h: Math.max(h, 240) };
   }, []);
+
+  const syncNativeViewBounds = useCallback((reason: string) => {
+    if (!USE_NATIVE_DRIFT_RDP) return;
+    const tabId = activeTabIdRef.current;
+    if (!tabId) return;
+    const tab = tabsRef.current.find(t => t.id === tabId);
+    const wrap = canvasWrapRef.current;
+    const visible = Boolean(
+      wrap &&
+      isRdpViewVisibleRef.current &&
+      store.viewMode === 'tab' &&
+      tab?.status === 'connected' &&
+      nativeTabsRef.current.has(tabId)
+    );
+    const rect = wrap?.getBoundingClientRect();
+    const bounds = {
+      x: rect ? Math.max(0, rect.left) : 0,
+      y: rect ? Math.max(0, rect.top) : 0,
+      width: rect ? Math.max(0, rect.width) : 0,
+      height: rect ? Math.max(0, rect.height) : 0,
+      scaleFactor: window.devicePixelRatio || 1,
+      visible,
+    };
+    const key = `${tabId}:${bounds.x.toFixed(1)}:${bounds.y.toFixed(1)}:${bounds.width.toFixed(1)}:${bounds.height.toFixed(1)}:${bounds.scaleFactor.toFixed(2)}:${bounds.visible}`;
+    if (nativeViewLastBoundsRef.current === key) return;
+    nativeViewLastBoundsRef.current = key;
+
+    api.rdpNativeSetViewBounds(tabId, bounds).catch(error => {
+      rdpLog.warn('native', 'native view bounds sync failed', {
+        tabId,
+        reason,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }, [store.viewMode]);
+
+  const scheduleNativeViewBoundsSync = useCallback((reason: string) => {
+    if (!USE_NATIVE_DRIFT_RDP) return;
+    if (nativeViewBoundsRafRef.current !== null) {
+      cancelAnimationFrame(nativeViewBoundsRafRef.current);
+    }
+    nativeViewBoundsRafRef.current = requestAnimationFrame(() => {
+      nativeViewBoundsRafRef.current = null;
+      syncNativeViewBounds(reason);
+    });
+  }, [syncNativeViewBounds]);
+
+  const forceNativeClipboardCheck = useCallback((reason: string) => {
+    if (!USE_NATIVE_RDP) return;
+    const tabId = activeTabIdRef.current;
+    if (!tabId) return;
+    const tab = tabsRef.current.find(t => t.id === tabId);
+    if (tab?.status !== 'connected') return;
+    if (!nativeTabsRef.current.has(tabId)) return;
+    if (!isRdpViewVisibleRef.current || store.viewMode !== 'tab') return;
+
+    const now = Date.now();
+    const last = lastNativeClipboardForceAtRef.current.get(tabId) ?? 0;
+    if (now - last < 1000) return;
+    lastNativeClipboardForceAtRef.current.set(tabId, now);
+
+    api.rdpNativeForceClipboardCheck(tabId).catch(error => {
+      rdpLog.debug('clipboard', 'native force clipboard check failed', {
+        tabId,
+        reason,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }, [store.viewMode]);
+
+  useEffect(() => {
+    scheduleNativeViewBoundsSync('state');
+  }, [store.activeTabId, store.viewMode, store.activeTab?.status, isRdpViewVisible, scheduleNativeViewBoundsSync]);
+
+  useEffect(() => {
+    if (!USE_NATIVE_RDP) return;
+    const tabId = isRdpViewVisible && store.viewMode === 'tab' ? store.activeTabId : null;
+    api.rdpNativeSetActiveClipboardSession(tabId)
+      .then(() => {
+        if (tabId) forceNativeClipboardCheck('active clipboard session');
+      })
+      .catch(error => {
+        rdpLog.debug('clipboard', 'native active clipboard session update failed', {
+          tabId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+  }, [store.activeTabId, store.viewMode, isRdpViewVisible, forceNativeClipboardCheck]);
+
+  useEffect(() => {
+    forceNativeClipboardCheck('active tab');
+  }, [store.activeTabId, store.viewMode, store.activeTab?.status, isRdpViewVisible, forceNativeClipboardCheck]);
+
+  useEffect(() => {
+    if (!USE_NATIVE_RDP) return;
+    const onFocus = () => forceNativeClipboardCheck('window focus');
+    const onVisibilityChange = () => {
+      if (!document.hidden) forceNativeClipboardCheck('visibility');
+    };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [forceNativeClipboardCheck]);
+
+  useEffect(() => {
+    if (!USE_NATIVE_DRIFT_RDP) return;
+    const wrap = canvasWrapRef.current;
+    const container = containerRef.current;
+    const obs = new ResizeObserver(() => scheduleNativeViewBoundsSync('observer'));
+    if (wrap) obs.observe(wrap);
+    if (container) obs.observe(container);
+
+    const onResize = () => scheduleNativeViewBoundsSync('window resize');
+    window.addEventListener('resize', onResize);
+    window.visualViewport?.addEventListener('resize', onResize);
+    scheduleNativeViewBoundsSync('mount');
+
+    return () => {
+      obs.disconnect();
+      window.removeEventListener('resize', onResize);
+      window.visualViewport?.removeEventListener('resize', onResize);
+      if (nativeViewBoundsRafRef.current !== null) {
+        cancelAnimationFrame(nativeViewBoundsRafRef.current);
+        nativeViewBoundsRafRef.current = null;
+      }
+    };
+  }, [store.activeTabId, scheduleNativeViewBoundsSync]);
 
   // ── Suppress adaptive resize when sidebar collapses/expands ──
   useEffect(() => {
@@ -957,7 +1120,12 @@ export function RdpManager({
 
       // ── Native RDP mode: connect via Rust backend ──
       if (USE_NATIVE_RDP) {
-        rdpLog.warn('native', 'Using experimental native RDP path instead of IronRDP official-web');
+        rdpLog.warn(
+          'native',
+          USE_NATIVE_DRIFT_RDP
+            ? 'Using native-drift canvas RDP path'
+            : 'Using experimental native RDP path instead of IronRDP official-web',
+        );
         cleanupNativeFrameStream(tabId);
         rdpLog.info('native', 'native.connect.request', {
           attemptId,
@@ -966,6 +1134,9 @@ export function RdpManager({
           port: server.port,
           width: w,
           height: h,
+          mode: RDP_ENGINE_MODE,
+          transport: USE_NATIVE_DRIFT_RDP ? 'dirty-rect' : 'raw-bitmap',
+          renderer: 'canvas',
         });
         const nativeGfxWorker = USE_NATIVE_GFX_H264 ? ensureH264Worker(tabId) : null;
         const handleNativeGfxFrame = USE_NATIVE_GFX_H264
@@ -998,6 +1169,7 @@ export function RdpManager({
           domain: server.domain || undefined,
           width: w,
           height: h,
+          renderProfile: RDP_ENGINE_MODE,
         });
         rdpLog.info('native', 'native.connect.ok', { attemptId, tabId, wsPort });
         nativeTabsRef.current.add(tabId);
@@ -1009,6 +1181,10 @@ export function RdpManager({
           wsPort,
           canvas,
           (frame?: NativeBitmapFrameInfo) => {
+            const current = tabsRef.current.find(t => t.id === tabId);
+            if (current?.status === 'connecting' || current?.status === 'reconnecting') {
+              markNativeTabConnected(tabId, 'frame-stream');
+            }
             if (!isNativeTabRenderable(tabId, canvas)) return;
             fpsCountRef.current++;
             if (frame) {
@@ -1049,7 +1225,13 @@ export function RdpManager({
           {
             tabId,
             host: server.host,
-            shouldRenderFrame: () => isNativeTabRenderable(tabId, canvas),
+            shouldRenderFrame: () => {
+              const current = tabsRef.current.find(t => t.id === tabId);
+              if (current?.status === 'connecting' || current?.status === 'reconnecting') {
+                markNativeTabConnected(tabId, 'frame-received');
+              }
+              return isNativeTabRenderable(tabId, canvas);
+            },
           },
         );
         nativeFrameCleanupByTabRef.current.set(tabId, cleanupWs);
@@ -2168,7 +2350,7 @@ export function RdpManager({
         store.updateTabStatus(tabId, 'error', friendlyRdpError(raw, t));
       }
     }
-  }, [store, proxyPort, getCanvasSize, ensureH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, startNativeFpsCounter, startOfficialWebFpsCounter, stopFpsCounter, updateNativeResolution]);
+  }, [store, proxyPort, getCanvasSize, ensureH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, markNativeTabConnected, startNativeFpsCounter, startOfficialWebFpsCounter, stopFpsCounter, updateNativeResolution]);
   connectSessionRef.current = connectSession;
 
   // ── Auto-reconnect with exponential backoff ──
@@ -2368,7 +2550,38 @@ export function RdpManager({
     if (isNativeTab) {
       if (!canUseNativeDynamicResizeForHost(server?.host)) {
         nativeResizePendingByTabRef.current.delete(tabId);
+        const now = Date.now();
+        const connectedAt = nativeConnectedAtByTabRef.current.get(tabId);
+        if (connectedAt && now - connectedAt < PUBLIC_NATIVE_ADAPTIVE_SETTLE_MS) {
+          rdpLog.info('render', `adaptive resize (${reason}, native) suppressed during public-route settle`, {
+            tabId,
+            host: server?.host,
+            width: w,
+            height: h,
+            ageMs: now - connectedAt,
+            settleMs: PUBLIC_NATIVE_ADAPTIVE_SETTLE_MS,
+          });
+          return;
+        }
+
+        const lastPublicAdaptiveReconnect = nativePublicAdaptiveReconnectAtRef.current.get(tabId);
+        if (
+          lastPublicAdaptiveReconnect &&
+          now - lastPublicAdaptiveReconnect < PUBLIC_NATIVE_ADAPTIVE_RECONNECT_MIN_INTERVAL_MS
+        ) {
+          rdpLog.info('render', `adaptive resize (${reason}, native) suppressed by public-route reconnect throttle`, {
+            tabId,
+            host: server?.host,
+            width: w,
+            height: h,
+            ageMs: now - lastPublicAdaptiveReconnect,
+            minIntervalMs: PUBLIC_NATIVE_ADAPTIVE_RECONNECT_MIN_INTERVAL_MS,
+          });
+          return;
+        }
+
         lastSizeRef.current = { w, h };
+        nativePublicAdaptiveReconnectAtRef.current.set(tabId, now);
         rdpLog.info('render', `adaptive resize (${reason}, native) → reconnect for public route`, {
           tabId,
           host: server?.host,
@@ -2629,8 +2842,14 @@ export function RdpManager({
       };
 
       // Native mode: send key scancode directly to Rust backend
+      const nativePressedKeys = new NativePressedKeyTracker();
       const nativeSendKey = (scancode: number, isPressed: boolean) => {
         if (!isNative) return;
+        if (isPressed) {
+          nativePressedKeys.press(scancode);
+        } else {
+          nativePressedKeys.release(scancode);
+        }
         api.rdpNativeInput(tabId, scancode, isPressed).catch(() => {});
       };
 
@@ -2638,7 +2857,7 @@ export function RdpManager({
       const nativeSendKeyBatch = (scancodes: { sc: number; pressed: boolean }[]) => {
         if (!isNative) return;
         for (const { sc, pressed } of scancodes) {
-          api.rdpNativeInput(tabId, sc, pressed).catch(() => {});
+          nativeSendKey(sc, pressed);
         }
       };
 
@@ -2814,6 +3033,7 @@ export function RdpManager({
       let cmdPendingWinTap = false;
 
       const onKeyDown = (e: KeyboardEvent) => {
+        lastRdpInputAtRef.current.set(tabId, Date.now());
         // Let host shortcuts (Cmd+W close tab, Cmd+Q quit) pass through without interception
         if (isMac && e.metaKey && (e.code === 'KeyW' || e.code === 'KeyQ')) {
           return;
@@ -2905,6 +3125,7 @@ export function RdpManager({
         }
       };
       const onKeyUp = (e: KeyboardEvent) => {
+        lastRdpInputAtRef.current.set(tabId, Date.now());
         e.preventDefault();
         if (!isNative && !wasmModule) return;
         if (suppressedShortcutKeyups.has(e.code)) {
@@ -2971,6 +3192,7 @@ export function RdpManager({
       };
 
       const onMouseMove = (e: MouseEvent) => {
+        lastRdpInputAtRef.current.set(tabId, Date.now());
         const { x: mx, y: my } = canvasPointToRemote(e);
         pendingMouseMove = { x: mx, y: my };
         if (mouseMoveAnimationFrame !== null) return;
@@ -2983,6 +3205,7 @@ export function RdpManager({
       };
       const pressedButtons = new Set<number>();
       const onMouseDown = (e: MouseEvent) => {
+        lastRdpInputAtRef.current.set(tabId, Date.now());
         e.preventDefault();
         pressedButtons.add(e.button);
         const { x: mx, y: my } = canvasPointToRemote(e);
@@ -3006,6 +3229,7 @@ export function RdpManager({
         }
       };
       const onMouseUp = (e: MouseEvent) => {
+        lastRdpInputAtRef.current.set(tabId, Date.now());
         if (!pressedButtons.has(e.button)) {
           rdpLog.debug('input', `mouse UP btn=${e.button} SKIPPED (not in pressed)`, { pressed: [...pressedButtons] });
           return;
@@ -3029,6 +3253,7 @@ export function RdpManager({
       };
       const onCtxMenu = (e: Event) => e.preventDefault();
       const onWheel = (e: WheelEvent) => {
+        lastRdpInputAtRef.current.set(tabId, Date.now());
         e.preventDefault();
         const vertical = Math.abs(e.deltaY) >= Math.abs(e.deltaX);
         const delta = vertical ? e.deltaY : e.deltaX;
@@ -3052,12 +3277,24 @@ export function RdpManager({
       // keyUp events for keys held when focus leaves.
       const releaseAllKeys = () => {
         rdpLog.debug('input', 'releaseAllKeys called', { pressedButtons: [...pressedButtons] });
+        if (isNative) {
+          nativePressedKeys.releaseAll(scancode => {
+            api.rdpNativeInput(tabId, scancode, false).catch(error => {
+              rdpLog.debug('input', 'native release key failed', {
+                tabId,
+                scancode,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+          });
+        }
         const session = sessionRefs.current.get(tabId);
         if (session) {
           try { session.releaseAllInputs(); } catch { /* ignore */ }
         }
         pressedButtons.clear();
         suppressedShortcutKeyups.clear();
+        cmdPendingWinTap = false;
       };
       const onCanvasBlur = () => {
         // Skip release if mouse buttons are still pressed (user is dragging).
@@ -3114,6 +3351,10 @@ export function RdpManager({
         if (fileTransferInProgressRef.current.has(tabId)) {
           if (reason === 'Focus') cblog('[clipboard] Focus: skipped — file transfer in progress');
           return;
+        }
+        if (reason === 'Poll') {
+          const lastInputAt = lastRdpInputAtRef.current.get(tabId) ?? 0;
+          if (Date.now() - lastInputAt < CLIPBOARD_POLL_INPUT_IDLE_MS) return;
         }
         // Prevent overlapping polls (previous poll still running)
         if (reason === 'Poll') {
@@ -3247,6 +3488,7 @@ export function RdpManager({
       }, 6000);
 
       cleanupFn = () => {
+        releaseAllKeys();
         canvas.removeEventListener('keydown', onKeyDown);
         canvas.removeEventListener('keyup', onKeyUp);
         canvas.removeEventListener('mousemove', onMouseMove);
@@ -3273,7 +3515,7 @@ export function RdpManager({
     };
   }, [store.activeTabId, store.activeTab?.status]);
 
-  // ── Debounced adaptive resize (Jump Desktop style) ──
+  // ── Adaptive resize after connect: only when the app window itself resizes ──
   useEffect(() => {
     const scheduleResize = (reason: string) => {
       if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
@@ -3283,56 +3525,20 @@ export function RdpManager({
       );
     };
 
-    // ResizeObserver for wrapper layout changes
-    const obs = new ResizeObserver(() => scheduleResize('observer'));
-    if (canvasWrapRef.current) obs.observe(canvasWrapRef.current);
-    if (containerRef.current) obs.observe(containerRef.current);
-
-    // Also listen for window resize (Tauri window drag/resize)
+    // Initial adaptive sizing is handled during connect. After the session is
+    // connected, only user-driven NextDesk window resizes may change the remote
+    // desktop size; wrapper/focus/poll layout stabilization must not reconnect.
     const onWindowResize = () => scheduleResize('window resize');
     const onVisualViewportResize = () => scheduleResize('visual viewport');
     window.addEventListener('resize', onWindowResize);
     window.visualViewport?.addEventListener('resize', onVisualViewportResize);
 
-    // Tauri/WebView window resizes can occasionally miss ResizeObserver.
-    // Keep a cheap fallback that only acts when dimensions actually changed.
-    const pollTimer = setInterval(() => scheduleResize('poll'), 1000);
-
     return () => {
-      obs.disconnect();
       window.removeEventListener('resize', onWindowResize);
       window.visualViewport?.removeEventListener('resize', onVisualViewportResize);
-      clearInterval(pollTimer);
       if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
     };
   }, [store.activeTabId, performAdaptiveResize]);
-
-  // ── Calibrate adaptive resolution when switching back to NextDesk ──
-  useEffect(() => {
-    let focusTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const scheduleFocusResize = () => {
-      if (focusTimer) clearTimeout(focusTimer);
-      focusTimer = setTimeout(() => {
-        performAdaptiveResize('window focus');
-      }, 250);
-    };
-
-    const onVisibilityChange = () => {
-      if (!document.hidden) scheduleFocusResize();
-    };
-
-    window.addEventListener('focus', scheduleFocusResize);
-    window.addEventListener('pageshow', scheduleFocusResize);
-    document.addEventListener('visibilitychange', onVisibilityChange);
-
-    return () => {
-      if (focusTimer) clearTimeout(focusTimer);
-      window.removeEventListener('focus', scheduleFocusResize);
-      window.removeEventListener('pageshow', scheduleFocusResize);
-      document.removeEventListener('visibilitychange', onVisibilityChange);
-    };
-  }, [performAdaptiveResize]);
 
   const activeTab = store.activeTab;
   const hasActiveTabs = store.tabs.length > 0;
@@ -3429,7 +3635,7 @@ export function RdpManager({
             sessionControls={activeTab?.status === 'connected' ? {
               resMode,
               resolution: rdpStats.resolution,
-              fps: rdpStats.fps,
+              fps: ENABLE_RDP_FRAME_DIAGNOSTICS ? rdpStats.fps : null,
               presets: RESOLUTION_PRESETS,
               macClipboardStrategy,
               hasClipboardFolder,

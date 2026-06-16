@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_RDP_ENGINE_MODE,
   RDP_ENGINE_STORAGE_KEY,
+  RDP_WASM_LOG_LEVEL_STORAGE_KEY,
   parseRdpEngineMode,
+  parseRdpWasmLogLevel,
   resolveOfficialWebFeatureFlags,
   resolveRdpEngineMode,
   resolveRdpRuntimeBooleanFlag,
+  resolveRdpWasmLogLevel,
 } from '@/rdp/engine-flags';
 
 function createStorage(initial: Record<string, string> = {}): Storage {
@@ -43,10 +47,40 @@ describe('IronRDP-first engine flags', () => {
     expect(parseRdpEngineMode('ironrdp-web')).toBe('official-web');
   });
 
+  it('uses native-drift as the default renderer while keeping official-web as fallback', () => {
+    expect(DEFAULT_RDP_ENGINE_MODE).toBe('native-drift');
+    expect(resolveRdpEngineMode({
+      envValue: null,
+      storage: createStorage(),
+      globalValue: null,
+      experimentalNativeValue: undefined,
+    })).toBe('native-drift');
+    expect(resolveRdpEngineMode({
+      envValue: 'official-web',
+      storage: createStorage(),
+      globalValue: null,
+      experimentalNativeValue: undefined,
+    })).toBe('official-web');
+    expect(resolveRdpEngineMode({
+      envValue: null,
+      storage: createStorage(),
+      globalValue: null,
+      experimentalNativeValue: '0',
+    })).toBe('official-web');
+  });
+
   it('parses native aliases but does not enable native without the experimental flag', () => {
     expect(parseRdpEngineMode('native')).toBe('native');
+    expect(parseRdpEngineMode('native-drift')).toBe('native-drift');
+    expect(parseRdpEngineMode('native-fast')).toBe('native-drift');
     expect(resolveRdpEngineMode({
       envValue: 'native',
+      storage: createStorage(),
+      globalValue: null,
+      experimentalNativeValue: '0',
+    })).toBe('official-web');
+    expect(resolveRdpEngineMode({
+      envValue: 'native-drift',
       storage: createStorage(),
       globalValue: null,
       experimentalNativeValue: '0',
@@ -60,6 +94,12 @@ describe('IronRDP-first engine flags', () => {
       globalValue: null,
       experimentalNativeValue: '1',
     })).toBe('native');
+    expect(resolveRdpEngineMode({
+      envValue: 'native-drift',
+      storage: createStorage(),
+      globalValue: null,
+      experimentalNativeValue: '1',
+    })).toBe('native-drift');
   });
 
   it('lets localStorage request native only when experimental native is enabled', () => {
@@ -94,6 +134,42 @@ describe('IronRDP-first engine flags', () => {
       envValue: 'enabled',
       defaultValue: false,
     })).toBe(true);
+  });
+
+  it('parses WASM log levels', () => {
+    expect(RDP_WASM_LOG_LEVEL_STORAGE_KEY).toBe('nextdesk_rdp_wasm_log_level');
+    expect(parseRdpWasmLogLevel('debug')).toBe('debug');
+    expect(parseRdpWasmLogLevel('WARN')).toBe('warn');
+    expect(parseRdpWasmLogLevel('verbose')).toBeNull();
+  });
+
+  it('keeps WASM tracing quiet in production by default', () => {
+    expect(resolveRdpWasmLogLevel({
+      isDev: false,
+      storageValue: null,
+      envValue: null,
+    })).toBe('warn');
+  });
+
+  it('keeps WASM tracing detailed in dev by default', () => {
+    expect(resolveRdpWasmLogLevel({
+      isDev: true,
+      storageValue: null,
+      envValue: null,
+    })).toBe('debug');
+  });
+
+  it('allows storage and env to override WASM log level', () => {
+    expect(resolveRdpWasmLogLevel({
+      isDev: false,
+      storageValue: 'trace',
+      envValue: 'error',
+    })).toBe('trace');
+    expect(resolveRdpWasmLogLevel({
+      isDev: false,
+      storageValue: null,
+      envValue: 'error',
+    })).toBe('error');
   });
 });
 

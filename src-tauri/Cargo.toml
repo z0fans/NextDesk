@@ -1,6 +1,6 @@
 [package]
 name = "nextdesk"
-version = "1.0.118"
+version = "1.0.119"
 edition = "2021"
 
 [dependencies]
@@ -34,6 +34,9 @@ aggligator = "0.9"
 maxminddb = "0.24"
 cpal = "0.17"
 png = "0.17"
+pollster = "0.4"
+raw-window-handle = "0.6"
+wgpu = "24"
 
 # ── IronRDP native crates (local path) ──
 ironrdp = { path = "../../IronRDP/crates/ironrdp", version = "0.14", features = [

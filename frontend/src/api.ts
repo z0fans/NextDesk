@@ -226,10 +226,26 @@ export const api = {
     domain?: string;
     width: number;
     height: number;
+    renderProfile?: string;
   }) => invoke<number>('rdp_native_connect', params),
+
+  rdpNativeSetViewBounds: (tabId: string, bounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    scaleFactor: number;
+    visible: boolean;
+  }) => invoke<void>('rdp_native_set_view_bounds', { tabId, ...bounds }),
 
   rdpNativeInput: (tabId: string, scancode: number, isPressed: boolean) =>
     invoke<void>('rdp_native_input', { tabId, scancode, isPressed }),
+
+  rdpNativeForceClipboardCheck: (tabId: string) =>
+    invoke<void>('rdp_native_force_clipboard_check', { tabId }),
+
+  rdpNativeSetActiveClipboardSession: (tabId: string | null) =>
+    invoke<void>('rdp_native_set_active_clipboard_session', { tabId }),
 
   rdpNativeMouse: (tabId: string, x: number, y: number, button: number, isDown: boolean) =>
     invoke<void>('rdp_native_mouse', { tabId, x, y, button, isDown }),

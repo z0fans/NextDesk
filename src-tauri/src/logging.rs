@@ -3,7 +3,7 @@
 //! Initializes env_logger with:
 //! - Output to both stderr (visible in `npx tauri dev` console) and a log file
 //! - Log file path: `/tmp/nextdesk_debug.log` (truncated on every startup)
-//! - Default level: INFO
+//! - Default level: INFO in dev, WARN in release builds
 //! - Override via `RUST_LOG` env var
 //!
 //! ## Usage
@@ -90,8 +90,9 @@ pub fn init() {
 
     let mut builder = env_logger::Builder::new();
 
-    // Default per-module levels.
-    builder.parse_filters(
+    // Default per-module levels. Dev keeps rich diagnostics; release keeps
+    // backend logging off RDP hot paths unless warnings/errors occur.
+    let default_filters = if cfg!(debug_assertions) {
         "info,\
          nextdesk_lib::cliprdr=trace,\
          nextdesk_lib::rdp_session=debug,\
@@ -100,8 +101,17 @@ pub fn init() {
          ironrdp_cliprdr=info,\
          ironrdp_session=info,\
          ironrdp_connector=info,\
-         tracing=warn",
-    );
+         tracing=warn"
+    } else {
+        "warn,\
+         nextdesk_lib=warn,\
+         ironrdp=warn,\
+         ironrdp_cliprdr=warn,\
+         ironrdp_session=warn,\
+         ironrdp_connector=warn,\
+         tracing=warn"
+    };
+    builder.parse_filters(default_filters);
 
     // Allow RUST_LOG to override the defaults
     if let Ok(filter) = std::env::var("RUST_LOG") {

@@ -23,6 +23,7 @@ pub fn build_factory(
     action_tx: mpsc::UnboundedSender<CliprdrAction>,
     app_handle: AppHandle,
     temp_dir: String,
+    session_id: String,
 ) -> backend::NextDeskCliprdrFactory {
-    backend::NextDeskCliprdrFactory::new(action_tx, app_handle, temp_dir)
+    backend::NextDeskCliprdrFactory::new(action_tx, app_handle, temp_dir, session_id)
 }

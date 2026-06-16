@@ -1,3 +1,5 @@
+import { isPotentialDriftFramePacket, parseDriftFramePacket } from '@/lib/drift-frame-protocol';
+
 const HEADER_SIZE = 12;
 const GFX_FRAME_MAGIC = 0xffff;
 
@@ -27,6 +29,30 @@ export function nativeBitmapFrameKey(raw: ArrayBuffer): string | null {
   return `${desktopW}x${desktopH}:${x},${y},${width},${height}`;
 }
 
+export function nativeFrameQueueKey(raw: ArrayBuffer): string | null {
+  const driftKey = driftFrameQueueKey(raw);
+  if (driftKey) return driftKey;
+  return nativeBitmapFrameKey(raw);
+}
+
+function driftFrameQueueKey(raw: ArrayBuffer): string | null {
+  if (!isPotentialDriftFramePacket(raw)) return null;
+
+  try {
+    const packet = parseDriftFramePacket(raw);
+    if (packet.kind === 'full') return `drift:full:${packet.width}x${packet.height}`;
+    if (packet.kind === 'dirty') {
+      const rectKey = packet.rects
+        .map(rect => `${rect.x},${rect.y},${rect.width},${rect.height}`)
+        .join('|');
+      return `drift:dirty:${packet.width}x${packet.height}:${rectKey}`;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function compactNativeFrameQueue(
   queue: ArrayBuffer[],
   options: NativeFrameQueueCompactOptions,
@@ -37,7 +63,7 @@ export function compactNativeFrameQueue(
 
   for (let i = queue.length - 1; i >= 0; i--) {
     const frame = queue[i];
-    const key = nativeBitmapFrameKey(frame);
+    const key = nativeFrameQueueKey(frame);
 
     if (key && seenBitmapKeys.has(key)) {
       droppedDuplicateFrames++;

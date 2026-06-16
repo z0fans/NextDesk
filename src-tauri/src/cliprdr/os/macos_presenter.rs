@@ -38,8 +38,9 @@
 #[cfg(target_os = "macos")]
 mod imp {
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use block2::{DynBlock, RcBlock};
     use objc2::{
@@ -60,6 +61,11 @@ mod imp {
         /// owns the only strong reference.
         static ACTIVE_PRESENTERS: RefCell<Vec<Retained<LazyPastePresenter>>> =
             const { RefCell::new(Vec::new()) };
+    }
+
+    fn active_fetchers() -> &'static Mutex<HashMap<PathBuf, Fetcher>> {
+        static ACTIVE_FETCHERS: OnceLock<Mutex<HashMap<PathBuf, Fetcher>>> = OnceLock::new();
+        ACTIVE_FETCHERS.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
     struct LazyPastePresenterIvars {
@@ -201,6 +207,10 @@ mod imp {
             unsafe { NSFileCoordinator::addFilePresenter(proto) };
 
             log::info!("[lazy-paste] registered presenter for {}", path.display());
+            active_fetchers()
+                .lock()
+                .map_err(|_| "lazy fetcher registry lock poisoned".to_string())?
+                .insert(path.clone(), Arc::clone(&fetcher));
             new_presenters.push(presenter);
         }
 
@@ -230,11 +240,36 @@ mod imp {
         if count > 0 {
             log::info!("[lazy-paste] unregistered {} presenter(s)", count);
         }
+
+        if let Ok(mut fetchers) = active_fetchers().lock() {
+            fetchers.clear();
+        }
+    }
+
+    /// Trigger the lazy file download for a registered placeholder path.
+    ///
+    /// Finder normally reaches the fetcher through NSFileCoordinator. RDP-to-RDP
+    /// clipboard forwarding reads the path directly, so it has to call this
+    /// hook before metadata/data reads or it will see the 0-byte placeholder.
+    pub fn fetch_registered_path(path: &Path) -> Result<bool, String> {
+        let fetcher = active_fetchers()
+            .lock()
+            .map_err(|_| "lazy fetcher registry lock poisoned".to_string())?
+            .get(path)
+            .cloned();
+
+        let Some(fetcher) = fetcher else {
+            return Ok(false);
+        };
+
+        log::info!("[lazy-paste] explicit fetch requested for {}", path.display());
+        fetcher(path)?;
+        Ok(true)
     }
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{register_lazy_paste, unregister_lazy_paste, Fetcher};
+pub use imp::{fetch_registered_path, register_lazy_paste, unregister_lazy_paste, Fetcher};
 
 // ── Stubs for non-macOS targets ───────────────────────────────────────────
 
@@ -248,3 +283,8 @@ pub fn register_lazy_paste(_paths: &[std::path::PathBuf], _fetcher: Fetcher) -> 
 
 #[cfg(not(target_os = "macos"))]
 pub fn unregister_lazy_paste() {}
+
+#[cfg(not(target_os = "macos"))]
+pub fn fetch_registered_path(_path: &std::path::Path) -> Result<bool, String> {
+    Ok(false)
+}
