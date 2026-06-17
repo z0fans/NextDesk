@@ -19,6 +19,7 @@ on:
 
 env:
   MIHOMO_VERSION: v1.19.27
+  HAS_TAURI_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
 
 jobs:
   build-macos:
@@ -53,9 +54,24 @@ jobs:
         run: bash scripts/download-deps.sh universal-apple-darwin
 
       - name: Sanitize signing key
+        if: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
+        shell: bash
         run: |
           KEY=$(echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" | tr -d '\n\r')
           echo "TAURI_SIGNING_PRIVATE_KEY=$KEY" >> "$GITHUB_ENV"
+
+      - name: Disable updater artifacts without signing key
+        if: ${{ env.HAS_TAURI_SIGNING_KEY != 'true' }}
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = 'src-tauri/tauri.conf.json';
+          const config = JSON.parse(fs.readFileSync(path, 'utf8'));
+          config.bundle = config.bundle || {};
+          config.bundle.createUpdaterArtifacts = false;
+          fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+          NODE
 
       - name: Build & Release
         uses: tauri-apps/tauri-action@v0
@@ -68,7 +84,7 @@ jobs:
           releaseBody: "See the assets below for download."
           releaseDraft: false
           prerelease: false
-          includeUpdaterJson: true
+          includeUpdaterJson: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
 
   build-macos-intel:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.platform == 'macos-intel' }}
@@ -102,9 +118,24 @@ jobs:
         run: bash scripts/download-deps.sh x86_64-apple-darwin
 
       - name: Sanitize signing key
+        if: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
+        shell: bash
         run: |
           KEY=$(echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" | tr -d '\n\r')
           echo "TAURI_SIGNING_PRIVATE_KEY=$KEY" >> "$GITHUB_ENV"
+
+      - name: Disable updater artifacts without signing key
+        if: ${{ env.HAS_TAURI_SIGNING_KEY != 'true' }}
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = 'src-tauri/tauri.conf.json';
+          const config = JSON.parse(fs.readFileSync(path, 'utf8'));
+          config.bundle = config.bundle || {};
+          config.bundle.createUpdaterArtifacts = false;
+          fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+          NODE
 
       - name: Build & Release
         uses: tauri-apps/tauri-action@v0
@@ -117,7 +148,7 @@ jobs:
           releaseBody: "See the assets below for download."
           releaseDraft: false
           prerelease: false
-          includeUpdaterJson: true
+          includeUpdaterJson: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
 
   build-windows:
     needs: build-macos
@@ -156,10 +187,24 @@ jobs:
         run: bash scripts/download-deps.sh x86_64-pc-windows-msvc
 
       - name: Sanitize signing key
+        if: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
         shell: bash
         run: |
           KEY=$(echo "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" | tr -d '\n\r')
           echo "TAURI_SIGNING_PRIVATE_KEY=$KEY" >> "$GITHUB_ENV"
+
+      - name: Disable updater artifacts without signing key
+        if: ${{ env.HAS_TAURI_SIGNING_KEY != 'true' }}
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = 'src-tauri/tauri.conf.json';
+          const config = JSON.parse(fs.readFileSync(path, 'utf8'));
+          config.bundle = config.bundle || {};
+          config.bundle.createUpdaterArtifacts = false;
+          fs.writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+          NODE
 
       - name: Preflight Windows build log
         shell: pwsh
@@ -185,4 +230,4 @@ jobs:
           releaseBody: "See the assets below for download."
           releaseDraft: false
           prerelease: false
-          includeUpdaterJson: true
+          includeUpdaterJson: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
