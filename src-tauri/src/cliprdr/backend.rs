@@ -42,7 +42,7 @@ use tokio::sync::mpsc;
 use super::formats;
 use super::os::{create_os_clipboard, ClipFormat, OsClipboard};
 use super::watcher::ClipboardWatcher;
-use crate::rdp_session::CliprdrAction;
+use super::CliprdrAction;
 
 // ── Well-known CLIPRDR format IDs ──
 const CF_TEXT: u32 = 1;
@@ -319,6 +319,13 @@ fn enqueue_request_size(
         return;
     };
     let server_index = f.server_index;
+    let Ok(server_index) = i32::try_from(server_index) else {
+        log::warn!(
+            "[cliprdr] enqueue_request_size: server_index {} exceeds i32",
+            f.server_index
+        );
+        return;
+    };
 
     let stream_id = transfer.next_stream_id;
     transfer.next_stream_id = transfer.next_stream_id.wrapping_add(1);
@@ -370,6 +377,13 @@ fn enqueue_request_next_chunk(
     if remaining == 0 {
         return;
     }
+    let Ok(server_index) = i32::try_from(server_index) else {
+        log::warn!(
+            "[cliprdr] enqueue_request_next_chunk: server_index {} exceeds i32",
+            server_index
+        );
+        return;
+    };
 
     let chunk_size = std::cmp::min(remaining, CHUNK_SIZE as u64) as u32;
     let stream_id = transfer.next_stream_id;
@@ -379,7 +393,7 @@ fn enqueue_request_next_chunk(
     let request = FileContentsRequest {
         stream_id,
         index: server_index,
-        flags: FileContentsFlags::DATA,
+        flags: FileContentsFlags::RANGE,
         position,
         requested_size: chunk_size,
         data_id: None,
@@ -646,7 +660,7 @@ impl CliprdrBackend for NextDeskCliprdrBackend {
         let flags = request.flags;
 
         tokio::task::spawn_blocking(move || {
-            let is_data_request = flags.contains(FileContentsFlags::DATA);
+            let is_data_request = flags.contains(FileContentsFlags::RANGE);
             #[cfg(target_os = "macos")]
             if let Err(e) = super::os::macos_presenter::fetch_registered_path(&path) {
                 log::debug!(
@@ -680,7 +694,7 @@ impl CliprdrBackend for NextDeskCliprdrBackend {
                         FileContentsResponse::new_error(stream_id)
                     }
                 }
-            } else if flags.contains(FileContentsFlags::DATA) {
+            } else if flags.contains(FileContentsFlags::RANGE) {
                 let response_size = capped_outgoing_file_contents_size(requested_size);
                 if response_size < requested_size {
                     log::debug!(
@@ -955,7 +969,11 @@ impl NextDeskCliprdrBackend {
 
             #[cfg(target_os = "macos")]
             if let Err(e) = super::os::macos_presenter::fetch_registered_path(path) {
-                return Err(format!("fetch lazy clipboard file {}: {}", path.display(), e));
+                return Err(format!(
+                    "fetch lazy clipboard file {}: {}",
+                    path.display(),
+                    e
+                ));
             }
 
             // Read file metadata

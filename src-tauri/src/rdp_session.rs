@@ -18,6 +18,7 @@
 //! Total header: 12 bytes. Frontend receives ArrayBuffer directly.
 
 use crate::cliprdr as cliprdr_module;
+use crate::cliprdr::CliprdrAction;
 use crate::frame_ws::{FrameSender, FrameServerShutdown};
 use crate::rdp_frame::{self, DirtyRect};
 use std::collections::HashMap;
@@ -1245,24 +1246,6 @@ fn drain_coalesced_inputs(
 
     coalesce_input_burst(inputs)
 }
-// ── Clipboard Actions (Backend → Session Loop) ──────────────
-
-/// Actions produced by `NextDeskCliprdrBackend` callbacks, consumed by the
-/// session event loop which has access to `Cliprdr` / `ActiveStage`.
-#[derive(Debug)]
-pub enum CliprdrAction {
-    /// Local clipboard changed → send FormatList to server
-    InitiateCopy(Vec<ironrdp::cliprdr::pdu::ClipboardFormat>),
-    /// Remote copied → request format data from server
-    InitiatePaste(ironrdp::cliprdr::pdu::ClipboardFormatId),
-    /// Server requested our data → submit format data response
-    SubmitFormatData(ironrdp::cliprdr::pdu::OwnedFormatDataResponse),
-    /// Server requested file contents → submit file contents response
-    SubmitFileContents(ironrdp::cliprdr::pdu::FileContentsResponse<'static>),
-    /// We need a file chunk from server → send FileContentsRequest
-    RequestFileContents(ironrdp::cliprdr::pdu::FileContentsRequest),
-}
-
 // ── Session Management ──────────────────────────────────────
 
 /// Handle to a running native RDP session.

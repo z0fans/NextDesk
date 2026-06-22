@@ -20,6 +20,9 @@ on:
 env:
   MIHOMO_VERSION: v1.19.27
   HAS_TAURI_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+  VITE_NEXTDESK_RDP_ENGINE: kkterm-copy
+  VITE_NEXTDESK_KKTERM_KEYBOARD_MODE: remote-scancode
+  RUSTFLAGS: --cfg nextdesk_kkterm_rdp
 
 jobs:
   build-macos:
@@ -78,7 +81,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          args: --target universal-apple-darwin --config src-tauri/tauri.macos.conf.json
+          args: --target universal-apple-darwin --features kkterm-rdp --config src-tauri/tauri.macos.conf.json
           tagName: ${{ github.ref_name }}
           releaseName: "NextDesk ${{ github.ref_name }}"
           releaseBody: "See the assets below for download."
@@ -142,7 +145,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          args: --target x86_64-apple-darwin --config src-tauri/tauri.macos.conf.json
+          args: --target x86_64-apple-darwin --features kkterm-rdp --config src-tauri/tauri.macos.conf.json
           tagName: ${{ github.ref_name }}
           releaseName: "NextDesk ${{ github.ref_name }}"
           releaseBody: "See the assets below for download."
@@ -211,7 +214,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cmd /c "npm run tauri build -- --config src-tauri/tauri.windows.conf.json > windows-tauri-build.log 2>&1"
+          cmd /c "npm run tauri build -- --features kkterm-rdp --config src-tauri/tauri.windows.conf.json > windows-tauri-build.log 2>&1"
           $exitCode = $LASTEXITCODE
           Get-Content windows-tauri-build.log
           if ($exitCode -ne 0) {
@@ -224,7 +227,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          args: --config src-tauri/tauri.windows.conf.json
+          args: --features kkterm-rdp --config src-tauri/tauri.windows.conf.json
           tagName: ${{ github.ref_name }}
           releaseName: "NextDesk ${{ github.ref_name }}"
           releaseBody: "See the assets below for download."

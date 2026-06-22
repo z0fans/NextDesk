@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use ironrdp::cliprdr::pdu::{ClipboardFormat, ClipboardFormatId};
 
 use super::os::{ClipFormat, OsClipboard};
-use crate::rdp_session::CliprdrAction;
+use super::CliprdrAction;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const INIT_COOLDOWN: Duration = Duration::from_secs(10);

@@ -89,6 +89,7 @@ pub struct AppState {
     pub last_sync_ts: Arc<Mutex<u64>>,
     pub sync_state: Arc<Mutex<SyncState>>,
     pub audio_manager: Arc<Mutex<crate::rdp_audio::AudioManager>>,
+    #[cfg(feature = "nextdesk-native-rdp")]
     pub native_sessions: Arc<Mutex<crate::rdp_session::SessionManager>>,
     pub native_view_bounds: crate::rdp_native_view::NativeViewBoundsStore,
     pub native_view_hosts: crate::rdp_native_view::NativeViewHostStore,
@@ -118,6 +119,7 @@ impl Default for AppState {
             last_sync_ts: Arc::new(Mutex::new(0)),
             sync_state: Arc::new(Mutex::new(SyncState::default())),
             audio_manager: Arc::new(Mutex::new(crate::rdp_audio::AudioManager::default())),
+            #[cfg(feature = "nextdesk-native-rdp")]
             native_sessions: Arc::new(Mutex::new(crate::rdp_session::SessionManager::default())),
             native_view_bounds: crate::rdp_native_view::create_bounds_store(),
             native_view_hosts: crate::rdp_native_view::create_host_store(),

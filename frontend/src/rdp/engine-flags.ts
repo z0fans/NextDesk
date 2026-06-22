@@ -1,10 +1,10 @@
-export type RdpEngineMode = 'native' | 'native-drift' | 'official-web';
+export type RdpEngineMode = 'native' | 'native-drift' | 'official-web' | 'kkterm-copy';
 export type RdpWasmLogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error';
 
 export const RDP_ENGINE_STORAGE_KEY = 'nextdesk_rdp_engine';
 export const RDP_EXPERIMENTAL_NATIVE_STORAGE_KEY = 'nextdesk_experimental_native_rdp';
 export const RDP_WASM_LOG_LEVEL_STORAGE_KEY = 'nextdesk_rdp_wasm_log_level';
-export const DEFAULT_RDP_ENGINE_MODE: RdpEngineMode = 'native-drift';
+export const DEFAULT_RDP_ENGINE_MODE: RdpEngineMode = 'kkterm-copy';
 export const DEFAULT_EXPERIMENTAL_NATIVE_RDP = true;
 
 type RuntimeGlobal = typeof globalThis & {
@@ -102,6 +102,14 @@ export function parseRdpEngineMode(value: string | null | undefined): RdpEngineM
     normalized === 'ironrdp-web'
   ) {
     return 'official-web';
+  }
+  if (
+    normalized === 'kkterm-copy' ||
+    normalized === 'kkterm' ||
+    normalized === 'mstscax' ||
+    normalized === 'activex'
+  ) {
+    return 'kkterm-copy';
   }
   return null;
 }
@@ -210,13 +218,14 @@ export function resolveRdpEngineMode(options: ResolveRdpEngineModeOptions = {}):
 
   const candidates = [
     typeof globalValue === 'string' ? globalValue : null,
-    readStorageItem(storage, RDP_ENGINE_STORAGE_KEY),
     envOption === undefined ? readEnvValue('VITE_NEXTDESK_RDP_ENGINE') : envOption,
+    readStorageItem(storage, RDP_ENGINE_STORAGE_KEY),
   ];
 
   for (const candidate of candidates) {
     const mode = parseRdpEngineMode(candidate);
     if (mode === 'official-web') return 'official-web';
+    if (mode === 'kkterm-copy') return 'kkterm-copy';
     if ((mode === 'native' || mode === 'native-drift') && experimentalNative) return mode;
   }
 
@@ -233,4 +242,8 @@ export function isNativeDriftRdpMode(mode: RdpEngineMode): boolean {
 
 export function isOfficialIronRdpWebMode(mode: RdpEngineMode): boolean {
   return mode === 'official-web';
+}
+
+export function isKktermCopyRdpMode(mode: RdpEngineMode): boolean {
+  return mode === 'kkterm-copy';
 }

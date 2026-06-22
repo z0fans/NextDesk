@@ -27,6 +27,7 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
+      'react-i18next': path.resolve(__dirname, './src/vendor/kkterm/shims/react-i18next.ts'),
     },
   },
 })

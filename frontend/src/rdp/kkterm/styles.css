@@ -1,0 +1,171 @@
+.remote-desktop-workspace {
+  position: relative;
+  display: grid;
+  min-height: 0;
+  height: 100%;
+  place-items: center;
+  overflow: hidden;
+  background: #111318;
+}
+
+.remote-desktop-pane {
+  grid-template-rows: 34px minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+}
+
+.remote-desktop-pane .remote-desktop-workspace {
+  border-radius: 0 0 8px 8px;
+}
+
+.remote-desktop-pane .webview-toolbar-status {
+  flex: 0 1 auto;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-desktop-placeholder {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 8px;
+  padding: 24px;
+  max-width: 360px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.remote-desktop-placeholder svg {
+  justify-self: center;
+  color: var(--accent);
+}
+
+.remote-desktop-placeholder h2,
+.remote-desktop-placeholder p,
+.remote-desktop-placeholder small {
+  margin: 0;
+}
+
+.remote-desktop-placeholder h2 {
+  color: var(--text);
+  font-size: 20px;
+}
+
+.remote-desktop-placeholder p {
+  font-size: 13px;
+}
+
+.rdp-suppression-snapshot {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  pointer-events: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.vnc-display {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  outline: none;
+  background: #05070a;
+  image-rendering: auto;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.vnc-display.ready {
+  z-index: 2;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.vnc-display.ready:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+.remote-desktop-view-mode-actualSize,
+.remote-desktop-view-mode-fitWidth,
+.remote-desktop-view-mode-fitHeight {
+  place-items: start;
+  overflow: auto;
+}
+
+.remote-desktop-view-mode-stretch .vnc-display {
+  object-fit: fill;
+}
+
+.remote-desktop-view-mode-actualSize .vnc-display,
+.remote-desktop-view-mode-fitWidth .vnc-display,
+.remote-desktop-view-mode-fitHeight .vnc-display {
+  position: relative;
+  inset: auto;
+  max-width: none;
+  max-height: none;
+}
+
+.remote-desktop-view-mode-actualSize .vnc-display {
+  width: auto;
+  height: auto;
+}
+
+.remote-desktop-view-mode-fitWidth .vnc-display {
+  width: 100%;
+  height: auto;
+}
+
+.remote-desktop-view-mode-fitHeight .vnc-display {
+  width: auto;
+  height: 100%;
+}
+
+/* macOS IronRDP canvas view (RdpCanvasView). */
+.rdp-canvas-view {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #000;
+}
+
+.rdp-canvas-surface {
+  width: 100%;
+  height: 100%;
+  object-fit: fill;
+  touch-action: none;
+}
+
+.rdp-canvas-ime-input {
+  position: absolute;
+  top: 0;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.rdp-canvas-status {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  color: #fff;
+  text-align: center;
+  pointer-events: none;
+}
+
+.rdp-canvas-status-blackout {
+  background: #000;
+}

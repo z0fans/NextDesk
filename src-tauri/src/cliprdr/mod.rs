@@ -14,7 +14,21 @@ pub mod watcher;
 use tauri::AppHandle;
 use tokio::sync::mpsc;
 
-use crate::rdp_session::CliprdrAction;
+/// Actions produced by `NextDeskCliprdrBackend` callbacks, consumed by the
+/// active RDP event loop which has access to `Cliprdr` / `ActiveStage`.
+#[derive(Debug)]
+pub enum CliprdrAction {
+    /// Local clipboard changed -> send FormatList to server.
+    InitiateCopy(Vec<ironrdp::cliprdr::pdu::ClipboardFormat>),
+    /// Remote copied -> request format data from server.
+    InitiatePaste(ironrdp::cliprdr::pdu::ClipboardFormatId),
+    /// Server requested our data -> submit format data response.
+    SubmitFormatData(ironrdp::cliprdr::pdu::OwnedFormatDataResponse),
+    /// Server requested file contents -> submit file contents response.
+    SubmitFileContents(ironrdp::cliprdr::pdu::FileContentsResponse<'static>),
+    /// We need a file chunk from server -> send FileContentsRequest.
+    RequestFileContents(ironrdp::cliprdr::pdu::FileContentsRequest),
+}
 
 /// Build the CLIPRDR backend factory for use with IronRDP session.
 ///

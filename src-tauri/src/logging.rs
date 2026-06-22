@@ -26,6 +26,11 @@ pub fn log_file_path() -> PathBuf {
     PathBuf::from("/tmp").join("nextdesk_debug.log")
 }
 
+#[allow(dead_code)]
+pub fn rdp_debug(event: &str, payload: &serde_json::Value) {
+    log::debug!(target: "nextdesk_lib::kkterm_rdp", "[kkterm-rdp] {event} {payload}");
+}
+
 /// A writer that fans out to both a file and stderr.
 struct FanoutWriter {
     file: Mutex<File>,

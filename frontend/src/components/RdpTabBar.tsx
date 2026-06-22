@@ -1,4 +1,4 @@
-import { useRef, useCallback, useEffect, useState } from 'react';
+import { useRef, useCallback, useEffect, useLayoutEffect, useState } from 'react';
 import { X, LayoutGrid, LayoutList, RefreshCw, MoreHorizontal, ChevronDown, FolderOpen, Monitor, ClipboardCopy, PanelLeftOpen, Keyboard, ShieldAlert } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
@@ -12,12 +12,23 @@ export interface SessionControls {
   presets: readonly { label: string; value: string }[];
   macClipboardStrategy: 'session-file-url' | 'pasteboard-promise';
   hasClipboardFolder: boolean;
+  showClipboardManagement?: boolean;
+  showWinKey?: boolean;
+  ctrlAltDelMode?: 'send' | 'hint' | 'hidden';
   onApplyResolution: (mode: string) => void;
   onToggleClipboardStrategy: () => void;
   onOpenClipboardFolder: () => void;
+  onSendClipboardText?: () => void;
   onSendWinKey: () => void;
   onSendCtrlAltDel: () => void;
   onDisconnect: () => void;
+}
+
+export interface SessionControlsMenuRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 interface Props {
@@ -32,6 +43,9 @@ interface Props {
   onReorderTabs?: (from: number, to: number) => void;
   onReconnectTab?: (tabId: string) => void;
   sessionControls?: SessionControls | null;
+  activeXSafeMenus?: boolean;
+  onSessionControlsMenuOpenChange?: (open: boolean, rect?: SessionControlsMenuRect) => void;
+  onOverlayClipRectChange?: (id: string, open: boolean, rect?: SessionControlsMenuRect) => void;
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -45,7 +59,24 @@ const STATUS_COLOR: Record<string, string> = {
 
 const DRAG_THRESHOLD = 4; // px before activating drag
 
-export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSidebar, onSelectTab, onCloseTab, onViewModeChange, onReorderTabs, onReconnectTab, sessionControls }: Props) {
+function rectFromElement(element: HTMLElement | null): SessionControlsMenuRect | undefined {
+  const rect = element?.getBoundingClientRect();
+  return rect
+    ? {
+        x: rect.left,
+        y: rect.top,
+        width: rect.width,
+        height: rect.height,
+      }
+    : undefined;
+}
+
+function clampContextMenuLeft(left: number, width: number): number {
+  const viewportWidth = typeof window === 'undefined' ? left + width : window.innerWidth;
+  return Math.max(8, Math.min(left, viewportWidth - width - 8));
+}
+
+export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSidebar, onSelectTab, onCloseTab, onViewModeChange, onReorderTabs, onReconnectTab, sessionControls, activeXSafeMenus = false, onSessionControlsMenuOpenChange, onOverlayClipRectChange }: Props) {
   const { t } = useTranslation();
   const [dragIdx, setDragIdx] = useState<number | null>(null);
   const [dragOffsetX, setDragOffsetX] = useState(0);
@@ -54,8 +85,69 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
   const [showControlsMenu, setShowControlsMenu] = useState(false);
   const [showResSubmenu, setShowResSubmenu] = useState(false);
   const dragState = useRef<{ idx: number; startX: number; active: boolean } | null>(null);
+  const barRef = useRef<HTMLDivElement>(null);
   const tabRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const controlsBtnRef = useRef<HTMLButtonElement>(null);
+  const controlsMenuRef = useRef<HTMLDivElement>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
+  const hasSessionControls = Boolean(sessionControls);
+  const showWinKeyControl = sessionControls?.showWinKey !== false;
+  const ctrlAltDelMode = sessionControls?.ctrlAltDelMode ?? 'send';
+
+  const notifySessionControlsMenuState = useCallback(() => {
+    if (!hasSessionControls || !showControlsMenu) {
+      onSessionControlsMenuOpenChange?.(false);
+      onOverlayClipRectChange?.('session-controls', false);
+      return;
+    }
+    const rect = rectFromElement(controlsMenuRef.current);
+    onSessionControlsMenuOpenChange?.(true, rect);
+    onOverlayClipRectChange?.('session-controls', true, rect);
+  }, [hasSessionControls, onOverlayClipRectChange, onSessionControlsMenuOpenChange, showControlsMenu]);
+
+  const notifyContextMenuState = useCallback(() => {
+    if (!ctxMenu || activeXSafeMenus) {
+      onOverlayClipRectChange?.('tab-context-menu', false);
+      return;
+    }
+    onOverlayClipRectChange?.('tab-context-menu', true, rectFromElement(contextMenuRef.current));
+  }, [activeXSafeMenus, ctxMenu, onOverlayClipRectChange]);
+
+  useLayoutEffect(() => {
+    notifySessionControlsMenuState();
+  }, [notifySessionControlsMenuState, showResSubmenu]);
+
+  useLayoutEffect(() => {
+    notifyContextMenuState();
+  }, [notifyContextMenuState]);
+
+  useEffect(() => {
+    if (!showControlsMenu) return;
+    window.addEventListener('resize', notifySessionControlsMenuState);
+    window.visualViewport?.addEventListener('resize', notifySessionControlsMenuState);
+    return () => {
+      window.removeEventListener('resize', notifySessionControlsMenuState);
+      window.visualViewport?.removeEventListener('resize', notifySessionControlsMenuState);
+    };
+  }, [notifySessionControlsMenuState, showControlsMenu]);
+
+  useEffect(() => {
+    if (!ctxMenu) return;
+    window.addEventListener('resize', notifyContextMenuState);
+    window.visualViewport?.addEventListener('resize', notifyContextMenuState);
+    return () => {
+      window.removeEventListener('resize', notifyContextMenuState);
+      window.visualViewport?.removeEventListener('resize', notifyContextMenuState);
+    };
+  }, [ctxMenu, notifyContextMenuState]);
+
+  useEffect(() => {
+    return () => {
+      onSessionControlsMenuOpenChange?.(false);
+      onOverlayClipRectChange?.('session-controls', false);
+      onOverlayClipRectChange?.('tab-context-menu', false);
+    };
+  }, [onOverlayClipRectChange, onSessionControlsMenuOpenChange]);
 
   // Hit-test: find which tab index the cursor is over (skip the dragged tab itself)
   const hitTest = useCallback((clientX: number, excludeIdx?: number) => {
@@ -111,7 +203,7 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
   };
 
   return (
-    <div className="flex items-center gap-1 px-2 py-1 bg-card/80 border-b border-border shrink-0">
+    <div ref={barRef} className="flex items-center gap-1 px-2 py-1 bg-card/80 border-b border-border shrink-0">
       {!sidebarOpen && (
         <Button
           variant="ghost"
@@ -170,13 +262,35 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
         <>
           <div className="fixed inset-0 z-[99]" onClick={() => setCtxMenu(null)} />
           <div
-            className="fixed z-[100] min-w-[140px] rounded-md border border-border bg-popover p-1 shadow-md animate-in fade-in-0 zoom-in-95"
-            style={{ left: ctxMenu.x, top: ctxMenu.y }}
+            ref={contextMenuRef}
+            data-testid="rdp-tab-context-menu"
+            className={cn(
+              "fixed z-[100] border border-border bg-popover",
+              activeXSafeMenus
+                ? "flex h-8 items-center gap-1 rounded-md p-0.5 shadow-none"
+                : "min-w-[140px] rounded-md p-1 shadow-md animate-in fade-in-0 zoom-in-95",
+            )}
+            style={activeXSafeMenus
+              ? (() => {
+                  const barRect = barRef.current?.getBoundingClientRect();
+                  const menuWidth = onReconnectTab ? 224 : 96;
+                  const menuHeight = 32;
+                  return {
+                    left: clampContextMenuLeft(ctxMenu.x, menuWidth),
+                    top: barRect
+                      ? Math.max(0, Math.round(barRect.top + (barRect.height - menuHeight) / 2))
+                      : Math.max(0, ctxMenu.y - menuHeight),
+                  };
+                })()
+              : { left: ctxMenu.x, top: ctxMenu.y }}
           >
             {onReconnectTab && (
               <button
                 type="button"
-                className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground cursor-pointer"
+                className={cn(
+                  "flex items-center gap-2 rounded-sm text-xs hover:bg-accent hover:text-accent-foreground cursor-pointer",
+                  activeXSafeMenus ? "h-7 px-2 whitespace-nowrap" : "w-full px-2 py-1.5",
+                )}
                 onClick={() => { onReconnectTab(ctxMenu.tabId); setCtxMenu(null); }}
               >
                 <RefreshCw className="h-3.5 w-3.5" />
@@ -185,7 +299,10 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
             )}
             <button
               type="button"
-              className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground text-destructive cursor-pointer"
+              className={cn(
+                "flex items-center gap-2 rounded-sm text-xs hover:bg-accent hover:text-accent-foreground text-destructive cursor-pointer",
+                activeXSafeMenus ? "h-7 px-2 whitespace-nowrap" : "w-full px-2 py-1.5",
+              )}
               onClick={() => { onCloseTab(ctxMenu.tabId); setCtxMenu(null); }}
             >
               <X className="h-3.5 w-3.5" />
@@ -200,6 +317,7 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
         <div className="relative shrink-0 ml-1">
           <Button
             ref={controlsBtnRef}
+            aria-label="RDP session controls"
             variant="ghost"
             size="sm"
             className={cn("h-7 w-7 p-0", showControlsMenu && "bg-accent")}
@@ -211,7 +329,15 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
           {showControlsMenu && (
             <>
               <div className="fixed inset-0 z-[99]" onClick={() => { setShowControlsMenu(false); setShowResSubmenu(false); }} />
-              <div className="absolute right-0 top-full mt-1 z-[100] min-w-[180px] rounded-md border border-border bg-popover/95 backdrop-blur-md p-1 shadow-xl animate-in fade-in-0 zoom-in-95">
+              <div
+                ref={controlsMenuRef}
+                className={cn(
+                  "absolute right-0 top-full mt-1 z-[100] min-w-[180px] border border-border p-1",
+                  activeXSafeMenus
+                    ? "rounded-none bg-popover shadow-none"
+                    : "bg-popover/95 backdrop-blur-md shadow-xl animate-in fade-in-0 zoom-in-95",
+                )}
+              >
                 {/* FPS & Resolution display */}
                 <div className="flex items-center justify-between px-2 py-1.5 text-[11px] font-mono">
                   <span className="text-cyan-400/80">
@@ -262,48 +388,76 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
 
                 <div className="h-px bg-border/60 my-0.5" />
 
-                {/* Clipboard strategy */}
-                <button
-                  type="button"
-                  className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground cursor-pointer whitespace-nowrap"
-                  onClick={() => { sessionControls.onToggleClipboardStrategy(); }}
-                >
-                  <ClipboardCopy className="h-3.5 w-3.5 shrink-0" />
-                  {t('rdpClipboard')} {sessionControls.macClipboardStrategy === 'session-file-url' ? t('rdpClipboardStandard') : t('rdpClipboardExperimental')}
-                </button>
+                {sessionControls.showClipboardManagement !== false && (
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground cursor-pointer whitespace-nowrap"
+                    onClick={() => { sessionControls.onToggleClipboardStrategy(); }}
+                  >
+                    <ClipboardCopy className="h-3.5 w-3.5 shrink-0" />
+                    {t('rdpClipboard')} {sessionControls.macClipboardStrategy === 'session-file-url' ? t('rdpClipboardStandard') : t('rdpClipboardExperimental')}
+                  </button>
+                )}
 
-                {/* Open clipboard folder */}
-                <button
-                  type="button"
-                  className={cn(
-                    "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground cursor-pointer",
-                    !sessionControls.hasClipboardFolder && "opacity-50 pointer-events-none"
-                  )}
-                  onClick={() => { sessionControls.onOpenClipboardFolder(); setShowControlsMenu(false); }}
-                >
-                  <FolderOpen className="h-3.5 w-3.5" />
-                  {t('rdpFiles')}
-                </button>
+                {sessionControls.onSendClipboardText && (
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground cursor-pointer whitespace-nowrap"
+                    onClick={() => { sessionControls.onSendClipboardText?.(); setShowControlsMenu(false); }}
+                  >
+                    <ClipboardCopy className="h-3.5 w-3.5 shrink-0" />
+                    {t('rdpSendClipboardText')}
+                  </button>
+                )}
+
+                {sessionControls.showClipboardManagement !== false && (
+                  <button
+                    type="button"
+                    className={cn(
+                      "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground cursor-pointer",
+                      !sessionControls.hasClipboardFolder && "opacity-50 pointer-events-none"
+                    )}
+                    onClick={() => { sessionControls.onOpenClipboardFolder(); setShowControlsMenu(false); }}
+                  >
+                    <FolderOpen className="h-3.5 w-3.5" />
+                    {t('rdpFiles')}
+                  </button>
+                )}
 
                 <div className="h-px bg-border/60 my-0.5" />
 
-                {/* Virtual keys: Win key & Ctrl+Alt+Del */}
-                <button
-                  type="button"
-                  className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground cursor-pointer"
-                  onClick={() => { sessionControls.onSendWinKey(); setShowControlsMenu(false); }}
-                >
-                  <Keyboard className="h-3.5 w-3.5" />
-                  {t('rdpSendWinKey')}
-                </button>
-                <button
-                  type="button"
-                  className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground cursor-pointer"
-                  onClick={() => { sessionControls.onSendCtrlAltDel(); setShowControlsMenu(false); }}
-                >
-                  <ShieldAlert className="h-3.5 w-3.5" />
-                  {t('rdpSendCtrlAltDel')}
-                </button>
+                {/* Virtual keys: KKTerm ActiveX exposes Ctrl+Alt+Del as a hint, not a direct Windows toolbar action. */}
+                {showWinKeyControl && (
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground cursor-pointer"
+                    onClick={() => { sessionControls.onSendWinKey(); setShowControlsMenu(false); }}
+                  >
+                    <Keyboard className="h-3.5 w-3.5" />
+                    {t('rdpSendWinKey')}
+                  </button>
+                )}
+                {ctrlAltDelMode === 'send' && (
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground cursor-pointer"
+                    onClick={() => { sessionControls.onSendCtrlAltDel(); setShowControlsMenu(false); }}
+                  >
+                    <ShieldAlert className="h-3.5 w-3.5" />
+                    {t('rdpSendCtrlAltDel')}
+                  </button>
+                )}
+                {ctrlAltDelMode === 'hint' && (
+                  <button
+                    type="button"
+                    disabled
+                    className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs text-muted-foreground opacity-70 cursor-default"
+                    title={t('rdpSendCtrlAltDelHint')}
+                  >
+                    <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
+                    <span className="whitespace-nowrap">{t('rdpSendCtrlAltDelHint')}</span>
+                  </button>
+                )}
 
                 <div className="h-px bg-border/60 my-0.5" />
 

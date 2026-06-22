@@ -1,6 +1,8 @@
 {
   "scripts": {
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:dev:kkterm": "bash scripts/dev-kkterm-rdp.sh",
+    "tauri:build:kkterm": "node scripts/build-kkterm-rdp.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.10.1"

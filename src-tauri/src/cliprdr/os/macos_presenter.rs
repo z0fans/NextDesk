@@ -262,7 +262,10 @@ mod imp {
             return Ok(false);
         };
 
-        log::info!("[lazy-paste] explicit fetch requested for {}", path.display());
+        log::info!(
+            "[lazy-paste] explicit fetch requested for {}",
+            path.display()
+        );
         fetcher(path)?;
         Ok(true)
     }

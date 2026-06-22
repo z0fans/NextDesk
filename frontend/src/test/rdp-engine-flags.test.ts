@@ -35,7 +35,7 @@ function createStorage(initial: Record<string, string> = {}): Storage {
   };
 }
 
-describe('IronRDP-first engine flags', () => {
+describe('KKTerm-first engine flags', () => {
   it('keeps the existing storage key for compatibility', () => {
     expect(RDP_ENGINE_STORAGE_KEY).toBe('nextdesk_rdp_engine');
   });
@@ -47,14 +47,21 @@ describe('IronRDP-first engine flags', () => {
     expect(parseRdpEngineMode('ironrdp-web')).toBe('official-web');
   });
 
-  it('uses native-drift as the default renderer while keeping official-web as fallback', () => {
-    expect(DEFAULT_RDP_ENGINE_MODE).toBe('native-drift');
+  it('parses kkterm-copy aliases as an explicit opt-in engine', () => {
+    expect(parseRdpEngineMode('kkterm-copy')).toBe('kkterm-copy');
+    expect(parseRdpEngineMode('kkterm')).toBe('kkterm-copy');
+    expect(parseRdpEngineMode('mstscax')).toBe('kkterm-copy');
+    expect(parseRdpEngineMode('activex')).toBe('kkterm-copy');
+  });
+
+  it('uses kkterm-copy as the default renderer while keeping official-web as fallback', () => {
+    expect(DEFAULT_RDP_ENGINE_MODE).toBe('kkterm-copy');
     expect(resolveRdpEngineMode({
       envValue: null,
       storage: createStorage(),
       globalValue: null,
       experimentalNativeValue: undefined,
-    })).toBe('native-drift');
+    })).toBe('kkterm-copy');
     expect(resolveRdpEngineMode({
       envValue: 'official-web',
       storage: createStorage(),
@@ -67,6 +74,39 @@ describe('IronRDP-first engine flags', () => {
       globalValue: null,
       experimentalNativeValue: '0',
     })).toBe('official-web');
+  });
+
+  it('keeps kkterm-copy as the default engine for production packages', () => {
+    expect(DEFAULT_RDP_ENGINE_MODE).toBe('kkterm-copy');
+    expect(resolveRdpEngineMode({
+      envValue: null,
+      storage: createStorage(),
+      globalValue: null,
+      experimentalNativeValue: undefined,
+    })).toBe('kkterm-copy');
+  });
+
+  it('allows kkterm-copy from env, storage, or global override', () => {
+    expect(resolveRdpEngineMode({
+      envValue: 'kkterm-copy',
+      storage: createStorage(),
+      globalValue: null,
+      experimentalNativeValue: '0',
+    })).toBe('kkterm-copy');
+
+    expect(resolveRdpEngineMode({
+      envValue: null,
+      storage: createStorage({ [RDP_ENGINE_STORAGE_KEY]: 'kkterm-copy' }),
+      globalValue: null,
+      experimentalNativeValue: '0',
+    })).toBe('kkterm-copy');
+
+    expect(resolveRdpEngineMode({
+      envValue: null,
+      storage: createStorage(),
+      globalValue: 'kkterm-copy',
+      experimentalNativeValue: '0',
+    })).toBe('kkterm-copy');
   });
 
   it('parses native aliases but does not enable native without the experimental flag', () => {
@@ -102,16 +142,31 @@ describe('IronRDP-first engine flags', () => {
     })).toBe('native-drift');
   });
 
-  it('lets localStorage request native only when experimental native is enabled', () => {
-    const storage = createStorage({ [RDP_ENGINE_STORAGE_KEY]: 'native' });
+  it('lets env override stale localStorage engine selections', () => {
+    expect(resolveRdpEngineMode({
+      envValue: 'kkterm-copy',
+      storage: createStorage({ [RDP_ENGINE_STORAGE_KEY]: 'native-drift' }),
+      globalValue: null,
+      experimentalNativeValue: '1',
+    })).toBe('kkterm-copy');
     expect(resolveRdpEngineMode({
       envValue: 'official-web',
+      storage: createStorage({ [RDP_ENGINE_STORAGE_KEY]: 'kkterm-copy' }),
+      globalValue: null,
+      experimentalNativeValue: '1',
+    })).toBe('official-web');
+  });
+
+  it('lets localStorage request native only when experimental native is enabled and env is unset', () => {
+    const storage = createStorage({ [RDP_ENGINE_STORAGE_KEY]: 'native' });
+    expect(resolveRdpEngineMode({
+      envValue: null,
       storage,
       globalValue: null,
       experimentalNativeValue: '0',
     })).toBe('official-web');
     expect(resolveRdpEngineMode({
-      envValue: 'official-web',
+      envValue: null,
       storage,
       globalValue: null,
       experimentalNativeValue: 'yes',

@@ -1,19 +1,31 @@
 mod clash;
+#[cfg(any(
+    feature = "nextdesk-native-rdp",
+    all(feature = "kkterm-rdp", nextdesk_kkterm_rdp)
+))]
 mod cliprdr;
 mod config;
 mod file_transfer_ws;
+#[cfg(feature = "nextdesk-native-rdp")]
 mod frame_ws;
+#[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp))]
+mod kkterm_rdp;
 mod logging;
 mod macos_cursor_fix;
 mod macos_file_promise;
 mod macos_item_provider;
 mod macos_pasteboard_promise;
 mod rdp_audio;
+#[cfg(feature = "nextdesk-native-rdp")]
 mod rdp_frame;
+#[cfg(feature = "nextdesk-native-rdp")]
 mod rdp_gpu_renderer;
 mod rdp_native_view;
+#[cfg(feature = "nextdesk-native-rdp")]
 mod rdp_proxy;
+#[cfg(feature = "nextdesk-native-rdp")]
 mod rdp_session;
+#[cfg(feature = "nextdesk-native-rdp")]
 mod rdp_shared_frame;
 mod rdpdr_backend;
 mod relay;
@@ -29,7 +41,45 @@ use serde_json::Value;
 use state::{AppState, RunMode, Server};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, TcpListener, UdpSocket};
+#[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp))]
+use std::sync::OnceLock;
 use tauri::{AppHandle, Manager, State};
+
+#[cfg(all(feature = "nextdesk-native-rdp", nextdesk_kkterm_rdp))]
+compile_error!(
+    "Use either the default NextDesk native RDP stack or `--no-default-features --features kkterm-rdp`; the two IronRDP stacks cannot be linked together."
+);
+
+#[cfg(all(feature = "kkterm-rdp", not(nextdesk_kkterm_rdp)))]
+compile_error!(
+    "kkterm-rdp requires RUSTFLAGS=\"--cfg nextdesk_kkterm_rdp\" so Cargo selects the isolated KKTerm dependency graph."
+);
+
+#[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
+static KKTERM_RDP_WINDOWS_MANAGER: OnceLock<kkterm_rdp::windows::RdpSessionManager> =
+    OnceLock::new();
+
+#[cfg(all(
+    feature = "kkterm-rdp",
+    nextdesk_kkterm_rdp,
+    not(target_os = "windows")
+))]
+static KKTERM_RDP_MACOS_MANAGER: OnceLock<kkterm_rdp::macos::RdpClientSessionManager> =
+    OnceLock::new();
+
+#[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
+fn kkterm_rdp_windows_manager() -> &'static kkterm_rdp::windows::RdpSessionManager {
+    KKTERM_RDP_WINDOWS_MANAGER.get_or_init(kkterm_rdp::windows::RdpSessionManager::new)
+}
+
+#[cfg(all(
+    feature = "kkterm-rdp",
+    nextdesk_kkterm_rdp,
+    not(target_os = "windows")
+))]
+fn kkterm_rdp_macos_manager() -> &'static kkterm_rdp::macos::RdpClientSessionManager {
+    KKTERM_RDP_MACOS_MANAGER.get_or_init(kkterm_rdp::macos::RdpClientSessionManager::new)
+}
 
 #[cfg(target_os = "windows")]
 fn cleanup_extra_windows_engine_processes(keep_pid: Option<u32>) {
@@ -228,6 +278,10 @@ fn is_private_or_reserved_host(host: &str) -> bool {
         Ok(IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unspecified(),
         Err(_) => false,
     }
+}
+
+fn rdp_target_requires_internal_engine(host: &str) -> bool {
+    !is_private_or_reserved_host(host)
 }
 
 fn free_tcp_port() -> Result<u16, String> {
@@ -985,6 +1039,7 @@ fn get_relay_endpoints(
 
 // ── Native RDP Session Commands ──────────────────────────────
 
+#[cfg(feature = "nextdesk-native-rdp")]
 #[tauri::command]
 async fn rdp_native_connect(
     app: tauri::AppHandle,
@@ -999,11 +1054,11 @@ async fn rdp_native_connect(
     render_profile: Option<String>,
     app_state: State<'_, AppState>,
 ) -> Result<u16, String> {
-    if is_private_or_reserved_host(&host) {
-        log::info!("[rdp-native] Private/local target {host}:{port}; using direct route");
-    } else {
+    if rdp_target_requires_internal_engine(&host) {
         log::info!("[rdp-native] Public target {host}:{port}; ensuring internal engine");
         start_engine_inner(app_state.inner()).await?;
+    } else {
+        log::info!("[rdp-native] Private/local target {host}:{port}; using direct route");
     }
 
     // Start a local WebSocket server on a random port for frame delivery.
@@ -1044,6 +1099,7 @@ async fn rdp_native_connect(
     Ok(ws_port)
 }
 
+#[cfg(feature = "nextdesk-native-rdp")]
 #[tauri::command]
 fn rdp_native_set_view_bounds(
     app: tauri::AppHandle,
@@ -1091,6 +1147,7 @@ fn rdp_native_set_view_bounds(
     Ok(())
 }
 
+#[cfg(feature = "nextdesk-native-rdp")]
 #[tauri::command]
 fn rdp_native_input(
     tab_id: String,
@@ -1121,6 +1178,7 @@ fn rdp_native_input(
         .map_err(|e| format!("Send input failed: {e}"))
 }
 
+#[cfg(feature = "nextdesk-native-rdp")]
 #[tauri::command]
 fn rdp_native_force_clipboard_check(
     tab_id: String,
@@ -1135,11 +1193,13 @@ fn rdp_native_force_clipboard_check(
         .map_err(|e| format!("Send clipboard check failed: {e}"))
 }
 
+#[cfg(feature = "nextdesk-native-rdp")]
 #[tauri::command]
 fn rdp_native_set_active_clipboard_session(tab_id: Option<String>) {
     cliprdr::watcher::set_active_clipboard_session(tab_id);
 }
 
+#[cfg(feature = "nextdesk-native-rdp")]
 #[tauri::command]
 fn rdp_native_mouse(
     tab_id: String,
@@ -1210,6 +1270,7 @@ fn rdp_native_mouse(
     .map_err(|e| format!("Send mouse failed: {e}"))
 }
 
+#[cfg(feature = "nextdesk-native-rdp")]
 #[tauri::command]
 fn rdp_native_wheel(
     tab_id: String,
@@ -1253,6 +1314,7 @@ fn rdp_native_wheel(
         .map_err(|e| format!("Send wheel failed: {e}"))
 }
 
+#[cfg(feature = "nextdesk-native-rdp")]
 #[tauri::command]
 fn rdp_native_disconnect(tab_id: String, app_state: State<'_, AppState>) -> Result<(), String> {
     rdp_native_view::remove_bounds(&app_state.native_view_bounds, &tab_id)?;
@@ -1264,6 +1326,7 @@ fn rdp_native_disconnect(tab_id: String, app_state: State<'_, AppState>) -> Resu
     Ok(())
 }
 
+#[cfg(feature = "nextdesk-native-rdp")]
 #[tauri::command]
 fn rdp_native_resize(
     tab_id: String,
@@ -1277,6 +1340,246 @@ fn rdp_native_resize(
         .ok_or_else(|| format!("Session not found: {tab_id}"))?;
     tx.send(rdp_session::NativeRdpInput::Resize { width, height })
         .map_err(|e| format!("Send resize failed: {e}"))
+}
+
+// ── KKTerm Native RDP Commands ──────────────────────────────────────────────
+
+#[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
+#[tauri::command]
+async fn kkterm_rdp_start(
+    app: tauri::AppHandle,
+    request: kkterm_rdp::types::KktermRdpStartRequest,
+    app_state: State<'_, AppState>,
+) -> Result<kkterm_rdp::types::KktermRdpStartResponse, String> {
+    let tab_id = request.tab_id.clone();
+    let host = request.host.trim().to_string();
+    let socks_port = if rdp_target_requires_internal_engine(&host) {
+        log::info!("[kkterm-rdp] Windows public target {host}; ensuring internal engine");
+        start_engine_inner(app_state.inner()).await?;
+        Some(*app_state.proxy_port.lock().unwrap())
+    } else {
+        log::info!("[kkterm-rdp] Windows private/local target {host}; using direct route");
+        None
+    };
+    let mut start_request = kkterm_rdp::windows::StartRdpSessionRequest::from_kkterm_start(request);
+    start_request.set_socks_proxy_port(socks_port);
+    kkterm_rdp_windows_manager().start_session(app, start_request)?;
+    Ok(kkterm_rdp::types::KktermRdpStartResponse {
+        session_id: tab_id.clone(),
+        tab_id,
+    })
+}
+
+#[cfg(all(
+    feature = "kkterm-rdp",
+    nextdesk_kkterm_rdp,
+    not(target_os = "windows")
+))]
+#[tauri::command]
+async fn kkterm_rdp_start(
+    app: tauri::AppHandle,
+    request: kkterm_rdp::types::KktermRdpStartRequest,
+    app_state: State<'_, AppState>,
+) -> Result<kkterm_rdp::types::KktermRdpStartResponse, String> {
+    let tab_id = request.tab_id.clone();
+    let session_id = kkterm_rdp::types::session_id_from_tab_id(&tab_id);
+    let host = request.host.trim().to_string();
+    if rdp_target_requires_internal_engine(&host) {
+        log::info!("[kkterm-rdp] Public target {host}; ensuring internal engine");
+        start_engine_inner(app_state.inner()).await?;
+    } else {
+        log::info!("[kkterm-rdp] Private/local target {host}; using direct route");
+    }
+    let socks_port = *app_state.proxy_port.lock().unwrap();
+    let start_request = kkterm_rdp::macos::StartRdpClientSessionRequest::from_kkterm_start(
+        request,
+        Some(socks_port),
+    );
+    tauri::async_runtime::spawn_blocking(move || {
+        kkterm_rdp_macos_manager().start_session(app.clone(), start_request)
+    })
+    .await
+    .map_err(|error| format!("RDP startup task failed: {error}"))??;
+    Ok(kkterm_rdp::types::KktermRdpStartResponse { tab_id, session_id })
+}
+
+#[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
+#[tauri::command]
+fn kkterm_rdp_set_bounds(
+    app: tauri::AppHandle,
+    request: kkterm_rdp::types::KktermRdpBoundsRequest,
+) -> Result<(), String> {
+    let visibility =
+        kkterm_rdp::windows::SetRdpVisibilityRequest::from_kkterm_bounds(request.clone());
+    kkterm_rdp_windows_manager().set_visibility(app.clone(), visibility)?;
+    if request.visible {
+        let bounds =
+            kkterm_rdp::windows::UpdateRdpBoundsRequest::from_kkterm_bounds(request, false);
+        kkterm_rdp_windows_manager().update_bounds(app, bounds)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
+#[tauri::command]
+fn kkterm_rdp_status(
+    app: tauri::AppHandle,
+    request: kkterm_rdp::types::KktermRdpSimpleRequest,
+) -> Result<kkterm_rdp::windows::RdpSessionStatus, String> {
+    kkterm_rdp_windows_manager().session_status(
+        app,
+        kkterm_rdp::windows::RdpSimpleRequest::from_kkterm_simple(request),
+    )
+}
+
+#[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
+#[tauri::command]
+fn kkterm_rdp_sync_display_size(
+    app: tauri::AppHandle,
+    request: kkterm_rdp::types::KktermRdpBoundsRequest,
+) -> Result<kkterm_rdp::windows::RdpDisplaySizeSync, String> {
+    kkterm_rdp_windows_manager().sync_display_size(
+        app,
+        kkterm_rdp::windows::SyncRdpDisplaySizeRequest::from_kkterm_bounds(request),
+    )
+}
+
+#[cfg(all(
+    feature = "kkterm-rdp",
+    nextdesk_kkterm_rdp,
+    not(target_os = "windows")
+))]
+#[tauri::command]
+fn kkterm_rdp_set_bounds(
+    _request: kkterm_rdp::types::KktermRdpBoundsRequest,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
+#[tauri::command]
+fn kkterm_rdp_pointer(
+    app: tauri::AppHandle,
+    request: kkterm_rdp::types::KktermRdpPointerRequest,
+) -> Result<(), String> {
+    if let Some(click) = kkterm_rdp::windows::SendRdpMouseClickRequest::from_kkterm_pointer(request)
+    {
+        kkterm_rdp_windows_manager().send_mouse_click(app, click)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "kkterm-rdp",
+    nextdesk_kkterm_rdp,
+    not(target_os = "windows")
+))]
+#[tauri::command]
+fn kkterm_rdp_pointer(request: kkterm_rdp::types::KktermRdpPointerRequest) -> Result<(), String> {
+    kkterm_rdp_macos_manager().pointer_event(
+        kkterm_rdp::macos::RdpClientPointerEventRequest::from_kkterm_pointer(request),
+    )
+}
+
+#[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
+#[tauri::command]
+fn kkterm_rdp_key(
+    app: tauri::AppHandle,
+    request: kkterm_rdp::types::KktermRdpKeyRequest,
+) -> Result<(), String> {
+    if !request.down {
+        return Ok(());
+    }
+    kkterm_rdp_windows_manager().send_key_press(
+        app,
+        kkterm_rdp::windows::SendRdpKeyPressRequest::from_kkterm_key(request),
+    )
+}
+
+#[cfg(all(
+    feature = "kkterm-rdp",
+    nextdesk_kkterm_rdp,
+    not(target_os = "windows")
+))]
+#[tauri::command]
+fn kkterm_rdp_key(request: kkterm_rdp::types::KktermRdpKeyRequest) -> Result<(), String> {
+    kkterm_rdp_macos_manager()
+        .key_event(kkterm_rdp::macos::RdpClientKeyEventRequest::from_kkterm_key(request))
+}
+
+#[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
+#[tauri::command]
+fn kkterm_rdp_text(
+    app: tauri::AppHandle,
+    request: kkterm_rdp::types::KktermRdpTextRequest,
+) -> Result<(), String> {
+    kkterm_rdp_windows_manager()
+        .send_text(
+            app,
+            kkterm_rdp::windows::SendRdpTextRequest::from_kkterm_text(request),
+        )
+        .map(|_| ())
+}
+
+#[cfg(all(
+    feature = "kkterm-rdp",
+    nextdesk_kkterm_rdp,
+    not(target_os = "windows")
+))]
+#[tauri::command]
+fn kkterm_rdp_text(request: kkterm_rdp::types::KktermRdpTextRequest) -> Result<(), String> {
+    kkterm_rdp_macos_manager().text_input(
+        kkterm_rdp::macos::RdpClientTextRequest::from_kkterm_text(request),
+    )
+}
+
+#[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
+#[tauri::command]
+fn kkterm_rdp_ctrl_alt_delete(
+    app: tauri::AppHandle,
+    request: kkterm_rdp::types::KktermRdpSimpleRequest,
+) -> Result<(), String> {
+    kkterm_rdp_windows_manager().send_ctrl_alt_delete(
+        app,
+        kkterm_rdp::windows::RdpSimpleRequest::from_kkterm_simple(request),
+    )
+}
+
+#[cfg(all(
+    feature = "kkterm-rdp",
+    nextdesk_kkterm_rdp,
+    not(target_os = "windows")
+))]
+#[tauri::command]
+fn kkterm_rdp_ctrl_alt_delete(
+    request: kkterm_rdp::types::KktermRdpSimpleRequest,
+) -> Result<(), String> {
+    kkterm_rdp_macos_manager().send_ctrl_alt_delete(
+        kkterm_rdp::macos::RdpClientSimpleRequest::from_kkterm_simple(request),
+    )
+}
+
+#[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
+#[tauri::command]
+fn kkterm_rdp_disconnect(
+    app: tauri::AppHandle,
+    request: kkterm_rdp::types::KktermRdpSimpleRequest,
+) -> Result<(), String> {
+    kkterm_rdp_windows_manager().close_session(
+        app,
+        kkterm_rdp::windows::RdpSimpleRequest::from_kkterm_simple(request),
+    )
+}
+
+#[cfg(all(
+    feature = "kkterm-rdp",
+    nextdesk_kkterm_rdp,
+    not(target_os = "windows")
+))]
+#[tauri::command]
+fn kkterm_rdp_disconnect(request: kkterm_rdp::types::KktermRdpSimpleRequest) -> Result<(), String> {
+    kkterm_rdp_macos_manager()
+        .close_session(kkterm_rdp::macos::RdpClientSimpleRequest::from_kkterm_simple(request))
 }
 
 // ── RDP Audio Commands ──────────────────────────────────────
@@ -1487,30 +1790,42 @@ pub fn run() {
             // to prevent cursor from hiding on keyDown in RDP sessions
             macos_cursor_fix::install_cursor_unhide();
 
-            let state = app.state::<AppState>();
-            let rdp_port = *state.rdp_proxy_port.lock().unwrap();
-            let rdp_proxy_port_state = state.rdp_proxy_port.clone();
-            let rdp_proxy_error = state.rdp_proxy_error.clone();
-            let socks_port = state.proxy_port.clone();
-            let tube_enabled = state.tube_enabled.clone();
-            let cloud_mode = state.cloud_mode.clone();
-            let relay_endpoints = state.relay_endpoints.clone();
-            let dashboard_url = state.dashboard_url.clone();
-            let relay_api_key = state.relay_api_key.clone();
-            tauri::async_runtime::spawn(async move {
-                rdp_proxy::start_proxy(
-                    rdp_port,
-                    socks_port,
-                    tube_enabled,
-                    cloud_mode,
-                    relay_endpoints,
-                    dashboard_url,
-                    relay_api_key,
-                    rdp_proxy_port_state,
-                    rdp_proxy_error,
-                )
-                .await;
-            });
+            #[cfg(feature = "nextdesk-native-rdp")]
+            {
+                let state = app.state::<AppState>();
+                let rdp_port = *state.rdp_proxy_port.lock().unwrap();
+                let rdp_proxy_port_state = state.rdp_proxy_port.clone();
+                let rdp_proxy_error = state.rdp_proxy_error.clone();
+                let socks_port = state.proxy_port.clone();
+                let tube_enabled = state.tube_enabled.clone();
+                let cloud_mode = state.cloud_mode.clone();
+                let relay_endpoints = state.relay_endpoints.clone();
+                let dashboard_url = state.dashboard_url.clone();
+                let relay_api_key = state.relay_api_key.clone();
+                tauri::async_runtime::spawn(async move {
+                    rdp_proxy::start_proxy(
+                        rdp_port,
+                        socks_port,
+                        tube_enabled,
+                        cloud_mode,
+                        relay_endpoints,
+                        dashboard_url,
+                        relay_api_key,
+                        rdp_proxy_port_state,
+                        rdp_proxy_error,
+                    )
+                    .await;
+                });
+            }
+
+            #[cfg(not(feature = "nextdesk-native-rdp"))]
+            {
+                let state = app.state::<AppState>();
+                *state.rdp_proxy_port.lock().unwrap() = 0;
+                *state.rdp_proxy_error.lock().unwrap() = Some(
+                    "NextDesk native/web RDP proxy is disabled in kkterm-rdp builds".to_string(),
+                );
+            }
 
             // Spawn subscription auto-update scheduler
             let app_handle = app.handle().clone();
@@ -1587,15 +1902,42 @@ pub fn run() {
             rdp_audio_push,
             rdp_audio_push_raw,
             rdp_audio_close,
+            #[cfg(feature = "nextdesk-native-rdp")]
             rdp_native_connect,
+            #[cfg(feature = "nextdesk-native-rdp")]
             rdp_native_set_view_bounds,
+            #[cfg(feature = "nextdesk-native-rdp")]
             rdp_native_input,
+            #[cfg(feature = "nextdesk-native-rdp")]
             rdp_native_force_clipboard_check,
+            #[cfg(feature = "nextdesk-native-rdp")]
             rdp_native_set_active_clipboard_session,
+            #[cfg(feature = "nextdesk-native-rdp")]
             rdp_native_mouse,
+            #[cfg(feature = "nextdesk-native-rdp")]
             rdp_native_wheel,
+            #[cfg(feature = "nextdesk-native-rdp")]
             rdp_native_disconnect,
+            #[cfg(feature = "nextdesk-native-rdp")]
             rdp_native_resize,
+            #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp))]
+            kkterm_rdp_start,
+            #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp))]
+            kkterm_rdp_set_bounds,
+            #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
+            kkterm_rdp_status,
+            #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
+            kkterm_rdp_sync_display_size,
+            #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp))]
+            kkterm_rdp_pointer,
+            #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp))]
+            kkterm_rdp_key,
+            #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp))]
+            kkterm_rdp_text,
+            #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp))]
+            kkterm_rdp_ctrl_alt_delete,
+            #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp))]
+            kkterm_rdp_disconnect,
             get_auto_update_status,
             set_auto_update_enabled,
             trigger_sync_now,
@@ -1612,7 +1954,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        internal_engine_running, is_private_or_reserved_host, should_start_engine_for_proxy_api,
+        internal_engine_running, is_private_or_reserved_host, rdp_target_requires_internal_engine,
+        should_start_engine_for_proxy_api,
     };
     use crate::state::AppState;
     use std::process::Stdio;
@@ -1628,6 +1971,14 @@ mod tests {
     fn rdp_engine_guard_treats_public_targets_as_proxy_required() {
         assert!(!is_private_or_reserved_host("68.64.138.254"));
         assert!(!is_private_or_reserved_host("example.com"));
+    }
+
+    #[test]
+    fn rdp_public_targets_require_internal_engine() {
+        assert!(rdp_target_requires_internal_engine("64.20.10.254"));
+        assert!(rdp_target_requires_internal_engine("example.com"));
+        assert!(!rdp_target_requires_internal_engine("192.168.3.108"));
+        assert!(!rdp_target_requires_internal_engine("127.0.0.1"));
     }
 
     #[test]

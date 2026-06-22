@@ -92,8 +92,6 @@ export interface AutoUpdateStatus {
   sync_state: SyncState;
 }
 
-
-
 export interface Connection {
   id: string;
   metadata: {

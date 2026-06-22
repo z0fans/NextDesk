@@ -11,6 +11,10 @@ export const event = {
   once: vi.fn(() => Promise.resolve(vi.fn())),
 };
 
+export const listen = event.listen;
+export const emit = event.emit;
+export const once = event.once;
+
 export const window = {
   appWindow: {
     listen: vi.fn(() => Promise.resolve(vi.fn())),

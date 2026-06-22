@@ -185,9 +185,11 @@ export const translations = {
     rdpClipboardStandard: 'Standard',
     rdpClipboardExperimental: 'Experimental',
     rdpFiles: 'Files',
+    rdpSendClipboardText: 'Send Clipboard Text',
     rdpDisconnect: 'Disconnect',
     rdpSendWinKey: 'Send Win Key',
     rdpSendCtrlAltDel: 'Send Ctrl+Alt+Del',
+    rdpSendCtrlAltDelHint: 'Press Ctrl+Alt+End to send Ctrl+Alt+Del',
     rdpAuto: 'Auto',
     // Error messages
     rdpErrLoginFailed: 'Login failed — incorrect username or password.',
@@ -422,9 +424,11 @@ export const translations = {
     rdpClipboardStandard: '标准',
     rdpClipboardExperimental: '实验',
     rdpFiles: '文件',
+    rdpSendClipboardText: '发送剪贴板文本',
     rdpDisconnect: '断开连接',
     rdpSendWinKey: '发送 Win 键',
     rdpSendCtrlAltDel: '发送 Ctrl+Alt+Del',
+    rdpSendCtrlAltDelHint: '按 Ctrl+Alt+End 以发送 Ctrl+Alt+Del',
     rdpAuto: '自动',
     // 错误消息
     rdpErrLoginFailed: '登录失败 — 用户名或密码不正确。',

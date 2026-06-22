@@ -9,6 +9,9 @@ on:
 env:
   MIHOMO_VERSION: v1.19.27
   HAS_TAURI_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
+  VITE_NEXTDESK_RDP_ENGINE: kkterm-copy
+  VITE_NEXTDESK_KKTERM_KEYBOARD_MODE: remote-scancode
+  RUSTFLAGS: --cfg nextdesk_kkterm_rdp
 
 jobs:
   windows-verify:
@@ -80,7 +83,7 @@ jobs:
       - name: Build Windows verification package
         shell: pwsh
         run: |
-          npm run tauri build -- --config src-tauri/tauri.windows.conf.json
+          npm run tauri build -- --features kkterm-rdp --config src-tauri/tauri.windows.conf.json
 
       - name: List Windows bundle output
         shell: pwsh

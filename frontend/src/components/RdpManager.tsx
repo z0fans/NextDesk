@@ -1,10 +1,23 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { readText as tauriReadClipboard, writeText as tauriWriteClipboard } from '@tauri-apps/plugin-clipboard-manager';
 import { RdpSidebar } from './RdpSidebar';
 import { RdpTabBar } from './RdpTabBar';
 import { RdpGridView } from './RdpGridView';
 import { NewConnectionDialog } from './NewConnectionDialog';
+import { KktermRdpSurface } from '@/rdp/kkterm/KktermRdpSurface';
+import {
+  kktermRdpCtrlAltDelete,
+  kktermRdpDisconnect,
+  kktermRdpKey,
+  kktermRdpSetBounds,
+  kktermRdpStart,
+  kktermRdpStatus,
+  kktermRdpSyncDisplaySize,
+  kktermRdpText,
+  type KktermRdpBoundsRequest,
+} from '@/rdp/kkterm/commands';
 import { useSessionStore } from '@/lib/useSessionStore';
 import { Monitor } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -34,6 +47,7 @@ import {
   isNativeRdpMode,
   isNativeDriftRdpMode,
   isOfficialIronRdpWebMode,
+  isKktermCopyRdpMode,
   parseRdpBooleanFlag,
   resolveOfficialWebFeatureFlags,
   resolveRdpEngineMode,
@@ -67,6 +81,7 @@ if (USE_NATIVE_RDP) {
   );
 }
 const USE_OFFICIAL_IRONRDP_WEB = isOfficialIronRdpWebMode(RDP_ENGINE_MODE);
+const USE_KKTERM_COPY_RDP = isKktermCopyRdpMode(RDP_ENGINE_MODE);
 const USE_NATIVE_GFX_H264 = USE_NATIVE_RDP;
 const OFFICIAL_WEB_FEATURES = resolveOfficialWebFeatureFlags((storageKey, envKey) => {
   if (storageKey) return readRdpRuntimeStorageFlag(storageKey);
@@ -87,8 +102,103 @@ const ENABLE_RDP_FRAME_DIAGNOSTICS = parseRdpBooleanFlag(
   false,
 );
 
+function detectKktermCopyPlatform(): 'windows' | 'macos' | 'other' {
+  if (typeof navigator === 'undefined') return 'other';
+  const platform = navigator.platform || '';
+  const userAgent = navigator.userAgent || '';
+  if (/Win/i.test(platform) || /Windows/i.test(userAgent)) return 'windows';
+  if (/Mac/i.test(platform) || /Mac OS/i.test(userAgent)) return 'macos';
+  return 'other';
+}
+
+const KKTERM_COPY_PLATFORM = detectKktermCopyPlatform();
+const USE_KKTERM_COPY_MACOS = USE_KKTERM_COPY_RDP && KKTERM_COPY_PLATFORM === 'macos';
+const USE_KKTERM_COPY_WINDOWS = USE_KKTERM_COPY_RDP && KKTERM_COPY_PLATFORM === 'windows';
+
 type NativeResizeSize = { w: number; h: number };
 type NativeResizePending = NativeResizeSize & { sentAt: number };
+type KktermRdpDesktopSize = { width: number; height: number };
+type KktermRdpTextSignal = { sequence: number; text: string };
+type KktermRdpClipRect = { x: number; y: number; width: number; height: number };
+type KktermRdpLayoutBounds = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  rightGap: number;
+  bottomGap: number;
+};
+
+function waitMs(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForKktermWindowsDisplay(
+  attemptId: string,
+  tabId: string,
+  bounds: KktermRdpBoundsRequest,
+  fallbackWidth: number,
+  fallbackHeight: number,
+) {
+  let lastError = '';
+  for (let attempt = 1; attempt <= 60; attempt += 1) {
+    try {
+      const display = await kktermRdpSyncDisplaySize(bounds);
+      rdpLog.info('native', 'kkterm-rdp ActiveX display sync poll', {
+        attemptId,
+        tabId,
+        attempt,
+        connectionState: display.connectionState,
+        connected: display.connected,
+        displaySynced: display.displaySynced,
+        desktopWidth: display.desktopWidth,
+        desktopHeight: display.desktopHeight,
+      });
+      if (display.connectionState === 1 || display.connected) {
+        return {
+          width: display.desktopWidth || fallbackWidth,
+          height: display.desktopHeight || fallbackHeight,
+        };
+      }
+      if (attempt === 60 && display.displaySynced) {
+        rdpLog.warn('native', 'kkterm-rdp ActiveX display revealed while still establishing', {
+          attemptId,
+          tabId,
+          connectionState: display.connectionState,
+          desktopWidth: display.desktopWidth,
+          desktopHeight: display.desktopHeight,
+        });
+        return {
+          width: display.desktopWidth || fallbackWidth,
+          height: display.desktopHeight || fallbackHeight,
+        };
+      }
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      try {
+        const status = await kktermRdpStatus({ tabId });
+        rdpLog.info('native', 'kkterm-rdp ActiveX status poll', {
+          attemptId,
+          tabId,
+          attempt,
+          connectionState: status.connectionState,
+          connected: status.connected,
+        });
+        if (status.connected) {
+          return { width: fallbackWidth, height: fallbackHeight };
+        }
+      } catch (statusError) {
+        lastError = statusError instanceof Error ? statusError.message : String(statusError);
+      }
+    }
+    await waitMs(500);
+  }
+  throw new Error(
+    lastError
+      ? `KKTerm ActiveX display did not become ready: ${lastError}`
+      : 'KKTerm ActiveX display did not become ready',
+  );
+}
 
 function createAttemptId(tabId: string): string {
   const shortTab = tabId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 8) || 'tab';
@@ -433,6 +543,12 @@ export function RdpManager({
   const { t } = useTranslation();
   const store = useSessionStore();
   const [rdpStats, setRdpStats] = useState({ resolution: '', fps: 0, status: 'idle' as string });
+  const [kktermRdpCadSignalByTab, setKktermRdpCadSignalByTab] = useState<Record<string, number>>({});
+  const [kktermRdpTextSignalByTab, setKktermRdpTextSignalByTab] = useState<Record<string, KktermRdpTextSignal>>({});
+  const [kktermRdpWinSignalByTab, setKktermRdpWinSignalByTab] = useState<Record<string, number>>({});
+  const [kktermRdpRestartNonce, setKktermRdpRestartNonce] = useState<Record<string, number>>({});
+  const [kktermRdpDesktopSize, setKktermRdpDesktopSize] = useState<Record<string, KktermRdpDesktopSize>>({});
+  const [kktermOverlayBackdropRects, setKktermOverlayBackdropRects] = useState<Record<string, KktermRdpClipRect>>({});
   const [hasClipboardFolder, setHasClipboardFolder] = useState(false);
   const [macClipboardStrategy, setMacClipboardStrategy] = useState<'session-file-url' | 'pasteboard-promise'>('session-file-url');
   const fpsCountRef = useRef(0);
@@ -532,6 +648,10 @@ export function RdpManager({
   const canvasWrapRef = useRef<HTMLDivElement>(null);
   const nativeViewBoundsRafRef = useRef<number | null>(null);
   const nativeViewLastBoundsRef = useRef<string>('');
+  const kktermViewBoundsRafRef = useRef<number | null>(null);
+  const kktermViewLastBoundsByTabRef = useRef<Map<string, string>>(new Map());
+  const kktermOverlayClipRectsRef = useRef<Map<string, KktermRdpClipRect>>(new Map());
+  const kktermPostConnectSettleTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>[]>>(new Map());
   const isRdpViewVisibleRef = useRef(isRdpViewVisible);
   const activeTabIdRef = useRef<string | null>(null);
   const tabsRef = useRef(store.tabs);
@@ -562,6 +682,7 @@ export function RdpManager({
   const remoteClipboardFileKeyRef = useRef<Map<string, string>>(new Map());
   const sendWinKeyRef = useRef<(() => void) | null>(null);
   const sendCtrlAltDelRef = useRef<(() => void) | null>(null);
+  const sendClipboardTextRef = useRef<(() => void) | null>(null);
   const prevSidebarOpenRef = useRef(store.sidebarOpen);
   isRdpViewVisibleRef.current = isRdpViewVisible;
   activeTabIdRef.current = store.activeTabId;
@@ -569,6 +690,7 @@ export function RdpManager({
 
   // Ref to track which tabs are connected via native backend
   const nativeTabsRef = useRef<Set<string>>(new Set());
+  const kktermTabsRef = useRef<Set<string>>(new Set());
   const attemptIdsRef = useRef<Map<string, string>>(new Map());
   const nativeFrameCleanupByTabRef = useRef<Map<string, () => void>>(new Map());
 
@@ -686,6 +808,55 @@ export function RdpManager({
     }, NATIVE_CONNECT_RESIZE_COOLDOWN_MS);
   }, [store]);
 
+  const markKktermTabConnected = useCallback((tabId: string, width?: number, height?: number) => {
+    kktermTabsRef.current.add(tabId);
+    store.updateTabStatus(tabId, 'connected');
+    setRdpStats(prev => ({
+      ...prev,
+      resolution: width && height ? `${width}×${height}` : prev.resolution,
+      status: 'connected',
+    }));
+    if (width && height) {
+      lastSizeRef.current = { w: width, h: height };
+    }
+  }, [store]);
+
+  const handleKktermDisconnected = useCallback((tabId: string) => {
+    kktermTabsRef.current.delete(tabId);
+    kktermViewLastBoundsByTabRef.current.delete(tabId);
+    stopFpsCounter(tabId);
+    if (userDisconnectedRef.current.has(tabId)) {
+      store.updateTabStatus(tabId, 'disconnected');
+      return;
+    }
+    store.updateTabStatus(tabId, 'disconnected');
+  }, [store, stopFpsCounter]);
+
+  const handleKktermError = useCallback((tabId: string, message: string) => {
+    kktermTabsRef.current.delete(tabId);
+    kktermViewLastBoundsByTabRef.current.delete(tabId);
+    stopFpsCounter(tabId);
+    store.updateTabStatus(tabId, 'error', friendlyRdpError(message, t));
+    setRdpStats(prev => ({ ...prev, status: 'error' }));
+  }, [store, stopFpsCounter, t]);
+
+  const handleKktermCanvasRef = useCallback((tabId: string, canvas: HTMLCanvasElement | null) => {
+    if (canvas) {
+      canvasRefs.current.set(tabId, canvas);
+    } else {
+      canvasRefs.current.delete(tabId);
+    }
+  }, []);
+
+  const waitForCanvas = useCallback(async (tabId: string): Promise<HTMLCanvasElement | null> => {
+    for (let frame = 0; frame < 12; frame += 1) {
+      const canvas = canvasRefs.current.get(tabId);
+      if (canvas) return canvas;
+      await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+    }
+    return canvasRefs.current.get(tabId) ?? null;
+  }, []);
+
   // ── Native RDP event rendering hook ──
   // Only active when USE_NATIVE_RDP is enabled
   const activeCanvas = store.activeTabId
@@ -747,20 +918,24 @@ export function RdpManager({
 
   useEffect(() => {
     installRdpConsoleBridge();
-    invoke<number>('get_rdp_proxy_port')
-      .then(port => {
-        setProxyPort(port > 0 ? port : 0);
-      })
-      .catch(error => {
-        setProxyPort(0);
-        rdpLog.error('connection', 'rdp proxy port unavailable', {
-          error: error instanceof Error ? error.message : String(error),
+    if (USE_KKTERM_COPY_RDP) {
+      setProxyPort(0);
+    } else {
+      invoke<number>('get_rdp_proxy_port')
+        .then(port => {
+          setProxyPort(port > 0 ? port : 0);
+        })
+        .catch(error => {
+          setProxyPort(0);
+          rdpLog.error('connection', 'rdp proxy port unavailable', {
+            error: error instanceof Error ? error.message : String(error),
+          });
         });
-      });
+      loadWasm().catch(() => { });
+    }
     invoke<'session-file-url' | 'pasteboard-promise'>('get_mac_clipboard_strategy')
       .then(setMacClipboardStrategy)
       .catch(() => {});
-    loadWasm().catch(() => { });
   }, []);
 
   useEffect(() => {
@@ -776,6 +951,16 @@ export function RdpManager({
         }
       }
       nativeFrameCleanupByTabRef.current.clear();
+      for (const tabId of kktermTabsRef.current) {
+        kktermRdpDisconnect({ tabId }).catch(() => {});
+      }
+      kktermTabsRef.current.clear();
+      kktermViewLastBoundsByTabRef.current.clear();
+      kktermOverlayClipRectsRef.current.clear();
+      kktermPostConnectSettleTimersRef.current.forEach(timers => {
+        timers.forEach(timer => clearTimeout(timer));
+      });
+      kktermPostConnectSettleTimersRef.current.clear();
     };
   }, []);
 
@@ -844,6 +1029,103 @@ export function RdpManager({
     return { w: Math.max(w, 320), h: Math.max(h, 240) };
   }, []);
 
+  const readKktermRdpLayoutBounds = useCallback((): KktermRdpLayoutBounds | null => {
+    const wrap = canvasWrapRef.current;
+    if (!wrap) return null;
+    const rect = wrap.getBoundingClientRect();
+    const viewportWidth = window.visualViewport?.width ?? window.innerWidth;
+    const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
+    return {
+      x: rect.left,
+      y: rect.top,
+      width: rect.width,
+      height: rect.height,
+      rightGap: Math.abs(viewportWidth - rect.right),
+      bottomGap: Math.abs(viewportHeight - rect.bottom),
+    };
+  }, []);
+
+  const waitForKktermWindowsLayoutReady = useCallback(async (
+    attemptId: string,
+    tabId: string,
+  ): Promise<KktermRdpLayoutBounds | null> => {
+    const startedAt = performance.now();
+    let lastKey = '';
+    let stableSince = startedAt;
+    let latest: KktermRdpLayoutBounds | null = null;
+
+    for (let frame = 0; frame < 90; frame += 1) {
+      await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+      const bounds = readKktermRdpLayoutBounds();
+      if (!bounds) continue;
+
+      latest = bounds;
+      const key = `${Math.round(bounds.x)}:${Math.round(bounds.y)}:${Math.round(bounds.width)}:${Math.round(bounds.height)}:${Math.round(bounds.rightGap)}:${Math.round(bounds.bottomGap)}`;
+      const now = performance.now();
+      if (key !== lastKey) {
+        lastKey = key;
+        stableSince = now;
+        rdpLog.debug('connection', 'kkterm.rdp.layout.observed', {
+          attemptId,
+          tabId,
+          frame,
+          x: Math.round(bounds.x),
+          y: Math.round(bounds.y),
+          width: Math.round(bounds.width),
+          height: Math.round(bounds.height),
+          rightGap: Math.round(bounds.rightGap),
+          bottomGap: Math.round(bounds.bottomGap),
+        });
+      }
+
+      const sizeReady = bounds.width >= 320 && bounds.height >= 240;
+      const fillsRightEdge = bounds.rightGap <= 2;
+      const stableForMs = now - stableSince;
+      if (sizeReady && fillsRightEdge && stableForMs >= 48) {
+        rdpLog.info('connection', 'kkterm.rdp.layout.ready', {
+          attemptId,
+          tabId,
+          frame,
+          waitMs: Math.round(now - startedAt),
+          width: Math.round(bounds.width),
+          height: Math.round(bounds.height),
+          rightGap: Math.round(bounds.rightGap),
+          bottomGap: Math.round(bounds.bottomGap),
+        });
+        return bounds;
+      }
+    }
+
+    if (latest) {
+      rdpLog.warn('connection', 'kkterm.rdp.layout.ready timeout; using latest bounds', {
+        attemptId,
+        tabId,
+        waitMs: Math.round(performance.now() - startedAt),
+        width: Math.round(latest.width),
+        height: Math.round(latest.height),
+        rightGap: Math.round(latest.rightGap),
+        bottomGap: Math.round(latest.bottomGap),
+      });
+    }
+    return latest;
+  }, [readKktermRdpLayoutBounds]);
+
+  const selectKktermRdpDesktopSize = useCallback((attemptId: string, tabId: string): KktermRdpDesktopSize => {
+    const selected = desiredSizeRef.current
+      ? { source: 'desired', w: desiredSizeRef.current.w, h: desiredSizeRef.current.h }
+      : { source: 'wrapper', ...getCanvasSize() };
+    const width = Math.max(320, Math.round(selected.w));
+    const height = Math.max(240, Math.round(selected.h));
+    rdpLog.info('connection', 'kkterm.rdp.size.selected', {
+      attemptId,
+      tabId,
+      source: selected.source,
+      width,
+      height,
+    });
+    return { width, height };
+  }, [getCanvasSize]);
+
   const syncNativeViewBounds = useCallback((reason: string) => {
     if (!USE_NATIVE_DRIFT_RDP) return;
     const tabId = activeTabIdRef.current;
@@ -890,6 +1172,170 @@ export function RdpManager({
     });
   }, [syncNativeViewBounds]);
 
+  const buildKktermVisibleBounds = useCallback((tabId: string): KktermRdpBoundsRequest | null => {
+    const wrap = canvasWrapRef.current;
+    const rect = wrap?.getBoundingClientRect();
+    if (!wrap || !rect) return null;
+
+    const clipRects = Array.from(kktermOverlayClipRectsRef.current.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([, overlayRect]) => overlayRect);
+
+    return {
+      tabId,
+      x: Math.max(0, rect.left),
+      y: Math.max(0, rect.top),
+      width: Math.max(1, rect.width),
+      height: Math.max(1, rect.height),
+      scaleFactor: window.devicePixelRatio || 1,
+      visible: true,
+      ...(clipRects.length > 0 ? { clipRect: clipRects[0], clipRects } : {}),
+    };
+  }, []);
+
+  const syncKktermViewBounds = useCallback((reason: string) => {
+    if (!USE_KKTERM_COPY_WINDOWS) return;
+    const activeTabId = activeTabIdRef.current;
+    const scaleFactor = window.devicePixelRatio || 1;
+    const connectedTabs = Array.from(kktermTabsRef.current);
+    if (connectedTabs.length === 0) return;
+
+    for (const tabId of connectedTabs) {
+      const tab = tabsRef.current.find(t => t.id === tabId);
+      const visible = Boolean(
+        tabId === activeTabId &&
+        isRdpViewVisibleRef.current &&
+        store.viewMode === 'tab' &&
+        tab?.status === 'connected'
+      );
+      const clipRects = visible
+        ? Array.from(kktermOverlayClipRectsRef.current.entries())
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([, overlayRect]) => overlayRect)
+        : [];
+      const visibleBounds = visible ? buildKktermVisibleBounds(tabId) : null;
+      const bounds = visibleBounds
+        ? visibleBounds
+        : {
+            tabId,
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            scaleFactor,
+            visible: false,
+          };
+      const clipKey = clipRects.length > 0
+        ? clipRects
+            .map(overlayRect => `${overlayRect.x.toFixed(1)}:${overlayRect.y.toFixed(1)}:${overlayRect.width.toFixed(1)}:${overlayRect.height.toFixed(1)}`)
+            .join('|')
+        : 'none';
+      const key = `${tabId}:${bounds.x.toFixed(1)}:${bounds.y.toFixed(1)}:${bounds.width.toFixed(1)}:${bounds.height.toFixed(1)}:${bounds.scaleFactor.toFixed(2)}:${bounds.visible}:${clipKey}`;
+      if (kktermViewLastBoundsByTabRef.current.get(tabId) === key) continue;
+      kktermViewLastBoundsByTabRef.current.set(tabId, key);
+
+      kktermRdpSetBounds(bounds).catch(error => {
+        rdpLog.warn('native', 'kkterm-rdp ActiveX bounds sync failed', {
+          tabId,
+          reason,
+          visible: bounds.visible,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+  }, [buildKktermVisibleBounds, store.viewMode]);
+
+  const scheduleKktermViewBoundsSync = useCallback((reason: string) => {
+    if (!USE_KKTERM_COPY_WINDOWS) return;
+    if (kktermViewBoundsRafRef.current !== null) {
+      cancelAnimationFrame(kktermViewBoundsRafRef.current);
+    }
+    kktermViewBoundsRafRef.current = requestAnimationFrame(() => {
+      kktermViewBoundsRafRef.current = null;
+      syncKktermViewBounds(reason);
+    });
+  }, [syncKktermViewBounds]);
+
+  const handleKktermOverlayClipRectChange = useCallback((id: string, open: boolean, rect?: KktermRdpClipRect) => {
+    if (open && rect) {
+      const clippedRect = {
+        x: Math.max(0, rect.x),
+        y: Math.max(0, rect.y),
+        width: Math.max(1, rect.width),
+        height: Math.max(1, rect.height),
+      };
+      kktermOverlayClipRectsRef.current.set(id, clippedRect);
+      setKktermOverlayBackdropRects(prev => ({ ...prev, [id]: clippedRect }));
+      rdpLog.info('native', 'kkterm-rdp ActiveX overlay clip open', {
+        id,
+        ...clippedRect,
+      });
+    } else {
+      kktermOverlayClipRectsRef.current.delete(id);
+      setKktermOverlayBackdropRects(prev => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      rdpLog.info('native', 'kkterm-rdp ActiveX overlay clip close', { id });
+    }
+    if (!USE_KKTERM_COPY_WINDOWS) return;
+    kktermViewLastBoundsByTabRef.current.clear();
+    scheduleKktermViewBoundsSync(open ? `overlay ${id} open` : `overlay ${id} close`);
+  }, [scheduleKktermViewBoundsSync]);
+
+  const forceKktermWindowsVisibleBoundsSync = useCallback(async (tabId: string, reason: string) => {
+    if (!USE_KKTERM_COPY_WINDOWS) return;
+    if (!kktermTabsRef.current.has(tabId)) return;
+    if (activeTabIdRef.current !== tabId) return;
+    if (!isRdpViewVisibleRef.current || store.viewMode !== 'tab') return;
+
+    const bounds = buildKktermVisibleBounds(tabId);
+    if (!bounds) return;
+
+    kktermViewLastBoundsByTabRef.current.delete(tabId);
+    rdpLog.info('native', 'kkterm-rdp ActiveX forced bounds settle', {
+      tabId,
+      reason,
+      x: bounds.x,
+      y: bounds.y,
+      width: bounds.width,
+      height: bounds.height,
+      scaleFactor: bounds.scaleFactor,
+    });
+
+    try {
+      await kktermRdpSetBounds(bounds);
+    } catch (error) {
+      rdpLog.warn('native', 'kkterm-rdp ActiveX forced bounds settle failed', {
+        tabId,
+        reason,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, [buildKktermVisibleBounds, store.viewMode]);
+
+  const scheduleKktermWindowsPostConnectSettle = useCallback((tabId: string, attemptId: string) => {
+    if (!USE_KKTERM_COPY_WINDOWS) return;
+
+    const existing = kktermPostConnectSettleTimersRef.current.get(tabId);
+    existing?.forEach(timer => clearTimeout(timer));
+
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    [0, 120, 360, 900, 1600].forEach(delay => {
+      timers.push(setTimeout(() => {
+        void forceKktermWindowsVisibleBoundsSync(tabId, `post-connect settle ${delay}ms ${attemptId}`);
+      }, delay));
+    });
+    timers.push(setTimeout(() => {
+      if (kktermPostConnectSettleTimersRef.current.get(tabId) === timers) {
+        kktermPostConnectSettleTimersRef.current.delete(tabId);
+      }
+    }, 1800));
+
+    kktermPostConnectSettleTimersRef.current.set(tabId, timers);
+  }, [forceKktermWindowsVisibleBoundsSync]);
+
   const forceNativeClipboardCheck = useCallback((reason: string) => {
     if (!USE_NATIVE_RDP) return;
     const tabId = activeTabIdRef.current;
@@ -918,6 +1364,10 @@ export function RdpManager({
   }, [store.activeTabId, store.viewMode, store.activeTab?.status, isRdpViewVisible, scheduleNativeViewBoundsSync]);
 
   useEffect(() => {
+    scheduleKktermViewBoundsSync('state');
+  }, [store.activeTabId, store.viewMode, store.activeTab?.status, isRdpViewVisible, scheduleKktermViewBoundsSync]);
+
+  useEffect(() => {
     if (!USE_NATIVE_RDP) return;
     const tabId = isRdpViewVisible && store.viewMode === 'tab' ? store.activeTabId : null;
     api.rdpNativeSetActiveClipboardSession(tabId)
@@ -935,6 +1385,91 @@ export function RdpManager({
   useEffect(() => {
     forceNativeClipboardCheck('active tab');
   }, [store.activeTabId, store.viewMode, store.activeTab?.status, isRdpViewVisible, forceNativeClipboardCheck]);
+
+  useEffect(() => {
+    if (!USE_KKTERM_COPY_RDP) return;
+    sendWinKeyRef.current = USE_KKTERM_COPY_MACOS
+      ? () => {
+          const tabId = activeTabIdRef.current;
+          if (!tabId || !kktermTabsRef.current.has(tabId)) return;
+          setKktermRdpWinSignalByTab(prev => ({
+            ...prev,
+            [tabId]: (prev[tabId] ?? 0) + 1,
+          }));
+        }
+      : () => {
+          const tabId = activeTabIdRef.current;
+          if (!tabId || !kktermTabsRef.current.has(tabId)) {
+            rdpLog.warn('native', 'kkterm-copy virtual Win key skipped; no active Windows session', { tabId });
+            return;
+          }
+          rdpLog.info('native', 'kkterm-copy virtual Win key requested', { tabId });
+          kktermRdpKey({ tabId, scancode: 0xe05b, down: true })
+            .then(() => {
+              rdpLog.info('native', 'kkterm-copy virtual Win key sent', { tabId });
+            })
+            .catch(error => {
+              rdpLog.warn('native', 'kkterm-copy virtual Win key failed', {
+                tabId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+        };
+    sendCtrlAltDelRef.current = USE_KKTERM_COPY_MACOS
+      ? () => {
+          const tabId = activeTabIdRef.current;
+          if (!tabId || !kktermTabsRef.current.has(tabId)) return;
+          setKktermRdpCadSignalByTab(prev => ({
+            ...prev,
+            [tabId]: (prev[tabId] ?? 0) + 1,
+          }));
+        }
+      : () => {
+          const tabId = activeTabIdRef.current;
+          if (!tabId || !kktermTabsRef.current.has(tabId)) {
+            rdpLog.warn('native', 'kkterm-copy Ctrl+Alt+Del skipped; no active Windows session', { tabId });
+            return;
+          }
+          rdpLog.info('native', 'kkterm-copy Ctrl+Alt+Del requested', { tabId });
+          kktermRdpCtrlAltDelete({ tabId })
+            .then(() => {
+              rdpLog.info('native', 'kkterm-copy Ctrl+Alt+Del sent', { tabId });
+            })
+            .catch(error => {
+              rdpLog.warn('native', 'kkterm-copy Ctrl+Alt+Del failed', {
+                tabId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+        };
+    sendClipboardTextRef.current = async () => {
+      const tabId = activeTabIdRef.current;
+      if (!tabId || !kktermTabsRef.current.has(tabId)) return;
+      const text = await tauriReadClipboard().catch(() => '');
+      if (!text) return;
+      if (USE_KKTERM_COPY_MACOS) {
+        setKktermRdpTextSignalByTab(prev => ({
+          ...prev,
+          [tabId]: {
+            sequence: (prev[tabId]?.sequence ?? 0) + 1,
+            text,
+          },
+        }));
+        return;
+      }
+      kktermRdpText({ tabId, text }).catch(error => {
+        rdpLog.warn('clipboard', 'kkterm-copy text injection failed', {
+          tabId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    };
+    return () => {
+      sendWinKeyRef.current = null;
+      sendCtrlAltDelRef.current = null;
+      sendClipboardTextRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     if (!USE_NATIVE_RDP) return;
@@ -973,6 +1508,58 @@ export function RdpManager({
       }
     };
   }, [store.activeTabId, scheduleNativeViewBoundsSync]);
+
+  useEffect(() => {
+    if (!USE_KKTERM_COPY_WINDOWS) return;
+    const wrap = canvasWrapRef.current;
+    const container = containerRef.current;
+    const obs = new ResizeObserver(() => scheduleKktermViewBoundsSync('observer'));
+    if (wrap) obs.observe(wrap);
+    if (container) obs.observe(container);
+
+    const forceBoundsSync = (reason: string) => {
+      kktermViewLastBoundsByTabRef.current.clear();
+      scheduleKktermViewBoundsSync(reason);
+    };
+    const onResize = () => forceBoundsSync('window resize');
+    window.addEventListener('resize', onResize);
+    window.visualViewport?.addEventListener('resize', onResize);
+    forceBoundsSync('mount');
+
+    let active = true;
+    const tauriUnlisteners: Array<() => void> = [];
+    const registerWindowListener = (promise: Promise<() => void>) => {
+      promise
+        .then(unlisten => {
+          if (active) {
+            tauriUnlisteners.push(unlisten);
+          } else {
+            unlisten();
+          }
+        })
+        .catch(error => {
+          rdpLog.debug('native', 'kkterm-rdp ActiveX window listener registration failed', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+    };
+    const appWindow = getCurrentWindow();
+    registerWindowListener(appWindow.onMoved(() => forceBoundsSync('window moved')));
+    registerWindowListener(appWindow.onResized(() => forceBoundsSync('tauri window resized')));
+    registerWindowListener(appWindow.onScaleChanged(() => forceBoundsSync('window scale changed')));
+
+    return () => {
+      active = false;
+      tauriUnlisteners.forEach(unlisten => unlisten());
+      obs.disconnect();
+      window.removeEventListener('resize', onResize);
+      window.visualViewport?.removeEventListener('resize', onResize);
+      if (kktermViewBoundsRafRef.current !== null) {
+        cancelAnimationFrame(kktermViewBoundsRafRef.current);
+        kktermViewBoundsRafRef.current = null;
+      }
+    };
+  }, [store.activeTabId, scheduleKktermViewBoundsSync]);
 
   // ── Suppress adaptive resize when sidebar collapses/expands ──
   useEffect(() => {
@@ -1055,6 +1642,30 @@ export function RdpManager({
       status: tab.status,
     });
 
+    if (USE_KKTERM_COPY_MACOS) {
+      await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
+      const desktopSize = selectKktermRdpDesktopSize(attemptId, tabId);
+      rdpLog.warn('connection', 'Using opt-in KKTerm RDP path', {
+        attemptId,
+        tabId,
+        platform: KKTERM_COPY_PLATFORM,
+        desktopWidth: desktopSize.width,
+        desktopHeight: desktopSize.height,
+      });
+      kktermTabsRef.current.add(tabId);
+      setKktermRdpDesktopSize(prev => ({
+        ...prev,
+        [tabId]: desktopSize,
+      }));
+      setKktermRdpRestartNonce(prev => ({
+        ...prev,
+        [tabId]: (prev[tabId] ?? 0) + 1,
+      }));
+      store.updateTabStatus(tabId, 'connecting');
+      setRdpStats(prev => ({ ...prev, status: 'connecting' }));
+      return;
+    }
+
     connectingTabsRef.current.add(tabId);
     // Keep 'reconnecting' UI during auto-reconnect instead of flashing back to 'Connecting to...'
     if (tab.status !== 'reconnecting') {
@@ -1064,18 +1675,32 @@ export function RdpManager({
       // Wait for 2 animation frames to ensure the wrapper div is in the DOM and laid out
       await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
 
-      const canvas = canvasRefs.current.get(tabId);
+      const canvas = await waitForCanvas(tabId);
       if (!canvas) throw new Error('Canvas not ready');
+      const kktermStableLayoutBounds = USE_KKTERM_COPY_WINDOWS
+        ? await waitForKktermWindowsLayoutReady(attemptId, tabId)
+        : null;
 
       // Use desired size if set (from resolution switching), otherwise wrapper size
       let w: number, h: number;
-      if (desiredSizeRef.current) {
-        w = desiredSizeRef.current.w;
-        h = desiredSizeRef.current.h;
+      const desiredDesktopSize = desiredSizeRef.current;
+      if (desiredDesktopSize) {
+        w = desiredDesktopSize.w;
+        h = desiredDesktopSize.h;
         rdpLog.info('connection', 'layout.size.selected', {
           attemptId,
           tabId,
           source: 'desired',
+          width: w,
+          height: h,
+        });
+      } else if (kktermStableLayoutBounds) {
+        w = Math.floor(kktermStableLayoutBounds.width);
+        h = Math.floor(kktermStableLayoutBounds.height);
+        rdpLog.info('connection', 'layout.size.selected', {
+          attemptId,
+          tabId,
+          source: 'stable-wrapper',
           width: w,
           height: h,
         });
@@ -1117,6 +1742,75 @@ export function RdpManager({
         }
         resizeCooldownRef.current = false;
       }, 1000);
+
+      // ── KKTerm copy mode: Windows ActiveX or macOS simple canvas backend ──
+      if (USE_KKTERM_COPY_RDP) {
+        if (!USE_KKTERM_COPY_MACOS && !USE_KKTERM_COPY_WINDOWS) {
+          throw new Error(`kkterm-copy RDP engine is unsupported on this platform: ${KKTERM_COPY_PLATFORM}`);
+        }
+
+        rdpLog.warn('connection', 'Using opt-in KKTerm copy RDP path', {
+          attemptId,
+          tabId,
+          platform: KKTERM_COPY_PLATFORM,
+        });
+
+        const domWrapRect = canvasWrapRef.current?.getBoundingClientRect();
+        const wrapX = kktermStableLayoutBounds?.x ?? domWrapRect?.left ?? 0;
+        const wrapY = kktermStableLayoutBounds?.y ?? domWrapRect?.top ?? 0;
+        const wrapWidth = kktermStableLayoutBounds?.width ?? domWrapRect?.width ?? w;
+        const wrapHeight = kktermStableLayoutBounds?.height ?? domWrapRect?.height ?? h;
+        const scaleFactor = window.devicePixelRatio || 1;
+        const kktermRemoteResolution = resModeRef.current === 'adaptive'
+          ? 'automatic'
+          : resModeRef.current;
+        await kktermRdpStart({
+          tabId,
+          host: server.host,
+          port: server.port,
+          username: server.username,
+          password: server.password,
+          domain: server.domain || undefined,
+          x: wrapX,
+          y: wrapY,
+          width: wrapWidth,
+          height: wrapHeight,
+          desktopWidth: w,
+          desktopHeight: h,
+          remoteResolution: kktermRemoteResolution,
+        });
+
+        kktermTabsRef.current.add(tabId);
+        if (USE_KKTERM_COPY_WINDOWS) {
+          const activeXBounds = {
+            tabId,
+            x: wrapX,
+            y: wrapY,
+            width: wrapWidth,
+            height: wrapHeight,
+            scaleFactor,
+            visible: false,
+          };
+          await kktermRdpSetBounds(activeXBounds).catch(error => {
+            rdpLog.warn('native', 'kkterm-rdp ActiveX staging after connect failed', { tabId, error: String(error) });
+          });
+          const connectedSize = await waitForKktermWindowsDisplay(
+            attemptId,
+            tabId,
+            activeXBounds,
+            w,
+            h,
+          );
+          markKktermTabConnected(tabId, connectedSize.width, connectedSize.height);
+          kktermViewLastBoundsByTabRef.current.delete(tabId);
+          scheduleKktermViewBoundsSync('connected');
+          scheduleKktermWindowsPostConnectSettle(tabId, attemptId);
+        }
+
+        startOfficialWebFpsCounter(tabId, canvas);
+        connectingTabsRef.current.delete(tabId);
+        return;
+      }
 
       // ── Native RDP mode: connect via Rust backend ──
       if (USE_NATIVE_RDP) {
@@ -2350,7 +3044,7 @@ export function RdpManager({
         store.updateTabStatus(tabId, 'error', friendlyRdpError(raw, t));
       }
     }
-  }, [store, proxyPort, getCanvasSize, ensureH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, markNativeTabConnected, startNativeFpsCounter, startOfficialWebFpsCounter, stopFpsCounter, updateNativeResolution]);
+  }, [store, proxyPort, getCanvasSize, selectKktermRdpDesktopSize, waitForCanvas, waitForKktermWindowsLayoutReady, ensureH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, markNativeTabConnected, scheduleKktermWindowsPostConnectSettle, startNativeFpsCounter, startOfficialWebFpsCounter, stopFpsCounter, updateNativeResolution]);
   connectSessionRef.current = connectSession;
 
   // ── Auto-reconnect with exponential backoff ──
@@ -2424,6 +3118,36 @@ export function RdpManager({
       api.rdpNativeDisconnect(tabId).catch(() => {});
       nativeTabsRef.current.delete(tabId);
     }
+    if (kktermTabsRef.current.has(tabId)) {
+      kktermRdpDisconnect({ tabId }).catch(() => {});
+      kktermTabsRef.current.delete(tabId);
+      kktermViewLastBoundsByTabRef.current.delete(tabId);
+    }
+    setKktermRdpRestartNonce(prev => {
+      const next = { ...prev };
+      delete next[tabId];
+      return next;
+    });
+    setKktermRdpWinSignalByTab(prev => {
+      const next = { ...prev };
+      delete next[tabId];
+      return next;
+    });
+    setKktermRdpCadSignalByTab(prev => {
+      const next = { ...prev };
+      delete next[tabId];
+      return next;
+    });
+    setKktermRdpTextSignalByTab(prev => {
+      const next = { ...prev };
+      delete next[tabId];
+      return next;
+    });
+    setKktermRdpDesktopSize(prev => {
+      const next = { ...prev };
+      delete next[tabId];
+      return next;
+    });
     cleanupNativeFrameStream(tabId);
     forgetNativeResizeState(tabId);
     stopFpsCounter(tabId);
@@ -2466,12 +3190,32 @@ export function RdpManager({
     } else {
       desiredSizeRef.current = null; // adaptive = use wrapper size
     }
+    if (USE_KKTERM_COPY_MACOS) {
+      const size = w && h
+        ? { width: Math.round(w), height: Math.round(h) }
+        : (() => {
+            const current = getCanvasSize();
+            return { width: Math.round(current.w), height: Math.round(current.h) };
+          })();
+      setKktermRdpDesktopSize(prev => ({
+        ...prev,
+        [tabId]: {
+          width: Math.max(320, size.width),
+          height: Math.max(240, size.height),
+        },
+      }));
+    }
     // Mark as user-initiated so session end handler won't trigger yellow reconnect UI
     userDisconnectedRef.current.add(tabId);
     // Disconnect native session if any
     if (nativeTabsRef.current.has(tabId)) {
       api.rdpNativeDisconnect(tabId).catch(() => {});
       nativeTabsRef.current.delete(tabId);
+    }
+    if (kktermTabsRef.current.has(tabId)) {
+      kktermRdpDisconnect({ tabId }).catch(() => {});
+      kktermTabsRef.current.delete(tabId);
+      kktermViewLastBoundsByTabRef.current.delete(tabId);
     }
     cleanupNativeFrameStream(tabId);
     forgetNativeResizeState(tabId);
@@ -2491,13 +3235,13 @@ export function RdpManager({
     rdpdrEnabledRef.current.delete(tabId);
     pasteShortcutInFlightRef.current.delete(tabId);
     keepCursorVisibleUntilRef.current.delete(tabId);
-    // Use 'connecting' instead of 'idle' to show blue spinner, not yellow
-    store.updateTabStatus(tabId, 'connecting');
+    // Use reconnecting so connectSession can pass its duplicate-connection guard.
+    store.updateTabStatus(tabId, 'reconnecting');
     setTimeout(() => {
       userDisconnectedRef.current.delete(tabId);
       connectSessionRef.current?.(tabId);
     }, 500);
-  }, [store, cleanupH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, stopFpsCounter]);
+  }, [store, cleanupH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, getCanvasSize, stopFpsCounter]);
 
   const performAdaptiveResize = useCallback((reason: string) => {
     if (resModeRef.current !== 'adaptive') return;
@@ -2519,6 +3263,8 @@ export function RdpManager({
     if (w <= 0 || h <= 0) return;
 
     const isNativeTab = USE_NATIVE_RDP && nativeTabsRef.current.has(tabId);
+    const isKktermMacTab = USE_KKTERM_COPY_MACOS && kktermTabsRef.current.has(tabId);
+    const isKktermWindowsTab = USE_KKTERM_COPY_WINDOWS && kktermTabsRef.current.has(tabId);
     let nativeCappedResizeLog: {
       requested: NativeResizeSize;
       capped: NativeResizeSize;
@@ -2545,6 +3291,30 @@ export function RdpManager({
         if (isNativeTab) nativeResizePendingByTabRef.current.delete(tabId);
         return;
       }
+    }
+
+    if (isKktermMacTab) {
+      lastSizeRef.current = { w, h };
+      rdpLog.info('render', `adaptive resize (${reason}, kkterm-macos) → reconnect: ${w} x ${h}`, {
+        tabId,
+        width: w,
+        height: h,
+      });
+      reconnectWithSize(tabId);
+      return;
+    }
+
+    if (isKktermWindowsTab) {
+      lastSizeRef.current = { w, h };
+      desiredSizeRef.current = null;
+      kktermViewLastBoundsByTabRef.current.delete(tabId);
+      rdpLog.info('render', `adaptive resize (${reason}, kkterm-windows) → ActiveX display sync: ${w} x ${h}`, {
+        tabId,
+        width: w,
+        height: h,
+      });
+      scheduleKktermViewBoundsSync(`adaptive resize ${reason}`);
+      return;
     }
 
     if (isNativeTab) {
@@ -2638,9 +3408,11 @@ export function RdpManager({
   }, [getCanvasSize, reconnectWithSize, store]);
 
   // ── Switch resolution mode ──
-  const applyResolution = useCallback((mode: string) => {
+  const applyResolution = useCallback((requestedMode: string) => {
+    const mode = requestedMode;
     rdpLog.info('render', `applyResolution called: ${mode}`);
     setResMode(mode);
+    resModeRef.current = mode;
     const tabId = store.activeTabId;
     if (!tabId) return;
     const tab = tabsRef.current.find(t => t.id === tabId);
@@ -2649,6 +3421,18 @@ export function RdpManager({
     if (mode === 'adaptive') {
       let { w, h } = getCanvasSize();
       rdpLog.info('render', `switching to adaptive: ${w} x ${h}`);
+      if (USE_KKTERM_COPY_WINDOWS && kktermTabsRef.current.has(tabId)) {
+        desiredSizeRef.current = null;
+        lastSizeRef.current = { w, h };
+        kktermViewLastBoundsByTabRef.current.delete(tabId);
+        rdpLog.info('render', 'kkterm-windows adaptive resolution → ActiveX display sync', {
+          tabId,
+          width: w,
+          height: h,
+        });
+        scheduleKktermViewBoundsSync('resolution adaptive');
+        return;
+      }
       // Try native resize first
       if (USE_NATIVE_RDP && nativeTabsRef.current.has(tabId)) {
         const normalized = normalizeNativeDesktopSizeForHost(w, h, server?.host);
@@ -2721,6 +3505,19 @@ export function RdpManager({
       const [ws, hs] = mode.split('x').map(Number);
       if (!ws || !hs) return;
       rdpLog.info('render', `switching to fixed resolution: ${ws} x ${hs}`);
+      if (USE_KKTERM_COPY_WINDOWS && kktermTabsRef.current.has(tabId)) {
+        desiredSizeRef.current = { w: ws, h: hs };
+        lastSizeRef.current = { w: ws, h: hs };
+        kktermViewLastBoundsByTabRef.current.delete(tabId);
+        rdpLog.info('render', 'kkterm-windows fixed resolution → reconnect with ActiveX remoteResolution', {
+          tabId,
+          width: ws,
+          height: hs,
+          remoteResolution: mode,
+        });
+        reconnectWithSize(tabId, ws, hs);
+        return;
+      }
       // Try native resize first
       if (USE_NATIVE_RDP && nativeTabsRef.current.has(tabId)) {
         const normalized = normalizeNativeDesktopSizeForHost(ws, hs, server?.host);
@@ -2797,12 +3594,13 @@ export function RdpManager({
       }
       reconnectWithSize(tabId, ws, hs);
     }
-  }, [store.activeTabId, getCanvasSize, reconnectWithSize]);
+  }, [store.activeTabId, getCanvasSize, reconnectWithSize, scheduleKktermViewBoundsSync]);
 
   // ── Input forwarding with retry for reliability ──
   useEffect(() => {
     const tabId = store.activeTabId;
     const tabStatus = store.activeTab?.status;
+    if (USE_KKTERM_COPY_RDP) return;
     if (!tabId || tabStatus !== 'connected') return;
 
     let cancelled = false;
@@ -3619,6 +4417,19 @@ export function RdpManager({
       />
 
       <div ref={containerRef} className="flex-1 flex flex-col min-w-0 relative transition-all duration-300">
+        {USE_KKTERM_COPY_WINDOWS && Object.entries(kktermOverlayBackdropRects).map(([id, rect]) => (
+          <div
+            key={id}
+            className="fixed z-[98] pointer-events-none bg-popover"
+            style={{
+              left: Math.max(0, rect.x - 1),
+              top: Math.max(0, rect.y - 1),
+              width: Math.max(1, rect.width + 2),
+              height: Math.max(1, rect.height + 1),
+            }}
+          />
+        ))}
+
         {/* TabBar — data-bar for height calculation */}
         <div data-bar>
           <RdpTabBar
@@ -3632,6 +4443,8 @@ export function RdpManager({
             onViewModeChange={handleViewModeChange}
             onReorderTabs={store.reorderTabs}
             onReconnectTab={(tabId) => reconnectWithSize(tabId)}
+            activeXSafeMenus={USE_KKTERM_COPY_WINDOWS}
+            onOverlayClipRectChange={handleKktermOverlayClipRectChange}
             sessionControls={activeTab?.status === 'connected' ? {
               resMode,
               resolution: rdpStats.resolution,
@@ -3639,9 +4452,13 @@ export function RdpManager({
               presets: RESOLUTION_PRESETS,
               macClipboardStrategy,
               hasClipboardFolder,
+              showClipboardManagement: !USE_KKTERM_COPY_RDP,
+              showWinKey: !USE_KKTERM_COPY_WINDOWS,
+              ctrlAltDelMode: USE_KKTERM_COPY_WINDOWS ? 'hint' : 'send',
               onApplyResolution: applyResolution,
               onToggleClipboardStrategy: toggleMacClipboardStrategy,
               onOpenClipboardFolder: openClipboardFolder,
+              onSendClipboardText: USE_KKTERM_COPY_RDP ? () => sendClipboardTextRef.current?.() : undefined,
               onSendWinKey: () => sendWinKeyRef.current?.(),
               onSendCtrlAltDel: () => sendCtrlAltDelRef.current?.(),
               onDisconnect: () => handleCloseTab(activeTab.id),
@@ -3667,27 +4484,48 @@ export function RdpManager({
         {hasActiveTabs && (
           <div className={store.viewMode !== 'tab' ? 'hidden' : 'contents'}>
             {/* Canvas wrapper — fills remaining flex space */}
-            <div ref={canvasWrapRef} className="flex-1 relative min-h-0 min-w-0 bg-zinc-100 dark:bg-[#0a0e1a] overflow-hidden">
+            <div ref={canvasWrapRef} className="flex-1 relative min-h-0 min-w-0 bg-black overflow-hidden">
               {/* Canvas layers: one per tab, absolutely positioned */}
-              {store.tabs.map(tab => (
-                <canvas
-                  key={tab.id}
-                  ref={el => {
-                    if (el) canvasRefs.current.set(tab.id, el);
-                    else canvasRefs.current.delete(tab.id);
-                  }}
-                  className={cn(
-                    "cursor-default outline-none",
-                    tab.id === activeTab?.id && tab.status === 'connected' && "absolute inset-0 w-full h-full",
-                    tab.id === activeTab?.id && tab.status === 'connecting' && "absolute inset-0 opacity-0 pointer-events-none",
-                    (tab.id !== activeTab?.id || (tab.status !== 'connected' && tab.status !== 'connecting')) && "hidden"
-                  )}
-                  tabIndex={0}
-                />
-              ))}
+              {USE_KKTERM_COPY_MACOS
+                ? store.tabs.map(tab => {
+                    const server = store.getServerById(tab.serverId);
+                    if (!server) return null;
+                    return (
+                      <KktermRdpSurface
+                        key={`${tab.id}:${kktermRdpRestartNonce[tab.id] ?? 0}`}
+                        tabId={tab.id}
+                        server={server}
+                        active={tab.id === activeTab?.id}
+                        cadSignal={kktermRdpCadSignalByTab[tab.id] ?? 0}
+                        textSignal={kktermRdpTextSignalByTab[tab.id] ?? null}
+                        winSignal={kktermRdpWinSignalByTab[tab.id] ?? 0}
+                        desktopSize={kktermRdpDesktopSize[tab.id] ?? null}
+                        onConnected={markKktermTabConnected}
+                        onDisconnected={handleKktermDisconnected}
+                        onError={handleKktermError}
+                        onCanvasRef={handleKktermCanvasRef}
+                      />
+                    );
+                  })
+                : store.tabs.map(tab => (
+                    <canvas
+                      key={tab.id}
+                      ref={el => {
+                        if (el) canvasRefs.current.set(tab.id, el);
+                        else canvasRefs.current.delete(tab.id);
+                      }}
+                      className={cn(
+                        "cursor-default outline-none",
+                        tab.id === activeTab?.id && tab.status === 'connected' && "absolute inset-0 w-full h-full",
+                        tab.id === activeTab?.id && tab.status === 'connecting' && "absolute inset-0 opacity-0 pointer-events-none",
+                        (tab.id !== activeTab?.id || (tab.status !== 'connected' && tab.status !== 'connecting')) && "hidden"
+                      )}
+                      tabIndex={0}
+                    />
+                  ))}
               {/* H.264 overlay canvases — separate 2D context per tab, layered on top.
                   pointer-events-none so clicks pass through to the WASM canvas below. */}
-              {store.tabs.map(tab => (
+              {!USE_KKTERM_COPY_RDP && store.tabs.map(tab => (
                 <canvas
                   key={`h264-${tab.id}`}
                   ref={el => {
