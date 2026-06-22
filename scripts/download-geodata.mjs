@@ -1,5 +1,4 @@
-import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { copyFile, mkdir, mkdtemp, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -14,6 +13,18 @@ const files = [
   ['geoip.metadb', 'geoip-lite.metadb'],
   ['geosite.dat', 'geosite.dat'],
 ];
+
+async function replaceFile(tmpFile, outputPath) {
+  try {
+    await rename(tmpFile, outputPath);
+  } catch (error) {
+    if (error?.code !== 'EXDEV') {
+      throw error;
+    }
+    await copyFile(tmpFile, outputPath);
+    await unlink(tmpFile);
+  }
+}
 
 async function download(label, sourceName, outputPath, tmpDir) {
   const url = `${baseUrl}/${sourceName}`;
@@ -35,7 +46,7 @@ async function download(label, sourceName, outputPath, tmpDir) {
 
       const bytes = Buffer.from(await response.arrayBuffer());
       await writeFile(tmpFile, bytes);
-      await rename(tmpFile, outputPath);
+      await replaceFile(tmpFile, outputPath);
       console.log(`  -> Saved to ${outputPath}`);
       return;
     } catch (error) {
@@ -50,7 +61,7 @@ async function download(label, sourceName, outputPath, tmpDir) {
 }
 
 await mkdir(binDir, { recursive: true });
-const tmpDir = await mkdtemp(path.join(tmpdir(), 'nextdesk-geodata-'));
+const tmpDir = await mkdtemp(path.join(binDir, '.nextdesk-geodata-'));
 
 try {
   for (const [label, sourceName] of files) {
