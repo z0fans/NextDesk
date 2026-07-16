@@ -1,0 +1,41 @@
+name: Windows Rust Diagnostic
+
+on:
+  push:
+    branches:
+      - codex/v1.0.124-windows-diagnostic
+
+env:
+  RUSTFLAGS: --cfg nextdesk_kkterm_rdp
+
+jobs:
+  windows-rust-diagnostic:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Checkout patched IronRDP
+        shell: bash
+        run: |
+          git clone --no-tags https://github.com/Devolutions/IronRDP.git ../IronRDP
+          git -C ../IronRDP checkout bf694c8a239d4cf53e7dd8edbe26f2aeb07bcf26
+          git -C ../IronRDP apply "$PWD/patches/ironrdp-nextdesk.patch"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Windows Rust regression tests with diagnostic annotation
+        shell: pwsh
+        working-directory: src-tauri
+        run: |
+          cargo test --locked --lib --features kkterm-rdp -- --nocapture *>&1 |
+            Tee-Object -FilePath windows-rust-tests.log
+          $exitCode = $LASTEXITCODE
+
+          if ($exitCode -ne 0) {
+            $tail = Get-Content windows-rust-tests.log | Select-Object -Last 140
+            $message = ($tail -join "`n")
+            $message = $message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=Windows Rust regression failure::$message"
+            exit $exitCode
+          }
