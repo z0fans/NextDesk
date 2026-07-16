@@ -1,75 +1,19 @@
 import { invoke } from '@tauri-apps/api/core';
+import type { DiagnosticLogEntry } from '@/lib/diagnostic-logs';
 
-export interface RunMode {
-  reuse_mode: boolean;
-  clash_api: string;
-  proxy_port: number;
-  cloud_mode: boolean;
-  dashboard_url: string;
+export interface CloudAccountStatus {
+  enabled: boolean;
+  authorized: boolean;
+  account_available: boolean;
+  account_available_until?: string | null;
+  device_expires_at?: string | null;
+  display?: string | null;
+  reason?: string | null;
 }
 
-export interface RelayEndpoint {
-  id: number;
-  name: string;
-  host: string;
-  port: number;
-  protocol: string;
-  server_name: string;
-}
-
-export interface EngineStatus {
-  clash: boolean;
-  rdp_proxy_port: number;
-  rdp_proxy_error?: string | null;
-}
-
-export interface Server {
-  id: string;
-  name: string;
-  host: string;
-  port: number;
-  sharedFolder?: string;
-  latency?: number;
-  status: 'online' | 'offline' | 'unknown';
-}
-
-export interface ProxyGroup {
-  name: string;
-  type: string;
-  proxies: string[];
-  now?: string;
-}
-
-export interface ProxyDelayAttempt {
-  url: string;
-  status: string;
-  delay?: number | null;
-  error?: string | null;
-}
-
-export interface ProxyDelayDetail {
-  name: string;
-  delay: number;
-  url?: string | null;
-  status: 'ok' | 'failed' | string;
-  error?: string | null;
-  attempts: ProxyDelayAttempt[];
-}
-
-export interface ProxyPlaneDiagnostics {
-  apiBase: string;
-  apiReady: boolean;
-  proxyCount: number;
-  realProxyCount: number;
-  delayUrls: string[];
-  details: ProxyDelayDetail[];
-}
-
-export interface SubscriptionResult {
-  success: boolean;
-  error: string | null;
-  server_count: number;
-  proxy_groups?: ProxyGroup[];
+export interface CloudAuthorizationStart {
+  authorize_url: string;
+  state: string;
 }
 
 export interface UpdateInfo {
@@ -80,107 +24,19 @@ export interface UpdateInfo {
   error?: string;
 }
 
-export interface SyncState {
-  type: 'Idle' | 'Syncing' | 'Failed';
-  error_category?: string;
-  error_detail?: string;
-}
+export type ConnectionRoute = 'cloud' | 'lan_direct' | 'local_direct' | 'cloud_fallback';
 
-export interface AutoUpdateStatus {
-  enabled: boolean;
-  last_sync_ts: number;
-  sync_state: SyncState;
-}
-
-export interface Connection {
-  id: string;
-  metadata: {
-    network: string;
-    type: string;
-    sourceIP: string;
-    destinationIP: string;
-    sourcePort: string;
-    destinationPort: string;
-    host: string;
-    dnsMode: string;
-    processPath: string;
-  };
-  upload: number;
-  download: number;
-  start: string;
-  chains: string[];
-  rule: string;
-  rulePayload: string;
-}
-
-export interface ConnectionsData {
-  connections: Connection[];
-  downloadTotal: number;
-  uploadTotal: number;
+export interface NativeRdpConnectResponse {
+  wsPort: number;
+  routeLabel: ConnectionRoute;
 }
 
 export const api = {
-  startEngine: (forceInternal?: boolean) =>
-    invoke<boolean>('start_engine', { forceInternal: forceInternal ?? null }),
-
-  stopEngine: () =>
-    invoke<boolean>('stop_engine'),
-
-  getStatus: () =>
-    invoke<EngineStatus>('get_status'),
-
-  saveConfig: (_config: Record<string, unknown>) =>
-    invoke<boolean>('save_config'),
-
-  loadSubscription: (url: string) =>
-    invoke<SubscriptionResult>('load_subscription', {
-      url,
-    }),
-
-  getServers: () =>
-    invoke<Server[]>('get_servers'),
-
-  getProxyGroups: () =>
-    invoke<ProxyGroup[]>('get_proxy_groups'),
-
-  getSubscriptionUrl: () =>
-    invoke<string>('get_subscription_url'),
-
-  testServersConnectivity: () =>
-    invoke<Server[]>('test_servers_connectivity'),
-
-  testGroupDelays: (groupName: string) =>
-    invoke<Record<string, number>>(
-      'test_group_delays',
-      { groupName },
-    ),
-
-  getProxyPlaneDiagnostics: (groupName: string) =>
-    invoke<ProxyPlaneDiagnostics>(
-      'get_proxy_plane_diagnostics',
-      { groupName },
-    ),
-
   checkForUpdate: () =>
     invoke<UpdateInfo>('check_for_update'),
 
   getCurrentVersion: () =>
     invoke<string>('get_current_version'),
-
-  getConnections: () =>
-    invoke<ConnectionsData>('get_connections'),
-
-  switchProxy: (
-    groupName: string,
-    proxyName: string,
-  ) =>
-    invoke<boolean>('switch_proxy', {
-      groupName,
-      proxyName,
-    }),
-
-  getRunMode: () =>
-    invoke<RunMode>('get_run_mode'),
 
   getSystemLanguage: () =>
     invoke<string>('get_system_language'),
@@ -188,31 +44,23 @@ export const api = {
   getRdpProxyPort: () =>
     invoke<number>('get_rdp_proxy_port'),
 
-  getTubeEnabled: () =>
-    invoke<boolean>('get_tube_enabled'),
+  cloudStartAuthorization: () =>
+    invoke<CloudAuthorizationStart>('cloud_start_authorization'),
 
-  setTubeEnabled: (enabled: boolean) =>
-    invoke<boolean>('set_tube_enabled', { enabled }),
+  cloudHandleCallback: (callbackUrl: string) =>
+    invoke<CloudAccountStatus>('cloud_handle_callback', { callbackUrl }),
 
-  // ── Cloud Mode ──────────────────────────────────────
-  setCloudMode: (enabled: boolean, dashboardUrl: string, apiKey: string) =>
-    invoke<boolean>('set_cloud_mode', { enabled, dashboardUrl, apiKey }),
+  cloudGetStatus: () =>
+    invoke<CloudAccountStatus>('cloud_get_status'),
 
-  refreshRelayEndpoints: () =>
-    invoke<RelayEndpoint[]>('refresh_relay_endpoints'),
+  cloudRefreshStatus: () =>
+    invoke<CloudAccountStatus>('cloud_refresh_status'),
 
-  getRelayEndpoints: () =>
-    invoke<RelayEndpoint[]>('get_relay_endpoints'),
+  cloudDisable: () =>
+    invoke<boolean>('cloud_disable'),
 
-  // ── Subscription Auto-Update ────────────────────────
-  getAutoUpdateStatus: () =>
-    invoke<AutoUpdateStatus>('get_auto_update_status'),
-
-  setAutoUpdateEnabled: (enabled: boolean) =>
-    invoke<void>('set_auto_update_enabled', { enabled }),
-
-  triggerSyncNow: () =>
-    invoke<void>('trigger_sync_now'),
+  cloudKeepBindingAlive: (tabId: string, host: string, port: number) =>
+    invoke<void>('cloud_keep_binding_alive', { sessionId: tabId, host, port }),
 
   // ── Native RDP Session ──────────────────────────────
   rdpNativeConnect: (params: {
@@ -225,7 +73,8 @@ export const api = {
     width: number;
     height: number;
     renderProfile?: string;
-  }) => invoke<number>('rdp_native_connect', params),
+    reuseCloudBinding?: boolean;
+  }) => invoke<NativeRdpConnectResponse>('rdp_native_connect', params),
 
   rdpNativeSetViewBounds: (tabId: string, bounds: {
     x: number;
@@ -267,6 +116,8 @@ export const api = {
   rdpLogClear: () => invoke<void>('rdp_log_clear'),
   rdpLogFilePath: () => invoke<string>('rdp_log_file_path_str'),
   rdpLogFileSize: () => invoke<number>('rdp_log_file_size'),
+  diagnosticLogRead: (limit = 1000) =>
+    invoke<DiagnosticLogEntry[]>('diagnostic_log_read', { limit }),
 };
 
 // ── Tauri Event Types (small, via emit) ─────────────

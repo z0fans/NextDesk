@@ -206,6 +206,12 @@ export function useSessionStore() {
     ));
   }, []);
 
+  const updateTabRoute = useCallback((tabId: string, routeLabel: SessionTab['routeLabel']) => {
+    setTabs(prev => prev.map(t =>
+      t.id === tabId ? { ...t, routeLabel } : t
+    ));
+  }, []);
+
   const updateTabThumbnail = useCallback((tabId: string, thumbnailUrl: string) => {
     setTabs(prev => prev.map(t =>
       t.id === tabId ? { ...t, thumbnailUrl } : t
@@ -232,7 +238,7 @@ export function useSessionStore() {
     setActiveTabId, setViewMode, setSidebarOpen, setFolderSharingEnabled,
     addServer, updateServer, removeServer, toggleFavorite,
     addGroup, removeGroup, toggleGroupExpand, renameGroup, moveGroup, reorderGroup,
-    openSession, closeTab, updateTabStatus, updateTabThumbnail, reorderTabs, getServerById,
+    openSession, closeTab, updateTabStatus, updateTabRoute, updateTabThumbnail, reorderTabs, getServerById,
   };
 }
 

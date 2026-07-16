@@ -163,6 +163,23 @@ pub struct NextDeskCliprdrBackend {
     outgoing_watchdog: Option<tokio::task::JoinHandle<()>>,
 }
 
+impl Drop for NextDeskCliprdrBackend {
+    fn drop(&mut self) {
+        if let Some(handle) = self.outgoing_watchdog.take() {
+            handle.abort();
+        }
+        self.abort_incoming_transfer();
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(state) = self.lazy_state.take() {
+                state.finish_err("RDP session closed".to_string());
+            }
+            super::os::macos_presenter::unregister_lazy_paste_for(&self.session_id);
+        }
+        self.watcher.set_transfer_in_progress(false);
+    }
+}
+
 /// State machine for receiving files from remote (Win→Mac).
 struct IncomingTransfer {
     files: Vec<IncomingFile>,
@@ -486,6 +503,14 @@ impl CliprdrBackend for NextDeskCliprdrBackend {
 
     /// Remote performed copy — pick best format and request data.
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
+        if !super::watcher::is_active_clipboard_session(&self.session_id) {
+            log::debug!(
+                "[cliprdr] session={} ignoring remote copy while another session owns the clipboard",
+                self.session_id
+            );
+            return;
+        }
+
         log::info!(
             "[cliprdr] session={} Remote copy: {} formats",
             self.session_id,
@@ -573,6 +598,15 @@ impl CliprdrBackend for NextDeskCliprdrBackend {
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
         if response.is_error() {
             log::warn!("[cliprdr] Remote returned error for format data");
+            return;
+        }
+
+        if !super::watcher::is_active_clipboard_session(&self.session_id) {
+            self.pending_paste_format_id = 0;
+            log::debug!(
+                "[cliprdr] session={} dropping remote clipboard data after ownership changed",
+                self.session_id
+            );
             return;
         }
 
@@ -1237,10 +1271,6 @@ impl NextDeskCliprdrBackend {
                 }
             }
 
-            // Tear down any previous lazy registration before installing a
-            // new one. (See lifecycle note in module docs.)
-            super::os::macos_presenter::unregister_lazy_paste();
-
             let lazy_state = Arc::new(LazyDownloadState::new());
 
             *self
@@ -1297,9 +1327,11 @@ impl NextDeskCliprdrBackend {
                 }
             });
 
-            if let Err(e) =
-                super::os::macos_presenter::register_lazy_paste(&top_level_paths, fetcher)
-            {
+            if let Err(e) = super::os::macos_presenter::register_lazy_paste(
+                &self.session_id,
+                &top_level_paths,
+                fetcher,
+            ) {
                 // Rollback: clear `incoming_transfer` so subsequent
                 // on_remote_copy() / on_format_data_response() calls aren't
                 // blocked by the `is_some()` guard.
@@ -1316,7 +1348,7 @@ impl NextDeskCliprdrBackend {
             // them as the current selection.
             if let Err(e) = self.os.write_files(&top_level_paths) {
                 // Rollback registration + state on pasteboard write failure.
-                super::os::macos_presenter::unregister_lazy_paste();
+                super::os::macos_presenter::unregister_lazy_paste_for(&self.session_id);
                 *self
                     .incoming_transfer
                     .lock()
@@ -1529,8 +1561,8 @@ impl NextDeskCliprdrBackend {
                 // now on disk, so subsequent `relinquishPresentedItemToReader:`
                 // calls (if Finder pastes again or refreshes) will re-enter
                 // the Fetcher, which immediately returns Ok because the
-                // status is Done. The presenter is torn down on the next
-                // remote copy via `unregister_lazy_paste()`.
+                // status is Done. The presenter is replaced by the next
+                // remote file copy, or removed when this session closes.
                 return;
             }
         }
@@ -1628,7 +1660,7 @@ impl NextDeskCliprdrBackend {
                 state.finish_err("Transfer aborted".to_string());
             }
             // Tear down presenters — the placeholder paths are gone.
-            super::os::macos_presenter::unregister_lazy_paste();
+            super::os::macos_presenter::unregister_lazy_paste_for(&self.session_id);
         }
 
         let _ = self.app_handle.emit(

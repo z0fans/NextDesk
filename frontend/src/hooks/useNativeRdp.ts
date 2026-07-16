@@ -215,7 +215,7 @@ export function connectFrameWebSocket(
   };
   const renderer = initGL2(canvas);
   if (!renderer) {
-    rdpLog.error('render', 'WebGL2 init failed for native frame websocket', {
+    rdpLog.error('display', 'WebGL2 init failed for native frame websocket', {
       ...logContext,
       canvasWidth: canvas.width,
       canvasHeight: canvas.height,
@@ -224,7 +224,7 @@ export function connectFrameWebSocket(
   }
 
   const { gl, texture } = renderer;
-  rdpLog.info('render', 'native frame renderer initialized', {
+  rdpLog.info('display', 'native frame renderer initialized', {
     ...logContext,
     canvasWidth: canvas.width,
     canvasHeight: canvas.height,
@@ -277,7 +277,7 @@ export function connectFrameWebSocket(
     const deltaProcessedFrames = processedFrames - lastStatsProcessedFrames;
     const deltaDrawnFrames = drawnFrames - lastStatsDrawnFrames;
 
-    rdpLog.info('render', 'native frame stream stats', {
+    rdpLog.info('display', 'native frame stream stats', {
       ...logContext,
       reason,
       recvFrames: deltaReceivedFrames,
@@ -332,7 +332,7 @@ export function connectFrameWebSocket(
         handleBitmapFrame(raw);
         processed++;
       } catch (error) {
-        rdpLog.error('render', 'native frame handling failed', {
+        rdpLog.error('display', 'native frame handling failed', {
           wsPort,
           byteLength: raw.byteLength,
           error: error instanceof Error ? error.message : String(error),
@@ -365,7 +365,7 @@ export function connectFrameWebSocket(
       now - lastBatchLogAt > 1000
     ) {
       lastBatchLogAt = now;
-      rdpLog.debug('render', 'native frame batch flushed', {
+      rdpLog.debug('display', 'native frame batch flushed', {
         ...logContext,
         processed,
         queuedAtStart,
@@ -411,7 +411,7 @@ export function connectFrameWebSocket(
 
   ws.onopen = () => {
     console.log(`[frame-ws] connected to port ${wsPort}`);
-    rdpLog.info('render', 'native frame websocket opened', logContext);
+    rdpLog.info('display', 'native frame websocket opened', logContext);
   };
 
   ws.onmessage = (event: MessageEvent) => {
@@ -441,7 +441,7 @@ export function connectFrameWebSocket(
         const now = performance.now();
         if (now - lastCompactLogAt > 1000) {
           lastCompactLogAt = now;
-          rdpLog.debug('render', 'native frame queue compacted', {
+          rdpLog.debug('display', 'native frame queue compacted', {
             ...logContext,
             queued: frameQueue.length,
             droppedDuplicateFrames: compacted.droppedDuplicateFrames,
@@ -452,7 +452,7 @@ export function connectFrameWebSocket(
     }
     if (!highQueueLogged && frameQueue.length > BITMAP_BACKLOG_WARN_THRESHOLD) {
       highQueueLogged = true;
-      rdpLog.warn('render', 'native frame queue is backing up', {
+      rdpLog.warn('display', 'native frame queue is backing up', {
         ...logContext,
         queued: frameQueue.length,
       });
@@ -463,7 +463,7 @@ export function connectFrameWebSocket(
   // ── Bitmap frame handler (with LZ4 decompression) ──
   function handleBitmapFrame(raw: ArrayBuffer) {
     if (raw.byteLength < HEADER_SIZE) {
-      rdpLog.warn('render', 'native frame too short', {
+      rdpLog.warn('display', 'native frame too short', {
         ...logContext,
         byteLength: raw.byteLength,
       });
@@ -498,7 +498,7 @@ export function connectFrameWebSocket(
 
     if (!firstBitmapFrameLogged) {
       firstBitmapFrameLogged = true;
-      rdpLog.info('render', 'first native bitmap frame received', {
+      rdpLog.info('display', 'first native bitmap frame received', {
         ...logContext,
         desktopW,
         desktopH,
@@ -525,7 +525,7 @@ export function connectFrameWebSocket(
     } else {
       const expectedBytes = width * height * 4;
       if (raw.byteLength < HEADER_SIZE + expectedBytes) {
-        rdpLog.warn('render', 'native bitmap frame payload too short', {
+        rdpLog.warn('display', 'native bitmap frame payload too short', {
           ...logContext,
           width,
           height,
@@ -571,7 +571,7 @@ export function connectFrameWebSocket(
 
   function handleDriftFrame(packet: DriftFramePacket): boolean {
     if (packet.kind === 'h264') {
-      rdpLog.debug('render', 'native drift H.264 frame ignored by canvas renderer', {
+      rdpLog.debug('display', 'native drift H.264 frame ignored by canvas renderer', {
         ...logContext,
         width: packet.width,
         height: packet.height,
@@ -582,7 +582,7 @@ export function connectFrameWebSocket(
 
     if (!firstBitmapFrameLogged) {
       firstBitmapFrameLogged = true;
-      rdpLog.info('render', 'first native drift frame received', {
+      rdpLog.info('display', 'first native drift frame received', {
         ...logContext,
         kind: packet.kind,
         desktopW: packet.width,
@@ -647,7 +647,7 @@ export function connectFrameWebSocket(
     const payloadStart = GFX_FRAME_HEADER_SIZE;
     const payloadEnd = payloadStart + payloadLen;
     if (payloadEnd > raw.byteLength) {
-      rdpLog.warn('render', 'native GFX frame payload too short', {
+      rdpLog.warn('display', 'native GFX frame payload too short', {
         ...logContext,
         payloadLen,
         byteLength: raw.byteLength,
@@ -658,7 +658,7 @@ export function connectFrameWebSocket(
     const data = raw.slice(payloadStart, payloadEnd);
     if (!firstGfxFrameLogged) {
       firstGfxFrameLogged = true;
-      rdpLog.info('render', 'first native GFX frame received', {
+      rdpLog.info('display', 'first native GFX frame received', {
         ...logContext,
         surfaceId: hdr.getUint16(4, true),
         codecId: hdr.getUint16(6, true),
@@ -680,14 +680,14 @@ export function connectFrameWebSocket(
 
   ws.onerror = (e) => {
     console.error('[frame-ws] error:', e);
-    rdpLog.error('render', 'native frame websocket error', logContext);
+    rdpLog.error('display', 'native frame websocket error', logContext);
   };
 
   ws.onclose = (event) => {
     console.log('[frame-ws] disconnected');
     logFrameStreamStats('close');
     window.clearInterval(statsTimer);
-    rdpLog.info('render', 'native frame websocket closed', {
+    rdpLog.info('display', 'native frame websocket closed', {
       ...logContext,
       code: event.code,
       reason: event.reason,

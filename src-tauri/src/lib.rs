@@ -1,10 +1,14 @@
-mod clash;
 #[cfg(any(
     feature = "nextdesk-native-rdp",
     all(feature = "kkterm-rdp", nextdesk_kkterm_rdp)
 ))]
 mod cliprdr;
+mod cloud_auth;
+mod cloud_gateway;
+mod cloud_probe;
 mod config;
+mod connection_resolver;
+mod diagnostic_logs;
 mod file_transfer_ws;
 #[cfg(feature = "nextdesk-native-rdp")]
 mod frame_ws;
@@ -28,22 +32,16 @@ mod rdp_session;
 #[cfg(feature = "nextdesk-native-rdp")]
 mod rdp_shared_frame;
 mod rdpdr_backend;
-mod relay;
 mod state;
-mod sub_scheduler;
-mod subscription;
-mod tube;
 mod updater;
 mod virtual_file_clipboard;
 mod windows_virtual_files;
 
-use serde_json::Value;
-use state::{AppState, RunMode, Server};
-use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, TcpListener, UdpSocket};
+use state::AppState;
 #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp))]
 use std::sync::OnceLock;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_shell::ShellExt;
 
 #[cfg(all(feature = "nextdesk-native-rdp", nextdesk_kkterm_rdp))]
 compile_error!(
@@ -79,377 +77,6 @@ fn kkterm_rdp_windows_manager() -> &'static kkterm_rdp::windows::RdpSessionManag
 ))]
 fn kkterm_rdp_macos_manager() -> &'static kkterm_rdp::macos::RdpClientSessionManager {
     KKTERM_RDP_MACOS_MANAGER.get_or_init(kkterm_rdp::macos::RdpClientSessionManager::new)
-}
-
-#[cfg(target_os = "windows")]
-fn cleanup_extra_windows_engine_processes(keep_pid: Option<u32>) {
-    let keep_pid = keep_pid.unwrap_or(0);
-    let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'; \
-         Get-Process -Name nextdesk-core* | \
-         Where-Object {{ $_.Id -ne {keep_pid} }} | \
-         Stop-Process -Force"
-    );
-
-    match std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &script,
-        ])
-        .output()
-    {
-        Ok(output) => {
-            log::info!(
-                "[engine-cleanup] Windows nextdesk-core cleanup exit={} stdout={} stderr={}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Err(err) => {
-            log::warn!("[engine-cleanup] Windows nextdesk-core cleanup failed: {err}");
-        }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn cleanup_extra_windows_engine_processes(_keep_pid: Option<u32>) {}
-
-#[cfg(target_os = "macos")]
-fn macos_engine_exe_for_pid(pid: u32) -> Option<String> {
-    let output = std::process::Command::new("/bin/ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    let command = String::from_utf8_lossy(&output.stdout);
-    command.split_whitespace().next().map(str::to_string)
-}
-
-#[cfg(target_os = "macos")]
-fn cleanup_extra_macos_engine_processes(keep_pid: Option<u32>) {
-    let output = match std::process::Command::new("/usr/bin/pgrep")
-        .args(["-f", "nextdesk-core"])
-        .output()
-    {
-        Ok(output) => output,
-        Err(err) => {
-            log::warn!("[engine-cleanup] macOS engine scan failed: {err}");
-            return;
-        }
-    };
-
-    if output.status.success() {
-        let mut killed = Vec::new();
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let Ok(pid) = line.trim().parse::<u32>() else {
-                continue;
-            };
-            if Some(pid) == keep_pid || pid == std::process::id() {
-                continue;
-            }
-            let Some(exe) = macos_engine_exe_for_pid(pid) else {
-                continue;
-            };
-            let Some(name) = std::path::Path::new(&exe)
-                .file_name()
-                .and_then(|name| name.to_str())
-            else {
-                continue;
-            };
-            if name != "nextdesk-core" && !name.starts_with("nextdesk-core-") {
-                continue;
-            }
-            match std::process::Command::new("/bin/kill")
-                .arg(pid.to_string())
-                .status()
-            {
-                Ok(status) if status.success() => killed.push(pid),
-                Ok(status) => {
-                    log::warn!("[engine-cleanup] kill nextdesk-core {pid} exited {status}")
-                }
-                Err(err) => log::warn!("[engine-cleanup] kill nextdesk-core {pid} failed: {err}"),
-            }
-        }
-        if !killed.is_empty() {
-            log::info!("[engine-cleanup] killed extra macOS nextdesk-core processes: {killed:?}");
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn cleanup_extra_macos_engine_processes(_keep_pid: Option<u32>) {}
-
-fn cleanup_runtime_engine_files() {
-    let runtime_dir = std::env::temp_dir().join("nextdesk-core-runtime");
-    let Ok(entries) = std::fs::read_dir(&runtime_dir) else {
-        return;
-    };
-    let mut removed = 0usize;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("nextdesk-core-") {
-            continue;
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => removed += 1,
-            Err(err) => log::warn!(
-                "[engine-cleanup] remove stale runtime core {} failed: {err}",
-                path.display()
-            ),
-        }
-    }
-    if removed > 0 {
-        log::info!("[engine-cleanup] removed {removed} stale runtime core files");
-    }
-}
-
-fn cleanup_extra_engine_processes(keep_pid: Option<u32>) {
-    cleanup_extra_windows_engine_processes(keep_pid);
-    cleanup_extra_macos_engine_processes(keep_pid);
-    cleanup_runtime_engine_files();
-}
-
-#[tauri::command]
-async fn start_engine(
-    app_state: State<'_, AppState>,
-    force_internal: Option<bool>,
-) -> Result<bool, String> {
-    let _ = force_internal; // suppress unused variable warning
-    start_engine_inner(app_state.inner()).await
-}
-
-fn internal_engine_running(app_state: &AppState) -> bool {
-    let mut proc = app_state.clash_process.lock().unwrap();
-    let Some(child) = proc.as_mut() else {
-        return false;
-    };
-
-    match child.try_wait() {
-        Ok(Some(status)) => {
-            log::warn!("[start_engine] Existing Clash process exited: {status}");
-            *proc = None;
-            false
-        }
-        Ok(None) => true,
-        Err(err) => {
-            log::warn!("[start_engine] Failed to probe Clash process: {err}");
-            false
-        }
-    }
-}
-
-async fn clash_api_ready(api_base: &str) -> bool {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .no_proxy()
-        .build()
-        .unwrap_or_default();
-
-    match client.get(format!("{api_base}/version")).send().await {
-        Ok(resp) => resp.status().is_success(),
-        Err(_) => false,
-    }
-}
-
-fn discard_internal_engine(app_state: &AppState) {
-    let mut proc = app_state.clash_process.lock().unwrap();
-    if let Some(child) = proc.as_mut() {
-        let _ = child.start_kill();
-    }
-    *proc = None;
-}
-
-fn is_private_or_reserved_host(host: &str) -> bool {
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => {
-            ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_unspecified()
-        }
-        Ok(IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unspecified(),
-        Err(_) => false,
-    }
-}
-
-fn rdp_target_requires_internal_engine(host: &str) -> bool {
-    !is_private_or_reserved_host(host)
-}
-
-fn free_tcp_port() -> Result<u16, String> {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .map_err(|e| format!("Reserve local TCP port failed: {e}"))?;
-    listener
-        .local_addr()
-        .map(|addr| addr.port())
-        .map_err(|e| format!("Read local TCP port failed: {e}"))
-}
-
-fn free_dns_port() -> Result<u16, String> {
-    for _ in 0..32 {
-        let tcp = TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|e| format!("Reserve local DNS TCP port failed: {e}"))?;
-        let port = tcp
-            .local_addr()
-            .map_err(|e| format!("Read local DNS TCP port failed: {e}"))?
-            .port();
-        if let Ok(udp) = UdpSocket::bind(("127.0.0.1", port)) {
-            drop(udp);
-            return Ok(port);
-        }
-    }
-    Err("Reserve local DNS port failed".into())
-}
-
-fn choose_runtime_ports() -> Result<config::RuntimePorts, String> {
-    let http_port = free_tcp_port()?;
-    let socks_port = free_tcp_port()?;
-    let controller_port = free_tcp_port()?;
-    let dns_port = free_dns_port()?;
-
-    Ok(config::RuntimePorts {
-        http_port,
-        socks_port,
-        controller_port,
-        dns_port,
-    })
-}
-
-async fn start_engine_inner(app_state: &AppState) -> Result<bool, String> {
-    let keep_pid = {
-        let proc = app_state.clash_process.lock().unwrap();
-        proc.as_ref().and_then(|child| child.id())
-    };
-    cleanup_extra_engine_processes(keep_pid);
-
-    if internal_engine_running(app_state) {
-        let api_base = app_state.clash_api_base.lock().unwrap().clone();
-        if !api_base.is_empty() && clash_api_ready(&api_base).await {
-            log::info!("[start_engine] Internal Clash already running");
-            return Ok(true);
-        }
-
-        log::warn!(
-            "[start_engine] Existing Clash process is running but API is not ready; restarting"
-        );
-        discard_internal_engine(app_state);
-    }
-
-    // Always use independent kernel — no reuse mode
-    *app_state.reuse_mode.lock().unwrap() = false;
-
-    // Verify runtime config exists (no longer require specific group names)
-    let config_path = config::get_user_config_dir().join("runtime_clash.yaml");
-    if !config_path.exists() {
-        return Err("No subscription loaded. Please load a subscription first.".into());
-    }
-
-    // Ensure interface-name is set to bypass external TUN/VPN
-    config::ensure_runtime_network_config(&config_path);
-    let runtime_ports = choose_runtime_ports()?;
-    config::patch_runtime_ports(&config_path, runtime_ports)?;
-    let api_base = format!("http://127.0.0.1:{}", runtime_ports.controller_port);
-
-    match clash::start_clash_process().await {
-        Ok(child) => {
-            *app_state.clash_process.lock().unwrap() = Some(child);
-            *app_state.clash_api_base.lock().unwrap() = api_base.clone();
-            *app_state.proxy_port.lock().unwrap() = runtime_ports.socks_port;
-            log::info!(
-                "[start_engine] Runtime ports http={} socks={} api={} dns={}",
-                runtime_ports.http_port,
-                runtime_ports.socks_port,
-                runtime_ports.controller_port,
-                runtime_ports.dns_port
-            );
-            // Wait for Clash API to become ready (up to 15s)
-            let ready = {
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(2))
-                    .no_proxy()
-                    .build()
-                    .unwrap_or_default();
-                let mut ok = false;
-                for _ in 0..240 {
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    if let Ok(resp) = client.get(format!("{api_base}/version")).send().await {
-                        if resp.status().is_success() {
-                            ok = true;
-                            break;
-                        }
-                    }
-                }
-                ok
-            };
-            if ready {
-                eprintln!("[start_engine] Internal Clash API ready");
-                // Trigger geodata update in background
-                // (mihomo downloads latest Country.mmdb via its own proxy)
-                tauri::async_runtime::spawn(async move {
-                    // Wait a few seconds for proxy connections to establish
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    eprintln!("[start_engine] Triggering geodata update...");
-                    clash::trigger_geodata_update(&api_base).await;
-                    eprintln!("[start_engine] Geodata update triggered");
-                });
-            } else {
-                eprintln!("[start_engine] Warning: Clash API not ready after 120s");
-                discard_internal_engine(app_state);
-                return Err("Internal Clash API not ready; SOCKS5 proxy is unavailable".into());
-            }
-            Ok(true)
-        }
-        Err(e) => {
-            eprintln!("[start_engine] Failed to start clash: {e}");
-            Err(e)
-        }
-    }
-}
-
-#[tauri::command]
-async fn stop_engine(app_state: State<'_, AppState>) -> Result<bool, String> {
-    let mut proc = app_state.clash_process.lock().unwrap();
-    if let Some(ref mut child) = *proc {
-        let _ = child.start_kill();
-    }
-    *proc = None;
-    Ok(true)
-}
-
-#[tauri::command]
-fn get_status(app_state: State<'_, AppState>) -> Result<Value, String> {
-    let clash_running =
-        internal_engine_running(app_state.inner()) || *app_state.reuse_mode.lock().unwrap();
-    let rdp_port = *app_state.rdp_proxy_port.lock().unwrap();
-    let rdp_proxy_error = app_state.rdp_proxy_error.lock().unwrap().clone();
-    Ok(serde_json::json!({
-        "clash": clash_running,
-        "rdp_proxy_port": rdp_port,
-        "rdp_proxy_error": rdp_proxy_error,
-    }))
-}
-
-#[tauri::command]
-fn get_servers(app_state: State<'_, AppState>) -> Result<Vec<Server>, String> {
-    Ok(app_state.servers.lock().unwrap().clone())
-}
-
-#[tauri::command]
-fn get_subscription_url(app_state: State<'_, AppState>) -> Result<String, String> {
-    Ok(app_state.subscription_url.lock().unwrap().clone())
-}
-
-#[tauri::command]
-fn save_config() -> Result<bool, String> {
-    Ok(true)
 }
 
 #[tauri::command]
@@ -491,266 +118,6 @@ fn set_mac_clipboard_strategy(
 }
 
 #[tauri::command]
-async fn load_subscription(
-    url: String,
-    app_state: State<'_, AppState>,
-) -> Result<subscription::SubscriptionResult, String> {
-    // Determine active proxy port (if any)
-    // [DISABLED] 复用模式暂时禁用，始终使用独立内核
-    // let proxy_port: Option<u16> = {
-    //     let reuse = *app_state.reuse_mode.lock().unwrap();
-    //     let has_internal = {
-    //         let proc = app_state.clash_process.lock().unwrap();
-    //         proc.as_ref().map_or(false, |c| c.id().is_some())
-    //     };
-    //     if reuse || has_internal {
-    //         Some(*app_state.proxy_port.lock().unwrap())
-    //     } else {
-    //         None // direct connection
-    //     }
-    // };
-    let proxy_port: Option<u16> = {
-        let has_internal = {
-            let proc = app_state.clash_process.lock().unwrap();
-            proc.as_ref().map_or(false, |c| c.id().is_some())
-        };
-        if has_internal {
-            Some(*app_state.proxy_port.lock().unwrap())
-        } else {
-            None
-        }
-    };
-
-    match subscription::load_subscription(&url, proxy_port).await {
-        Ok(parsed) => {
-            let servers = subscription::transform_proxies_to_servers(&parsed.proxies);
-            let server_count = servers.len();
-
-            // Save state
-            *app_state.servers.lock().unwrap() = servers;
-            *app_state.subscription_url.lock().unwrap() = url;
-
-            let server_names: Vec<String> = app_state
-                .servers
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|s| s.name.clone())
-                .collect();
-            let groups = config::build_rdp_proxy_groups(&server_names);
-
-            *app_state.proxy_groups.lock().unwrap() = groups.clone();
-
-            // Generate clash config
-            if let Some(raw) = &parsed.raw_config {
-                config::generate_clash_config_from_subscription(raw);
-            } else {
-                config::generate_clash_config(&parsed.proxies);
-            }
-
-            // Persist config
-            let saved = config::SavedConfig {
-                subscription_url: app_state.subscription_url.lock().unwrap().clone(),
-                servers: app_state.servers.lock().unwrap().clone(),
-                proxy_groups: groups.clone(),
-                tube_enabled: *app_state.tube_enabled.lock().unwrap(),
-                cloud_mode: *app_state.cloud_mode.lock().unwrap(),
-                dashboard_url: app_state.dashboard_url.lock().unwrap().clone(),
-                relay_api_key: app_state.relay_api_key.lock().unwrap().clone(),
-                auto_update_enabled: *app_state.auto_update_enabled.lock().unwrap(),
-                last_sync_ts: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            };
-            config::save_config(&saved);
-            // Update in-memory last_sync_ts
-            *app_state.last_sync_ts.lock().unwrap() = saved.last_sync_ts;
-
-            let pg_json: Vec<Value> = groups
-                .iter()
-                .map(|g| {
-                    serde_json::json!({
-                        "name": g.name,
-                        "type": g.group_type,
-                        "proxies": g.proxies,
-                        "now": g.now,
-                    })
-                })
-                .collect();
-
-            Ok(subscription::SubscriptionResult {
-                success: true,
-                error: None,
-                server_count,
-                proxy_groups: pg_json,
-            })
-        }
-        Err(e) => Ok(subscription::SubscriptionResult {
-            success: false,
-            error: Some(e),
-            server_count: 0,
-            proxy_groups: vec![],
-        }),
-    }
-}
-
-#[tauri::command]
-async fn get_proxy_groups(app_state: State<'_, AppState>) -> Result<Vec<Value>, String> {
-    let groups = app_state.proxy_groups.lock().unwrap().clone();
-    let server_names: std::collections::HashSet<String> = app_state
-        .servers
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|s| config::is_selectable_proxy_name(&s.name))
-        .map(|s| s.name.clone())
-        .collect();
-    let api = app_state.clash_api_base.lock().unwrap().clone();
-
-    let mut result = vec![];
-    for g in &groups {
-        let lower = g.name.to_lowercase();
-        if !lower.contains("server-") || lower.contains("server-rdp") || lower.contains("auto-rdp")
-        {
-            continue;
-        }
-        let proxies: Vec<String> = g
-            .proxies
-            .iter()
-            .filter(|proxy| server_names.contains(*proxy))
-            .cloned()
-            .collect();
-        if proxies.is_empty() {
-            continue;
-        }
-        let now = clash::get_active_proxy(&api, &g.name).await;
-        let now = now.filter(|name| server_names.contains(name));
-        result.push(serde_json::json!({
-            "name": g.name,
-            "type": g.group_type,
-            "proxies": proxies,
-            "now": now,
-        }));
-    }
-    Ok(result)
-}
-
-#[tauri::command]
-async fn switch_proxy(
-    group_name: String,
-    proxy_name: String,
-    app_state: State<'_, AppState>,
-) -> Result<bool, String> {
-    let api = app_state.clash_api_base.lock().unwrap().clone();
-    Ok(clash::switch_proxy(&api, &group_name, &proxy_name).await)
-}
-
-fn selectable_server_names(app_state: &AppState) -> HashSet<String> {
-    app_state
-        .servers
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|server| config::is_selectable_proxy_name(&server.name))
-        .map(|server| server.name.clone())
-        .collect()
-}
-
-fn state_group_members(group_name: &str, app_state: &AppState) -> Vec<String> {
-    let groups = app_state.proxy_groups.lock().unwrap();
-    groups
-        .iter()
-        .find(|group| group.name == group_name)
-        .map(|group| group.proxies.clone())
-        .unwrap_or_default()
-}
-
-fn real_group_proxies(members: &[String], server_names: &HashSet<String>) -> Vec<String> {
-    members
-        .iter()
-        .filter(|proxy| server_names.contains(*proxy))
-        .cloned()
-        .collect()
-}
-
-fn should_start_engine_for_proxy_api(api_base: &str, api_ready: bool) -> bool {
-    api_base.trim().is_empty() || !api_ready
-}
-
-async fn ensure_proxy_api_ready(app_state: &AppState) -> Result<String, String> {
-    let api = app_state.clash_api_base.lock().unwrap().clone();
-    let api_ready = !api.trim().is_empty() && clash_api_ready(&api).await;
-    if !should_start_engine_for_proxy_api(&api, api_ready) {
-        return Ok(api);
-    }
-
-    log::info!("[proxy-api] Clash API unavailable before node delay test; starting engine");
-    start_engine_inner(app_state).await?;
-
-    let api = app_state.clash_api_base.lock().unwrap().clone();
-    if api.trim().is_empty() {
-        return Err("Internal Clash API is unavailable after engine start".into());
-    }
-    if !clash_api_ready(&api).await {
-        return Err("Internal Clash API is not ready after engine start".into());
-    }
-
-    Ok(api)
-}
-
-#[tauri::command]
-async fn test_group_delays(
-    group_name: String,
-    app_state: State<'_, AppState>,
-) -> Result<HashMap<String, i64>, String> {
-    let api = ensure_proxy_api_ready(app_state.inner()).await?;
-    let server_names = selectable_server_names(app_state.inner());
-    let state_members = state_group_members(&group_name, app_state.inner());
-    let members = clash::get_proxy_group_members(&api, &group_name)
-        .await
-        .unwrap_or(state_members);
-    let proxies = real_group_proxies(&members, &server_names);
-
-    Ok(clash::test_group_delays(&api, &group_name, &proxies).await)
-}
-
-#[tauri::command]
-async fn get_proxy_plane_diagnostics(
-    group_name: String,
-    app_state: State<'_, AppState>,
-) -> Result<clash::ProxyPlaneDiagnostics, String> {
-    let api = ensure_proxy_api_ready(app_state.inner()).await?;
-    let server_names = selectable_server_names(app_state.inner());
-    let state_members = state_group_members(&group_name, app_state.inner());
-    let members = clash::get_proxy_group_members(&api, &group_name)
-        .await
-        .unwrap_or(state_members);
-    let proxies = real_group_proxies(&members, &server_names);
-
-    Ok(clash::get_proxy_plane_diagnostics(&api, members.len(), &proxies).await)
-}
-
-#[tauri::command]
-async fn test_servers_connectivity(app_state: State<'_, AppState>) -> Result<Vec<Server>, String> {
-    let mut servers = app_state.servers.lock().unwrap().clone();
-    subscription::test_servers_connectivity(&mut servers).await;
-    *app_state.servers.lock().unwrap() = servers.clone();
-    Ok(servers)
-}
-
-#[tauri::command]
-async fn get_connections(app_state: State<'_, AppState>) -> Result<Value, String> {
-    let api = app_state.clash_api_base.lock().unwrap().clone();
-    Ok(clash::get_connections(&api).await)
-}
-
-#[tauri::command]
-fn get_clash_log() -> Result<String, String> {
-    Ok(clash::get_clash_log())
-}
-
-#[tauri::command]
 async fn check_for_update() -> Result<updater::UpdateInfo, String> {
     Ok(updater::check_for_update().await)
 }
@@ -780,12 +147,27 @@ struct RdpLogEntry {
     data: Option<String>,
 }
 
+#[cfg(feature = "nextdesk-native-rdp")]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeRdpConnectResponse {
+    ws_port: u16,
+    route_label: String,
+}
+
 const RDP_DEBUG_LOG: &str = "nextdesk_rdp_debug.log";
 
 fn rdp_log_path() -> std::path::PathBuf {
     // Hardcode /tmp/ — macOS std::env::temp_dir() returns /var/folders/…/T/
     // which is harder to discover. /tmp/ is universally accessible.
-    std::path::PathBuf::from("/tmp").join(RDP_DEBUG_LOG)
+    let path = std::path::PathBuf::from("/tmp").join(RDP_DEBUG_LOG);
+    static SANITIZE_EXISTING_LOGS: std::sync::Once = std::sync::Once::new();
+    SANITIZE_EXISTING_LOGS.call_once(|| {
+        if let Err(error) = logging::sanitize_log_family(&path) {
+            eprintln!("[logging] Failed to sanitize existing RDP logs: {error}");
+        }
+    });
+    path
 }
 
 #[tauri::command]
@@ -795,17 +177,18 @@ fn rdp_log_file_path_str() -> String {
 
 #[tauri::command]
 fn rdp_log_file_size() -> u64 {
-    std::fs::metadata(rdp_log_path())
-        .map(|m| m.len())
-        .unwrap_or(0)
+    logging::log_family_size(&rdp_log_path())
+}
+
+#[tauri::command]
+fn diagnostic_log_read(
+    limit: Option<usize>,
+) -> Result<Vec<diagnostic_logs::DiagnosticLogEntry>, String> {
+    diagnostic_logs::read(&logging::log_file_path(), &rdp_log_path(), limit)
 }
 
 #[tauri::command]
 fn log_copy_diagnostic_bundle_to_desktop() -> Result<String, String> {
-    if !cfg!(debug_assertions) {
-        return Err("Diagnostic bundle export is only available in development builds".into());
-    }
-
     use std::io::Write;
 
     let desktop =
@@ -817,25 +200,13 @@ fn log_copy_diagnostic_bundle_to_desktop() -> Result<String, String> {
     let dest = desktop.join(format!("nextdesk_diagnostics_{ts}"));
     std::fs::create_dir_all(&dest).map_err(|e| format!("create diagnostics dir failed: {e}"))?;
 
-    let backend_log = logging::log_file_path();
-    let rdp_log = rdp_log_path();
-    let clash_log =
-        dirs::config_dir().map(|dir| dir.join("NextDesk").join("log").join("clash.log"));
-
-    let mut copied = Vec::new();
-    for (label, path) in [
-        ("nextdesk_debug.log", Some(backend_log)),
-        ("nextdesk_rdp_debug.log", Some(rdp_log)),
-        ("clash.log", clash_log),
-    ] {
-        let Some(path) = path else { continue };
-        if !path.exists() {
-            continue;
-        }
-        let target = dest.join(label);
-        std::fs::copy(&path, &target)
-            .map_err(|e| format!("copy {} failed: {e}", path.display()))?;
-        copied.push(format!("{label}: {}", path.display()));
+    let entries = diagnostic_logs::read(&logging::log_file_path(), &rdp_log_path(), Some(5000))?;
+    let mut jsonl = std::fs::File::create(dest.join("nextdesk_diagnostics.jsonl"))
+        .map_err(|e| format!("create diagnostics JSONL failed: {e}"))?;
+    for entry in &entries {
+        serde_json::to_writer(&mut jsonl, entry)
+            .map_err(|e| format!("serialize diagnostic entry failed: {e}"))?;
+        writeln!(jsonl).map_err(|e| format!("write diagnostic entry failed: {e}"))?;
     }
 
     let mut manifest = std::fs::File::create(dest.join("manifest.txt"))
@@ -846,10 +217,11 @@ fn log_copy_diagnostic_bundle_to_desktop() -> Result<String, String> {
     writeln!(manifest, "target_os={}", std::env::consts::OS).map_err(|e| e.to_string())?;
     writeln!(manifest, "target_arch={}", std::env::consts::ARCH).map_err(|e| e.to_string())?;
     writeln!(manifest, "debug_assertions={}", cfg!(debug_assertions)).map_err(|e| e.to_string())?;
-    writeln!(manifest, "copied_logs={}", copied.len()).map_err(|e| e.to_string())?;
-    for item in copied {
-        writeln!(manifest, "{item}").map_err(|e| e.to_string())?;
-    }
+    writeln!(manifest, "entry_count={}", entries.len()).map_err(|e| e.to_string())?;
+    writeln!(manifest, "format=jsonl").map_err(|e| e.to_string())?;
+    writeln!(manifest, "redacted=true").map_err(|e| e.to_string())?;
+    writeln!(manifest, "rdp_brand=Next RDP").map_err(|e| e.to_string())?;
+    writeln!(manifest, "internal_technology_names=false").map_err(|e| e.to_string())?;
 
     log::info!("Copied diagnostic bundle to {}", dest.display());
     Ok(dest.to_string_lossy().to_string())
@@ -857,34 +229,39 @@ fn log_copy_diagnostic_bundle_to_desktop() -> Result<String, String> {
 
 #[tauri::command]
 fn rdp_log_batch(entries: Vec<RdpLogEntry>) -> Result<(), String> {
-    use std::io::Write;
     let path = rdp_log_path();
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| e.to_string())?;
+    let mut output = Vec::new();
+    let internal = logging::internal_diagnostics_enabled();
     for e in &entries {
-        let line = if let Some(ref data) = e.data {
+        let message = if internal {
+            e.msg.clone()
+        } else {
+            logging::public_log_text(&e.msg)
+        };
+        let data = e.data.as_ref().map(|data| {
+            if internal {
+                data.clone()
+            } else {
+                logging::public_log_text(data)
+            }
+        });
+        let line = if let Some(ref data) = data {
             format!(
                 "[{}][{}][{}] {} | {}\n",
-                e.ts, e.level, e.module, e.msg, data
+                e.ts, e.level, e.module, message, data
             )
         } else {
-            format!("[{}][{}][{}] {}\n", e.ts, e.level, e.module, e.msg)
+            format!("[{}][{}][{}] {}\n", e.ts, e.level, e.module, message)
         };
-        f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        output.extend_from_slice(line.as_bytes());
     }
-    Ok(())
+    logging::append_rotating(&path, &output).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn rdp_log_clear() -> Result<(), String> {
     let path = rdp_log_path();
-    if path.exists() {
-        std::fs::write(&path, b"").map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    logging::clear_log_family(&path).map_err(|e| e.to_string())
 }
 
 /// Legacy shim — kept for backward compatibility with existing cblog() calls
@@ -914,127 +291,347 @@ fn frontend_log(msg: String) -> Result<(), String> {
     rdp_log_batch(vec![entry])
 }
 
-#[tauri::command]
-fn get_run_mode(app_state: State<'_, AppState>) -> Result<RunMode, String> {
-    Ok(RunMode {
-        reuse_mode: *app_state.reuse_mode.lock().unwrap(),
-        clash_api: app_state.clash_api_base.lock().unwrap().clone(),
-        proxy_port: *app_state.proxy_port.lock().unwrap(),
-        cloud_mode: *app_state.cloud_mode.lock().unwrap(),
-        dashboard_url: app_state.dashboard_url.lock().unwrap().clone(),
-    })
+fn cloud_authorization_base_url_from_state(_app_state: &AppState) -> Result<String, String> {
+    Ok(config::CLOUD_AUTH_BASE_URL.to_string())
 }
 
-/// Get proxy port synchronously (pure std::net)
-#[allow(dead_code)]
-fn get_proxy_port_sync(api_port: u16) -> u16 {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::time::Duration;
+fn persist_cloud_authorization_base_url(app_state: &AppState, panel_url: &str) {
+    *app_state.cloud_authorization_base_url.lock().unwrap() = panel_url.to_string();
+    let mut saved = config::load_saved_config();
+    saved.cloud_authorization_base_url = panel_url.to_string();
+    config::save_config(&saved);
+}
 
-    let timeout = Duration::from_secs(2);
-    let addr = format!("127.0.0.1:{api_port}");
-    if let Ok(mut stream) = TcpStream::connect_timeout(&addr.parse().unwrap(), timeout) {
-        stream.set_read_timeout(Some(timeout)).ok();
-        stream.set_write_timeout(Some(timeout)).ok();
-        let req = format!(
-            "GET /configs HTTP/1.1\r\n\
-             Host: 127.0.0.1:{api_port}\r\n\
-             Connection: close\r\n\r\n"
-        );
-        if stream.write_all(req.as_bytes()).is_ok() {
-            let mut buf = vec![0u8; 4096];
-            if let Ok(n) = stream.read(&mut buf) {
-                let body = String::from_utf8_lossy(&buf[..n]);
-                // Try mixed-port first, then socks-port; skip if 0
-                for key in &["\"mixed-port\"", "\"socks-port\""] {
-                    if let Some(pos) = body.find(key) {
-                        let after = &body[pos..];
-                        if let Some(colon) = after.find(':') {
-                            let num_str: String = after[colon + 1..]
-                                .chars()
-                                .take_while(|c| c.is_ascii_digit() || *c == ' ')
-                                .collect();
-                            if let Ok(p) = num_str.trim().parse::<u16>() {
-                                if p > 0 {
-                                    return p;
-                                }
-                            }
-                        }
-                    }
+#[tauri::command]
+async fn cloud_start_authorization(
+    app: AppHandle,
+    app_state: State<'_, AppState>,
+) -> Result<cloud_gateway::CloudAuthorizationStart, String> {
+    let panel_url = cloud_authorization_base_url_from_state(app_state.inner())?;
+    persist_cloud_authorization_base_url(app_state.inner(), &panel_url);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|e| format!("bind cloud callback listener failed: {e}"))?;
+    let callback_port = listener
+        .local_addr()
+        .map_err(|e| format!("read cloud callback listener address failed: {e}"))?
+        .port();
+    let redirect_uri = format!("http://127.0.0.1:{callback_port}/cloud/auth/callback");
+    log::info!("[cloud-auth] listening on {redirect_uri}");
+    let auth = cloud_auth::start_authorization(panel_url, redirect_uri)?;
+    spawn_cloud_callback_server(app.clone(), listener, callback_port);
+    #[allow(deprecated)]
+    app.shell()
+        .open(auth.authorize_url.clone(), None)
+        .map_err(|e| format!("open authorization url failed: {e}"))?;
+    log::info!("[cloud-auth] opened authorization url");
+    Ok(auth)
+}
+
+#[tauri::command]
+async fn cloud_handle_callback(
+    callback_url: String,
+    app_state: State<'_, AppState>,
+) -> Result<cloud_gateway::CloudAccountStatus, String> {
+    let status = cloud_auth::handle_callback(callback_url).await?;
+    sync_cloud_config_to_state(app_state.inner());
+    Ok(status)
+}
+
+#[tauri::command]
+async fn cloud_get_status() -> Result<cloud_gateway::CloudAccountStatus, String> {
+    cloud_auth::status().await
+}
+
+#[tauri::command]
+async fn cloud_refresh_status() -> Result<cloud_gateway::CloudAccountStatus, String> {
+    cloud_auth::status().await
+}
+
+#[tauri::command]
+async fn cloud_keep_binding_alive(
+    session_id: String,
+    host: String,
+    port: u16,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    connection_resolver::keep_binding_alive(app_state.inner(), Some(&session_id), &host, port).await
+}
+
+#[tauri::command]
+async fn cloud_disable(app_state: State<'_, AppState>) -> Result<bool, String> {
+    app_state.cloud_active_bindings.lock().unwrap().clear();
+    cloud_auth::disable().await
+}
+
+fn sync_cloud_config_to_state(app_state: &AppState) {
+    let saved = config::load_saved_config();
+    *app_state.dashboard_url.lock().unwrap() = saved.dashboard_url;
+    *app_state.cloud_authorization_base_url.lock().unwrap() = saved.cloud_authorization_base_url;
+}
+
+fn is_cloud_auth_callback(url: &str) -> bool {
+    url.starts_with("nextdesk://auth/callback")
+        || url.starts_with("ndesk://auth/callback")
+        || url.starts_with("http://127.0.0.1:")
+        || url.starts_with("http://localhost:")
+}
+
+async fn complete_cloud_auth_callback(
+    app_handle: AppHandle,
+    callback_url: String,
+) -> Result<(), String> {
+    let result = cloud_auth::handle_callback(callback_url).await;
+    let payload = match &result {
+        Ok(status) => {
+            let state = app_handle.state::<AppState>();
+            sync_cloud_config_to_state(state.inner());
+            serde_json::json!({ "ok": true, "status": status })
+        }
+        Err(error) => serde_json::json!({ "ok": false, "error": error }),
+    };
+    let _ = app_handle.emit("cloud-auth-result", payload);
+    result.map(|_| ())
+}
+
+fn handle_cloud_deep_link_urls(app: AppHandle, urls: Vec<String>) {
+    for callback_url in urls {
+        if !is_cloud_auth_callback(&callback_url) {
+            continue;
+        }
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = complete_cloud_auth_callback(app_handle, callback_url).await;
+        });
+    }
+}
+
+async fn write_cloud_callback_response(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .map_err(|e| format!("write cloud callback response failed: {e}"))?;
+    stream
+        .shutdown()
+        .await
+        .map_err(|e| format!("shutdown cloud callback response failed: {e}"))
+}
+
+#[derive(Clone)]
+struct CloudCallbackPage {
+    title: &'static str,
+    heading: &'static str,
+    message: &'static str,
+    success: bool,
+}
+
+fn cloud_callback_page(completion: &Result<(), String>) -> CloudCallbackPage {
+    match completion {
+        Ok(()) => CloudCallbackPage {
+            title: "NextDesk Cloud 授权完成",
+            heading: "授权成功",
+            message: "此设备已获得云端加速授权，现在可以返回 NextDesk。",
+            success: true,
+        },
+        Err(error) if error.contains("cloud_auth_too_many_devices") => CloudCallbackPage {
+            title: "NextDesk Cloud 设备数量已达上限",
+            heading: "已达到用户最大授权设备数",
+            message: "请联系管理员移除旧设备授权或调整设备数量上限，然后重新登录。",
+            success: false,
+        },
+        Err(error) if error.contains("cloud_auth_invalid_or_expired") => CloudCallbackPage {
+            title: "NextDesk Cloud 授权已失效",
+            heading: "授权链接已失效",
+            message: "请返回 NextDesk，重新发起登录授权。",
+            success: false,
+        },
+        Err(error) if error.contains("cloud_auth_rate_limited") => CloudCallbackPage {
+            title: "NextDesk Cloud 请求过于频繁",
+            heading: "授权请求过于频繁",
+            message: "请稍后返回 NextDesk 重新登录。",
+            success: false,
+        },
+        Err(_) => CloudCallbackPage {
+            title: "NextDesk Cloud 授权失败",
+            heading: "授权未完成",
+            message: "请返回 NextDesk 查看日志，然后重新发起登录授权。",
+            success: false,
+        },
+    }
+}
+
+fn cloud_callback_progress_page() -> &'static str {
+    r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NextDesk Cloud 正在完成授权</title>
+<style>
+body{margin:0;background:#f5f7fb;color:#172033;font:16px/1.6 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{max-width:560px;margin:12vh auto;padding:40px;background:#fff;border:1px solid #dce3ef;border-radius:8px;box-shadow:0 16px 45px rgba(31,45,70,.10)}
+.mark{width:44px;height:44px;display:flex;align-items:center;justify-content:center;border-radius:50%;background:#1769e0;color:#fff;font-size:22px;font-weight:700;line-height:1}
+.loading-dots{height:8px;display:flex;align-items:center;justify-content:center;gap:4px}
+.loading-dots span{width:6px;height:6px;border-radius:50%;background:#fff;animation:pulse 1.1s ease-in-out infinite}
+.loading-dots span:nth-child(2){animation-delay:.14s}
+.loading-dots span:nth-child(3){animation-delay:.28s}
+@keyframes pulse{0%,70%,100%{opacity:.45;transform:scale(.82)}35%{opacity:1;transform:scale(1)}}
+h1{font-size:26px;margin:20px 0 8px;letter-spacing:0}
+p{margin:0;color:#64748b}
+button{margin-top:28px;border:0;border-radius:6px;background:#1769e0;color:#fff;padding:11px 18px;font:inherit;font-weight:600;cursor:pointer}
+button:hover{background:#155fc9}
+button:focus-visible{outline:3px solid rgba(23,105,224,.28);outline-offset:3px}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<main>
+<div class="mark" id="mark" aria-hidden="true"><span class="loading-dots"><span></span><span></span><span></span></span></div>
+<h1 id="heading">正在完成授权</h1>
+<p id="message">请稍候，NextDesk 正在确认此设备的云端加速授权。</p>
+<button class="hidden" id="return" type="button">返回 NextDesk</button>
+</main>
+<script>
+const mark=document.getElementById('mark');
+const heading=document.getElementById('heading');
+const message=document.getElementById('message');
+const returnButton=document.getElementById('return');
+returnButton.addEventListener('click',()=>{
+  window.location.href='nextdesk://auth/complete';
+  setTimeout(()=>window.close(),350);
+});
+const poll=async()=>{
+  try{
+    const response=await fetch('/cloud/auth/result',{cache:'no-store'});
+    const result=await response.json();
+    if(result.pending){setTimeout(poll,600);return}
+    document.title=result.title;
+    mark.replaceChildren(document.createTextNode(result.success?'✓':'!'));
+    mark.style.background=result.success?'#16a34a':'#dc2626';
+    heading.textContent=result.heading;
+    message.textContent=result.message;
+    returnButton.classList.remove('hidden');
+  }catch(_){setTimeout(poll,900)}
+};
+poll();
+</script>
+</body>
+</html>"#
+}
+
+fn spawn_cloud_callback_server(
+    app: AppHandle,
+    listener: tokio::net::TcpListener,
+    callback_port: u16,
+) {
+    tauri::async_runtime::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let result = std::sync::Arc::new(tokio::sync::Mutex::new(None::<CloudCallbackPage>));
+        let mut callback_started = false;
+        let mut deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                log::warn!("[cloud-auth] loopback callback listener timed out");
+                return;
+            }
+            let accepted = tokio::time::timeout(remaining, listener.accept()).await;
+            let Ok(Ok((mut stream, peer))) = accepted else {
+                log::warn!("[cloud-auth] loopback callback listener timed out");
+                return;
+            };
+
+            let mut buffer = [0_u8; 8192];
+            let read = match stream.read(&mut buffer).await {
+                Ok(read) => read,
+                Err(error) => {
+                    log::warn!("[cloud-auth] read loopback callback failed: {error}");
+                    continue;
                 }
+            };
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let target = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
+
+            if target.starts_with("/cloud/auth/result") {
+                let page = result.lock().await.clone();
+                let body = match page {
+                    Some(page) => serde_json::json!({
+                        "pending": false,
+                        "title": page.title,
+                        "heading": page.heading,
+                        "message": page.message,
+                        "success": page.success,
+                    })
+                    .to_string(),
+                    None => serde_json::json!({ "pending": true }).to_string(),
+                };
+                let _ = write_cloud_callback_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    &body,
+                )
+                .await;
+                continue;
+            }
+
+            if !target.starts_with("/cloud/auth/callback?") {
+                let body = "Not Found";
+                let _ = write_cloud_callback_response(
+                    &mut stream,
+                    "404 Not Found",
+                    "text/plain; charset=utf-8",
+                    body,
+                )
+                .await;
+                continue;
+            }
+
+            if let Err(error) = write_cloud_callback_response(
+                &mut stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                cloud_callback_progress_page(),
+            )
+            .await
+            {
+                log::warn!("[cloud-auth] {error}");
+                continue;
+            }
+            log::info!("[cloud-auth] callback progress page sent");
+
+            if !callback_started {
+                callback_started = true;
+                deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
+                log::info!("[cloud-auth] accepted loopback callback from {peer}");
+                let callback_url = format!("http://127.0.0.1:{callback_port}{target}");
+                let app_handle = app.clone();
+                let result_state = result.clone();
+                tauri::async_runtime::spawn(async move {
+                    let completion = complete_cloud_auth_callback(app_handle, callback_url).await;
+                    *result_state.lock().await = Some(cloud_callback_page(&completion));
+                    log::info!("[cloud-auth] callback result ready");
+                });
             }
         }
-    }
-    7897 // default fallback
-}
-
-#[tauri::command]
-fn get_tube_enabled(app_state: State<'_, AppState>) -> Result<bool, String> {
-    Ok(*app_state.tube_enabled.lock().unwrap())
-}
-
-#[tauri::command]
-fn set_tube_enabled(enabled: bool, app_state: State<'_, AppState>) -> Result<bool, String> {
-    *app_state.tube_enabled.lock().unwrap() = enabled;
-    // Persist
-    let mut saved = config::load_saved_config();
-    saved.tube_enabled = enabled;
-    config::save_config(&saved);
-    log::info!("[tube] Tube Mode = {enabled}");
-    Ok(enabled)
-}
-
-#[tauri::command]
-async fn set_cloud_mode(
-    app_state: State<'_, AppState>,
-    enabled: bool,
-    dashboard_url: String,
-    api_key: String,
-) -> Result<bool, String> {
-    *app_state.cloud_mode.lock().unwrap() = enabled;
-    *app_state.dashboard_url.lock().unwrap() = dashboard_url.clone();
-    *app_state.relay_api_key.lock().unwrap() = api_key.clone();
-
-    // Persist
-    let mut saved = config::load_saved_config();
-    saved.cloud_mode = enabled;
-    saved.dashboard_url = dashboard_url.clone();
-    saved.relay_api_key = api_key.clone();
-    config::save_config(&saved);
-
-    // If enabling, fetch endpoints immediately
-    if enabled && !dashboard_url.is_empty() && !api_key.is_empty() {
-        match relay::fetch_endpoints(&dashboard_url, &api_key).await {
-            Ok(eps) => {
-                log::info!("[cloud] Fetched {} endpoints", eps.len());
-                *app_state.relay_endpoints.lock().unwrap() = eps;
-            }
-            Err(e) => log::warn!("[cloud] Fetch failed: {e}"),
-        }
-    } else {
-        *app_state.relay_endpoints.lock().unwrap() = Vec::new();
-    }
-    log::info!("[cloud] Cloud Mode = {enabled}");
-    Ok(true)
-}
-
-#[tauri::command]
-async fn refresh_relay_endpoints(
-    app_state: State<'_, AppState>,
-) -> Result<Vec<state::RelayEndpoint>, String> {
-    let url = app_state.dashboard_url.lock().unwrap().clone();
-    let key = app_state.relay_api_key.lock().unwrap().clone();
-    let eps = relay::fetch_endpoints(&url, &key).await?;
-    *app_state.relay_endpoints.lock().unwrap() = eps.clone();
-    Ok(eps)
-}
-
-#[tauri::command]
-fn get_relay_endpoints(
-    app_state: State<'_, AppState>,
-) -> Result<Vec<state::RelayEndpoint>, String> {
-    Ok(app_state.relay_endpoints.lock().unwrap().clone())
+    });
 }
 
 // ── Native RDP Session Commands ──────────────────────────────
@@ -1052,22 +649,33 @@ async fn rdp_native_connect(
     width: u16,
     height: u16,
     render_profile: Option<String>,
+    reuse_cloud_binding: Option<bool>,
     app_state: State<'_, AppState>,
-) -> Result<u16, String> {
-    if rdp_target_requires_internal_engine(&host) {
-        log::info!("[rdp-native] Public target {host}:{port}; ensuring internal engine");
-        start_engine_inner(app_state.inner()).await?;
-    } else {
-        log::info!("[rdp-native] Private/local target {host}:{port}; using direct route");
-    }
+) -> Result<NativeRdpConnectResponse, String> {
+    let resolved = connection_resolver::resolve_connection_target(
+        app_state.inner(),
+        host.clone(),
+        port,
+        reuse_cloud_binding.unwrap_or(false),
+        Some(tab_id.clone()),
+    )
+    .await?;
+    let route_label = resolved.route_label.clone();
+    let connect_host = resolved.host;
+    let connect_port = resolved.port;
+    log::info!(
+        "[rdp-native] target {host}:{port} resolved to {}:{} route={}",
+        connect_host,
+        connect_port,
+        resolved.route_label
+    );
 
     // Start a local WebSocket server on a random port for frame delivery.
     // This bypasses Tauri Channel's 5-layer IPC overhead entirely.
     let (ws_port, frame_tx, frame_ws_shutdown) =
-        frame_ws::start_frame_server(tab_id.clone(), host.clone())
+        frame_ws::start_frame_server(tab_id.clone(), connect_host.clone())
             .await
             .map_err(|e| format!("Failed to start frame WS: {e}"))?;
-    let socks_port = *app_state.proxy_port.lock().unwrap();
     let frame_transport =
         rdp_session::native_frame_transport_from_profile(render_profile.as_deref());
     log::info!(
@@ -1081,9 +689,8 @@ async fn rdp_native_connect(
     let handle = rdp_session::spawn_session(
         app,
         tab_id.clone(),
-        host,
-        port,
-        socks_port,
+        connect_host,
+        connect_port,
         username,
         password,
         domain,
@@ -1096,7 +703,10 @@ async fn rdp_native_connect(
     );
     let mut mgr = app_state.native_sessions.lock().unwrap();
     mgr.insert(tab_id, handle);
-    Ok(ws_port)
+    Ok(NativeRdpConnectResponse {
+        ws_port,
+        route_label,
+    })
 }
 
 #[cfg(feature = "nextdesk-native-rdp")]
@@ -1348,25 +958,34 @@ fn rdp_native_resize(
 #[tauri::command]
 async fn kkterm_rdp_start(
     app: tauri::AppHandle,
-    request: kkterm_rdp::types::KktermRdpStartRequest,
+    mut request: kkterm_rdp::types::KktermRdpStartRequest,
     app_state: State<'_, AppState>,
 ) -> Result<kkterm_rdp::types::KktermRdpStartResponse, String> {
     let tab_id = request.tab_id.clone();
     let host = request.host.trim().to_string();
-    let socks_port = if rdp_target_requires_internal_engine(&host) {
-        log::info!("[kkterm-rdp] Windows public target {host}; ensuring internal engine");
-        start_engine_inner(app_state.inner()).await?;
-        Some(*app_state.proxy_port.lock().unwrap())
-    } else {
-        log::info!("[kkterm-rdp] Windows private/local target {host}; using direct route");
-        None
-    };
-    let mut start_request = kkterm_rdp::windows::StartRdpSessionRequest::from_kkterm_start(request);
-    start_request.set_socks_proxy_port(socks_port);
+    let port = request.port;
+    let resolved = connection_resolver::resolve_connection_target(
+        app_state.inner(),
+        host.clone(),
+        port,
+        request.reuse_cloud_binding,
+        Some(tab_id.clone()),
+    )
+    .await?;
+    request.host = resolved.host.clone();
+    request.port = resolved.port;
+    log::info!(
+        "[kkterm-rdp] Windows target {host}:{port} resolved to {}:{} route={}",
+        request.host,
+        request.port,
+        resolved.route_label
+    );
+    let start_request = kkterm_rdp::windows::StartRdpSessionRequest::from_kkterm_start(request);
     kkterm_rdp_windows_manager().start_session(app, start_request)?;
     Ok(kkterm_rdp::types::KktermRdpStartResponse {
         session_id: tab_id.clone(),
         tab_id,
+        route_label: resolved.route_label,
     })
 }
 
@@ -1378,29 +997,40 @@ async fn kkterm_rdp_start(
 #[tauri::command]
 async fn kkterm_rdp_start(
     app: tauri::AppHandle,
-    request: kkterm_rdp::types::KktermRdpStartRequest,
+    mut request: kkterm_rdp::types::KktermRdpStartRequest,
     app_state: State<'_, AppState>,
 ) -> Result<kkterm_rdp::types::KktermRdpStartResponse, String> {
     let tab_id = request.tab_id.clone();
     let session_id = kkterm_rdp::types::session_id_from_tab_id(&tab_id);
     let host = request.host.trim().to_string();
-    if rdp_target_requires_internal_engine(&host) {
-        log::info!("[kkterm-rdp] Public target {host}; ensuring internal engine");
-        start_engine_inner(app_state.inner()).await?;
-    } else {
-        log::info!("[kkterm-rdp] Private/local target {host}; using direct route");
-    }
-    let socks_port = *app_state.proxy_port.lock().unwrap();
-    let start_request = kkterm_rdp::macos::StartRdpClientSessionRequest::from_kkterm_start(
-        request,
-        Some(socks_port),
+    let port = request.port;
+    let resolved = connection_resolver::resolve_connection_target(
+        app_state.inner(),
+        host.clone(),
+        port,
+        request.reuse_cloud_binding,
+        Some(tab_id.clone()),
+    )
+    .await?;
+    request.host = resolved.host.clone();
+    request.port = resolved.port;
+    log::info!(
+        "[kkterm-rdp] target {host}:{port} resolved to {}:{} route={}",
+        request.host,
+        request.port,
+        resolved.route_label
     );
+    let start_request = kkterm_rdp::macos::StartRdpClientSessionRequest::from_kkterm_start(request);
     tauri::async_runtime::spawn_blocking(move || {
         kkterm_rdp_macos_manager().start_session(app.clone(), start_request)
     })
     .await
     .map_err(|error| format!("RDP startup task failed: {error}"))??;
-    Ok(kkterm_rdp::types::KktermRdpStartResponse { tab_id, session_id })
+    Ok(kkterm_rdp::types::KktermRdpStartResponse {
+        tab_id,
+        session_id,
+        route_label: resolved.route_label,
+    })
 }
 
 #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
@@ -1409,15 +1039,8 @@ fn kkterm_rdp_set_bounds(
     app: tauri::AppHandle,
     request: kkterm_rdp::types::KktermRdpBoundsRequest,
 ) -> Result<(), String> {
-    let visibility =
-        kkterm_rdp::windows::SetRdpVisibilityRequest::from_kkterm_bounds(request.clone());
-    kkterm_rdp_windows_manager().set_visibility(app.clone(), visibility)?;
-    if request.visible {
-        let bounds =
-            kkterm_rdp::windows::UpdateRdpBoundsRequest::from_kkterm_bounds(request, false);
-        kkterm_rdp_windows_manager().update_bounds(app, bounds)?;
-    }
-    Ok(())
+    let visibility = kkterm_rdp::windows::SetRdpVisibilityRequest::from_kkterm_bounds(request);
+    kkterm_rdp_windows_manager().set_visibility(app, visibility)
 }
 
 #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
@@ -1487,9 +1110,6 @@ fn kkterm_rdp_key(
     app: tauri::AppHandle,
     request: kkterm_rdp::types::KktermRdpKeyRequest,
 ) -> Result<(), String> {
-    if !request.down {
-        return Ok(());
-    }
     kkterm_rdp_windows_manager().send_key_press(
         app,
         kkterm_rdp::windows::SendRdpKeyPressRequest::from_kkterm_key(request),
@@ -1555,6 +1175,33 @@ fn kkterm_rdp_ctrl_alt_delete(
     request: kkterm_rdp::types::KktermRdpSimpleRequest,
 ) -> Result<(), String> {
     kkterm_rdp_macos_manager().send_ctrl_alt_delete(
+        kkterm_rdp::macos::RdpClientSimpleRequest::from_kkterm_simple(request),
+    )
+}
+
+#[cfg(all(
+    feature = "kkterm-rdp",
+    nextdesk_kkterm_rdp,
+    not(target_os = "windows")
+))]
+#[tauri::command]
+fn kkterm_rdp_set_active_clipboard_session(tab_id: Option<String>) {
+    let session_id = tab_id
+        .as_deref()
+        .map(kkterm_rdp::types::session_id_from_tab_id);
+    cliprdr::watcher::set_active_clipboard_session(session_id);
+}
+
+#[cfg(all(
+    feature = "kkterm-rdp",
+    nextdesk_kkterm_rdp,
+    not(target_os = "windows")
+))]
+#[tauri::command]
+fn kkterm_rdp_force_clipboard_check(
+    request: kkterm_rdp::types::KktermRdpSimpleRequest,
+) -> Result<(), String> {
+    kkterm_rdp_macos_manager().force_clipboard_check(
         kkterm_rdp::macos::RdpClientSimpleRequest::from_kkterm_simple(request),
     )
 }
@@ -1647,135 +1294,16 @@ fn rdp_audio_close(tab_id: String, app_state: State<'_, AppState>) -> Result<(),
     Ok(())
 }
 
-#[tauri::command]
-fn get_auto_update_status(app_state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let enabled = *app_state.auto_update_enabled.lock().unwrap();
-    let last_sync_ts = *app_state.last_sync_ts.lock().unwrap();
-    let sync_state = app_state.sync_state.lock().unwrap().clone();
-    Ok(serde_json::json!({
-        "enabled": enabled,
-        "last_sync_ts": last_sync_ts,
-        "sync_state": sync_state,
-    }))
-}
-
-#[tauri::command]
-fn set_auto_update_enabled(enabled: bool, app_state: State<'_, AppState>) -> Result<(), String> {
-    *app_state.auto_update_enabled.lock().unwrap() = enabled;
-    let mut saved = config::load_saved_config();
-    saved.auto_update_enabled = enabled;
-    config::save_config(&saved);
-    log::info!("[sub_scheduler] Auto-update set to: {enabled}");
-    Ok(())
-}
-
-#[tauri::command]
-async fn trigger_sync_now(app: AppHandle) -> Result<(), String> {
-    sub_scheduler::trigger_sync(&app).await;
-    Ok(())
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize structured logging FIRST so all subsequent code can log.
     logging::init();
-    cleanup_extra_engine_processes(None);
 
     // Load saved config on startup
     let saved = config::load_saved_config();
     let app_state = AppState::default();
-    *app_state.servers.lock().unwrap() = saved.servers;
-    *app_state.proxy_groups.lock().unwrap() = saved.proxy_groups;
-    *app_state.subscription_url.lock().unwrap() = saved.subscription_url;
-    *app_state.tube_enabled.lock().unwrap() = saved.tube_enabled;
-    *app_state.cloud_mode.lock().unwrap() = saved.cloud_mode;
     *app_state.dashboard_url.lock().unwrap() = saved.dashboard_url;
-    *app_state.relay_api_key.lock().unwrap() = saved.relay_api_key;
-    *app_state.auto_update_enabled.lock().unwrap() = saved.auto_update_enabled;
-    *app_state.last_sync_ts.lock().unwrap() = saved.last_sync_ts;
-
-    // [DISABLED] 复用模式暂时禁用，始终使用独立内核
-    // 待独立内核模式成熟后删除此段注释代码
-    // (Original synchronous external Clash detection block commented out)
-    eprintln!("[init] Independent kernel mode — skipping external Clash detection");
-    // {
-    //     use std::io::{Read, Write};
-    //     use std::net::TcpStream;
-    //     use std::time::Duration;
-    //
-    //     let ports: &[u16] = &[9090, 9097, 7891, 7890];
-    //     let timeout = Duration::from_secs(1);
-    //
-    //     for &port in ports {
-    //         let addr = format!("127.0.0.1:{port}");
-    //         if let Ok(mut stream) =
-    //             TcpStream::connect_timeout(
-    //                 &addr.parse().unwrap(),
-    //                 timeout,
-    //             )
-    //         {
-    //             stream
-    //                 .set_read_timeout(Some(timeout))
-    //                 .ok();
-    //             stream
-    //                 .set_write_timeout(Some(timeout))
-    //                 .ok();
-    //             let req = format!(
-    //                 "GET /version HTTP/1.1\r\n\
-    //                  Host: 127.0.0.1:{port}\r\n\
-    //                  Connection: close\r\n\r\n"
-    //             );
-    //             if stream
-    //                 .write_all(req.as_bytes())
-    //                 .is_ok()
-    //             {
-    //                 let mut buf = vec![0u8; 1024];
-    //                 if let Ok(n) =
-    //                     stream.read(&mut buf)
-    //                 {
-    //                     let resp =
-    //                         String::from_utf8_lossy(
-    //                             &buf[..n],
-    //                         );
-    //                     if resp.contains("200")
-    //                         && resp.contains("version")
-    //                     {
-    //                         let api = format!(
-    //                             "http://127.0.0.1:{port}"
-    //                         );
-    //                         eprintln!(
-    //                             "[init] Detected external Clash at {api}"
-    //                         );
-    //
-    //                         // Get proxy port
-    //                         let pp =
-    //                             get_proxy_port_sync(
-    //                                 port,
-    //                             );
-    //                         *app_state
-    //                             .clash_api_base
-    //                             .lock()
-    //                             .unwrap() = api;
-    //                         *app_state
-    //                             .proxy_port
-    //                             .lock()
-    //                             .unwrap() = pp;
-    //                         *app_state
-    //                             .reuse_mode
-    //                             .lock()
-    //                             .unwrap() = true;
-    //                         break;
-    //                     }
-    //                 }
-    //             }
-    //         }
-    //     }
-    //     if !*app_state.reuse_mode.lock().unwrap() {
-    //         eprintln!(
-    //             "[init] No external Clash detected"
-    //         );
-    //     }
-    // }
+    *app_state.cloud_authorization_base_url.lock().unwrap() = saved.cloud_authorization_base_url;
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -1784,11 +1312,39 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_deep_link::init())
         .manage(app_state)
         .setup(|app| {
             // macOS: swizzle [NSCursor setHiddenUntilMouseMoves:] to no-op
             // to prevent cursor from hiding on keyDown in RDP sessions
             macos_cursor_fix::install_cursor_unhide();
+
+            #[cfg(desktop)]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+
+                #[cfg(any(windows, target_os = "linux"))]
+                {
+                    if let Err(error) = app.deep_link().register_all() {
+                        log::warn!("[cloud-auth] deep link register_all failed: {error}");
+                    }
+                }
+
+                match app.deep_link().get_current() {
+                    Ok(Some(urls)) => {
+                        let urls = urls.iter().map(ToString::to_string).collect();
+                        handle_cloud_deep_link_urls(app.handle().clone(), urls);
+                    }
+                    Ok(None) => {}
+                    Err(error) => log::warn!("[cloud-auth] read startup deep link failed: {error}"),
+                }
+
+                let app_handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    let urls = event.urls().iter().map(ToString::to_string).collect();
+                    handle_cloud_deep_link_urls(app_handle.clone(), urls);
+                });
+            }
 
             #[cfg(feature = "nextdesk-native-rdp")]
             {
@@ -1796,21 +1352,11 @@ pub fn run() {
                 let rdp_port = *state.rdp_proxy_port.lock().unwrap();
                 let rdp_proxy_port_state = state.rdp_proxy_port.clone();
                 let rdp_proxy_error = state.rdp_proxy_error.clone();
-                let socks_port = state.proxy_port.clone();
-                let tube_enabled = state.tube_enabled.clone();
-                let cloud_mode = state.cloud_mode.clone();
-                let relay_endpoints = state.relay_endpoints.clone();
-                let dashboard_url = state.dashboard_url.clone();
-                let relay_api_key = state.relay_api_key.clone();
+                let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     rdp_proxy::start_proxy(
+                        app_handle,
                         rdp_port,
-                        socks_port,
-                        tube_enabled,
-                        cloud_mode,
-                        relay_endpoints,
-                        dashboard_url,
-                        relay_api_key,
                         rdp_proxy_port_state,
                         rdp_proxy_error,
                     )
@@ -1826,10 +1372,6 @@ pub fn run() {
                     "NextDesk native/web RDP proxy is disabled in kkterm-rdp builds".to_string(),
                 );
             }
-
-            // Spawn subscription auto-update scheduler
-            let app_handle = app.handle().clone();
-            sub_scheduler::spawn(app_handle);
 
             // Start file transfer WebSocket server for CLIPRDR large file bypass
             let app_handle_for_ft = app.handle().clone();
@@ -1851,24 +1393,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            start_engine,
-            stop_engine,
-            get_status,
-            get_servers,
-            get_subscription_url,
-            save_config,
-            load_subscription,
-            get_proxy_groups,
-            switch_proxy,
-            test_group_delays,
-            get_proxy_plane_diagnostics,
-            test_servers_connectivity,
-            get_connections,
-            get_clash_log,
             check_for_update,
             get_current_version,
             get_system_language,
-            get_run_mode,
             get_rdp_proxy_port,
             get_file_transfer_ws_port,
             get_mac_clipboard_strategy,
@@ -1892,12 +1419,14 @@ pub fn run() {
             rdp_log_clear,
             rdp_log_file_path_str,
             rdp_log_file_size,
+            diagnostic_log_read,
             log_copy_diagnostic_bundle_to_desktop,
-            get_tube_enabled,
-            set_tube_enabled,
-            set_cloud_mode,
-            refresh_relay_endpoints,
-            get_relay_endpoints,
+            cloud_start_authorization,
+            cloud_handle_callback,
+            cloud_get_status,
+            cloud_refresh_status,
+            cloud_keep_binding_alive,
+            cloud_disable,
             rdp_audio_set_format,
             rdp_audio_push,
             rdp_audio_push_raw,
@@ -1936,11 +1465,20 @@ pub fn run() {
             kkterm_rdp_text,
             #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp))]
             kkterm_rdp_ctrl_alt_delete,
+            #[cfg(all(
+                feature = "kkterm-rdp",
+                nextdesk_kkterm_rdp,
+                not(target_os = "windows")
+            ))]
+            kkterm_rdp_set_active_clipboard_session,
+            #[cfg(all(
+                feature = "kkterm-rdp",
+                nextdesk_kkterm_rdp,
+                not(target_os = "windows")
+            ))]
+            kkterm_rdp_force_clipboard_check,
             #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp))]
             kkterm_rdp_disconnect,
-            get_auto_update_status,
-            set_auto_update_enabled,
-            trigger_sync_now,
             logging::log_show_in_finder,
             logging::log_copy_to_desktop,
             logging::log_clear,
@@ -1953,74 +1491,28 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        internal_engine_running, is_private_or_reserved_host, rdp_target_requires_internal_engine,
-        should_start_engine_for_proxy_api,
-    };
+    use super::cloud_authorization_base_url_from_state;
     use crate::state::AppState;
-    use std::process::Stdio;
 
     #[test]
-    fn rdp_engine_guard_treats_private_targets_as_direct() {
-        assert!(is_private_or_reserved_host("192.168.3.108"));
-        assert!(is_private_or_reserved_host("10.0.0.8"));
-        assert!(is_private_or_reserved_host("127.0.0.1"));
+    fn cloud_authorization_base_url_uses_builtin_default_without_subscription() {
+        let app_state = AppState::default();
+
+        assert_eq!(
+            cloud_authorization_base_url_from_state(&app_state).unwrap(),
+            "https://oauth.mxolab.com"
+        );
     }
 
     #[test]
-    fn rdp_engine_guard_treats_public_targets_as_proxy_required() {
-        assert!(!is_private_or_reserved_host("68.64.138.254"));
-        assert!(!is_private_or_reserved_host("example.com"));
-    }
+    fn cloud_authorization_base_url_ignores_saved_override() {
+        let app_state = AppState::default();
+        *app_state.cloud_authorization_base_url.lock().unwrap() =
+            "https://a1.libraslink10.xyz/path".to_string();
 
-    #[test]
-    fn rdp_public_targets_require_internal_engine() {
-        assert!(rdp_target_requires_internal_engine("64.20.10.254"));
-        assert!(rdp_target_requires_internal_engine("example.com"));
-        assert!(!rdp_target_requires_internal_engine("192.168.3.108"));
-        assert!(!rdp_target_requires_internal_engine("127.0.0.1"));
-    }
-
-    #[test]
-    fn node_delay_test_starts_engine_when_proxy_api_is_unavailable() {
-        assert!(should_start_engine_for_proxy_api("", false));
-        assert!(should_start_engine_for_proxy_api(
-            "http://127.0.0.1:17891",
-            false
-        ));
-        assert!(!should_start_engine_for_proxy_api(
-            "http://127.0.0.1:17891",
-            true
-        ));
-    }
-
-    #[tokio::test]
-    async fn exited_internal_engine_is_not_reported_running() {
-        #[cfg(target_os = "windows")]
-        let mut command = {
-            let mut command = tokio::process::Command::new("cmd");
-            command.args(["/C", "exit", "0"]);
-            command
-        };
-
-        #[cfg(not(target_os = "windows"))]
-        let mut command = {
-            let mut command = tokio::process::Command::new("/bin/sh");
-            command.args(["-c", "exit 0"]);
-            command
-        };
-
-        let child = command
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn short-lived child");
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        let state = AppState::default();
-        *state.clash_process.lock().unwrap() = Some(child);
-
-        assert!(!internal_engine_running(&state));
-        assert!(state.clash_process.lock().unwrap().is_none());
+        assert_eq!(
+            cloud_authorization_base_url_from_state(&app_state).unwrap(),
+            "https://oauth.mxolab.com"
+        );
     }
 }

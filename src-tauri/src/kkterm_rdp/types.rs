@@ -19,6 +19,10 @@ pub struct KktermRdpStartRequest {
     #[serde(default)]
     pub remote_resolution: Option<String>,
     #[serde(default)]
+    pub redirect_drives: bool,
+    #[serde(default)]
+    pub use_multimon: bool,
+    #[serde(default)]
     pub x: Option<f64>,
     #[serde(default)]
     pub y: Option<f64>,
@@ -26,6 +30,10 @@ pub struct KktermRdpStartRequest {
     pub width: Option<f64>,
     #[serde(default)]
     pub height: Option<f64>,
+    #[serde(default)]
+    pub scale_factor: Option<f64>,
+    #[serde(default)]
+    pub reuse_cloud_binding: bool,
 }
 
 #[derive(Serialize)]
@@ -33,6 +41,7 @@ pub struct KktermRdpStartRequest {
 pub struct KktermRdpStartResponse {
     pub tab_id: String,
     pub session_id: String,
+    pub route_label: String,
 }
 
 #[derive(Clone, Deserialize)]

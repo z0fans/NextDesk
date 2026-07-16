@@ -37,7 +37,6 @@
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -55,17 +54,19 @@ mod imp {
     /// real bytes and return Ok. Errors are logged; reader is still invoked.
     pub type Fetcher = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 
-    thread_local! {
-        /// Keep presenters alive for the duration of registration. ObjC's
-        /// `addFilePresenter:` does not retain its argument, so the Rust side
-        /// owns the only strong reference.
-        static ACTIVE_PRESENTERS: RefCell<Vec<Retained<LazyPastePresenter>>> =
-            const { RefCell::new(Vec::new()) };
-    }
-
     fn active_fetchers() -> &'static Mutex<HashMap<PathBuf, Fetcher>> {
         static ACTIVE_FETCHERS: OnceLock<Mutex<HashMap<PathBuf, Fetcher>>> = OnceLock::new();
         ACTIVE_FETCHERS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn active_registration() -> &'static Mutex<Option<ActiveRegistration>> {
+        static ACTIVE_REGISTRATION: OnceLock<Mutex<Option<ActiveRegistration>>> = OnceLock::new();
+        ACTIVE_REGISTRATION.get_or_init(|| Mutex::new(None))
+    }
+
+    struct ActiveRegistration {
+        owner: String,
+        presenters: Vec<Retained<LazyPastePresenter>>,
     }
 
     struct LazyPastePresenterIvars {
@@ -154,13 +155,31 @@ mod imp {
         }
     }
 
+    fn remove_presenters(presenters: &[Retained<LazyPastePresenter>]) {
+        for presenter in presenters {
+            let proto: &ProtocolObject<dyn NSFilePresenter> =
+                ProtocolObject::from_ref(&**presenter);
+            unsafe { NSFileCoordinator::removeFilePresenter(proto) };
+        }
+    }
+
+    fn clear_fetchers() {
+        if let Ok(mut fetchers) = active_fetchers().lock() {
+            fetchers.clear();
+        }
+    }
+
     /// Register an NSFilePresenter for each path. The fetcher is invoked
     /// (synchronously, on a background queue) when Finder paste reads the file.
     ///
     /// Each path is touched as a zero-byte placeholder if it doesn't exist —
     /// `NSFileCoordinator` only routes reads through us when the URL points
     /// to a file that's actually on disk.
-    pub fn register_lazy_paste(paths: &[PathBuf], fetcher: Fetcher) -> Result<(), String> {
+    pub fn register_lazy_paste(
+        owner: &str,
+        paths: &[PathBuf],
+        fetcher: Fetcher,
+    ) -> Result<(), String> {
         // NOTE: `[NSFileCoordinator addFilePresenter:]` is thread-safe per
         // Apple's documentation — it's safe to call from any thread, including
         // a tokio worker. (Earlier versions of this code required a
@@ -170,6 +189,14 @@ mod imp {
 
         if paths.is_empty() {
             return Ok(());
+        }
+
+        let mut registration = active_registration()
+            .lock()
+            .map_err(|_| "lazy presenter registry lock poisoned".to_string())?;
+        if let Some(previous) = registration.take() {
+            remove_presenters(&previous.presenters);
+            clear_fetchers();
         }
 
         let mut new_presenters: Vec<Retained<LazyPastePresenter>> = Vec::with_capacity(paths.len());
@@ -203,46 +230,63 @@ mod imp {
 
             let presenter = LazyPastePresenter::new(url, path.clone(), Arc::clone(&fetcher));
 
-            let proto: &ProtocolObject<dyn NSFilePresenter> = ProtocolObject::from_ref(&*presenter);
-            unsafe { NSFileCoordinator::addFilePresenter(proto) };
-
-            log::info!("[lazy-paste] registered presenter for {}", path.display());
-            active_fetchers()
-                .lock()
-                .map_err(|_| "lazy fetcher registry lock poisoned".to_string())?
-                .insert(path.clone(), Arc::clone(&fetcher));
             new_presenters.push(presenter);
         }
 
-        ACTIVE_PRESENTERS.with(|cell| {
-            cell.borrow_mut().extend(new_presenters);
+        {
+            let mut fetchers = active_fetchers()
+                .lock()
+                .map_err(|_| "lazy fetcher registry lock poisoned".to_string())?;
+            fetchers.clear();
+            for path in paths {
+                fetchers.insert(path.clone(), Arc::clone(&fetcher));
+            }
+        }
+
+        for (path, presenter) in paths.iter().zip(&new_presenters) {
+            let proto: &ProtocolObject<dyn NSFilePresenter> =
+                ProtocolObject::from_ref(&**presenter);
+            unsafe { NSFileCoordinator::addFilePresenter(proto) };
+            log::info!(
+                "[lazy-paste] owner={} registered presenter for {}",
+                owner,
+                path.display()
+            );
+        }
+
+        *registration = Some(ActiveRegistration {
+            owner: owner.to_string(),
+            presenters: new_presenters,
         });
 
         Ok(())
     }
 
-    /// Remove every currently-registered presenter.
-    ///
-    /// Safe to call multiple times. Should be called when the clipboard
-    /// changes (i.e. our pasteboard write is no longer the active selection)
-    /// or on shutdown.
-    pub fn unregister_lazy_paste() {
-        let presenters: Vec<Retained<LazyPastePresenter>> =
-            ACTIVE_PRESENTERS.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    /// Remove the registration only when it is still owned by this RDP session.
+    /// A stale session teardown must not unregister a newer session's presenters.
+    pub fn unregister_lazy_paste_for(owner: &str) -> bool {
+        let previous = {
+            let Ok(mut registration) = active_registration().lock() else {
+                return false;
+            };
+            if registration.as_ref().map(|entry| entry.owner.as_str()) != Some(owner) {
+                return false;
+            }
+            registration.take()
+        };
 
-        let count = presenters.len();
-        for presenter in &presenters {
-            let proto: &ProtocolObject<dyn NSFilePresenter> =
-                ProtocolObject::from_ref(&**presenter);
-            unsafe { NSFileCoordinator::removeFilePresenter(proto) };
-        }
-
-        if count > 0 {
-            log::info!("[lazy-paste] unregistered {} presenter(s)", count);
-        }
-
-        if let Ok(mut fetchers) = active_fetchers().lock() {
-            fetchers.clear();
+        if let Some(previous) = previous {
+            let count = previous.presenters.len();
+            remove_presenters(&previous.presenters);
+            clear_fetchers();
+            log::info!(
+                "[lazy-paste] owner={} unregistered {} presenter(s)",
+                owner,
+                count
+            );
+            true
+        } else {
+            false
         }
     }
 
@@ -269,10 +313,56 @@ mod imp {
         fetcher(path)?;
         Ok(true)
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[test]
+        fn stale_owner_cannot_unregister_newer_presenters() {
+            let root = std::env::temp_dir().join(format!(
+                "nextdesk-lazy-presenter-test-{}",
+                std::process::id()
+            ));
+            let path_a = root.join("a.txt");
+            let path_b = root.join("b.txt");
+            let calls_a = Arc::new(AtomicUsize::new(0));
+            let calls_b = Arc::new(AtomicUsize::new(0));
+
+            let fetch_a: Fetcher = {
+                let calls = Arc::clone(&calls_a);
+                Arc::new(move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            };
+            let fetch_b: Fetcher = {
+                let calls = Arc::clone(&calls_b);
+                Arc::new(move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            };
+
+            register_lazy_paste("session-a", std::slice::from_ref(&path_a), fetch_a).unwrap();
+            assert!(fetch_registered_path(&path_a).unwrap());
+            assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+
+            register_lazy_paste("session-b", std::slice::from_ref(&path_b), fetch_b).unwrap();
+            assert!(!unregister_lazy_paste_for("session-a"));
+            assert!(fetch_registered_path(&path_b).unwrap());
+            assert_eq!(calls_b.load(Ordering::SeqCst), 1);
+
+            assert!(unregister_lazy_paste_for("session-b"));
+            assert!(!fetch_registered_path(&path_b).unwrap());
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{fetch_registered_path, register_lazy_paste, unregister_lazy_paste, Fetcher};
+pub use imp::{fetch_registered_path, register_lazy_paste, unregister_lazy_paste_for, Fetcher};
 
 // ── Stubs for non-macOS targets ───────────────────────────────────────────
 
@@ -280,12 +370,18 @@ pub use imp::{fetch_registered_path, register_lazy_paste, unregister_lazy_paste,
 pub type Fetcher = std::sync::Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>;
 
 #[cfg(not(target_os = "macos"))]
-pub fn register_lazy_paste(_paths: &[std::path::PathBuf], _fetcher: Fetcher) -> Result<(), String> {
+pub fn register_lazy_paste(
+    _owner: &str,
+    _paths: &[std::path::PathBuf],
+    _fetcher: Fetcher,
+) -> Result<(), String> {
     Err("not supported on this platform".to_string())
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn unregister_lazy_paste() {}
+pub fn unregister_lazy_paste_for(_owner: &str) -> bool {
+    false
+}
 
 #[cfg(not(target_os = "macos"))]
 pub fn fetch_registered_path(_path: &std::path::Path) -> Result<bool, String> {

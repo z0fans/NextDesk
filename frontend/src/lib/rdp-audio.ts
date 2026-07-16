@@ -206,7 +206,7 @@ export class RdpAudioPlayer {
 
 function alawToLinear(alaw: number): number {
   let a = alaw ^ 0x55;
-  let sign = (a & 0x80) ? -1 : 1;
+  const sign = (a & 0x80) ? -1 : 1;
   a &= 0x7f;
   const seg = (a >> 4) & 0x07;
   const quant = a & 0x0f;

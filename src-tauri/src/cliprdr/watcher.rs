@@ -55,7 +55,7 @@ pub fn set_active_clipboard_session(session_id: Option<String>) {
     }
 }
 
-fn is_active_clipboard_session(session_id: &str) -> bool {
+pub(crate) fn is_active_clipboard_session(session_id: &str) -> bool {
     active_clipboard_session()
         .lock()
         .map(|active| match active.as_deref() {

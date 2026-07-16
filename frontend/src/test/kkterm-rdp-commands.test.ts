@@ -2,8 +2,10 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   kktermRdpCtrlAltDelete,
   kktermRdpDisconnect,
+  kktermRdpForceClipboardCheck,
   kktermRdpKey,
   kktermRdpPointer,
+  kktermRdpSetActiveClipboardSession,
   kktermRdpSetBounds,
   kktermRdpStart,
   kktermRdpStatus,
@@ -34,6 +36,8 @@ describe('kkterm RDP direct commands', () => {
       desktopWidth: 1440,
       desktopHeight: 900,
       remoteResolution: '1440x900',
+      redirectDrives: true,
+      scaleFactor: 1.5,
     });
 
     expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_start', {
@@ -47,6 +51,8 @@ describe('kkterm RDP direct commands', () => {
         desktopWidth: 1440,
         desktopHeight: 900,
         remoteResolution: '1440x900',
+        redirectDrives: true,
+        scaleFactor: 1.5,
       },
     });
   });
@@ -56,6 +62,8 @@ describe('kkterm RDP direct commands', () => {
     await kktermRdpKey({ tabId: 'tab-public', scancode: 0x1d, down: true });
     await kktermRdpText({ tabId: 'tab-public', text: 'hello' });
     await kktermRdpCtrlAltDelete({ tabId: 'tab-public' });
+    await kktermRdpSetActiveClipboardSession('tab-public');
+    await kktermRdpForceClipboardCheck({ tabId: 'tab-public' });
     await kktermRdpSetBounds({
       tabId: 'tab-public',
       x: 1,
@@ -92,6 +100,12 @@ describe('kkterm RDP direct commands', () => {
       request: { tabId: 'tab-public', text: 'hello' },
     });
     expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_ctrl_alt_delete', {
+      request: { tabId: 'tab-public' },
+    });
+    expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_set_active_clipboard_session', {
+      tabId: 'tab-public',
+    });
+    expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_force_clipboard_check', {
       request: { tabId: 'tab-public' },
     });
     expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_set_bounds', {

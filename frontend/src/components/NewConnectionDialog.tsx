@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef } from 'react';
-import { Monitor, X, ChevronDown, Check } from 'lucide-react';
+import { useEffect, useState, useRef } from 'react';
+import { Monitor, X, ChevronDown, Check, Eye, EyeOff } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import type { SessionStore } from '@/lib/useSessionStore';
@@ -18,34 +18,17 @@ const COLOR_TAGS = ['#3B82F6', '#10B981', '#EF4444', '#F59E0B', '#8B5CF6', '#EC4
 
 export function NewConnectionDialog({ store, open, onClose, onSaved, editServer }: Props) {
   const { t } = useTranslation();
-  const [name, setName] = useState('');
-  const [host, setHost] = useState('');
-  const [port, setPort] = useState('3389');
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [domain, setDomain] = useState('');
+  const [name, setName] = useState(editServer?.name || '');
+  const [host, setHost] = useState(editServer?.host || '');
+  const [port, setPort] = useState(String(editServer?.port || 3389));
+  const [username, setUsername] = useState(editServer?.username || '');
+  const [password, setPassword] = useState(editServer?.password || '');
+  const [passwordVisible, setPasswordVisible] = useState(false);
+  const [domain, setDomain] = useState(editServer?.domain || '');
 
-  const [groupId, setGroupId] = useState('default');
-  const [colorTag, setColorTag] = useState(COLOR_TAGS[0]);
+  const [groupId, setGroupId] = useState(editServer?.groupId || 'default');
+  const [colorTag, setColorTag] = useState(editServer?.colorTag || COLOR_TAGS[0]);
   const isEdit = !!editServer;
-
-  useEffect(() => {
-    if (editServer) {
-      setName(editServer.name || '');
-      setHost(editServer.host || '');
-      setPort(String(editServer.port || 3389));
-      setUsername(editServer.username || '');
-      setPassword(editServer.password || '');
-      setDomain(editServer.domain || '');
-
-      setGroupId(editServer.groupId || 'default');
-      setColorTag(editServer.colorTag || COLOR_TAGS[0]);
-    } else {
-      setName(''); setHost(''); setPort('3389');
-      setUsername(''); setPassword(''); setDomain('');
-      setGroupId('default'); setColorTag(COLOR_TAGS[0]);
-    }
-  }, [editServer]);
 
   if (!open) return null;
 
@@ -107,7 +90,27 @@ export function NewConnectionDialog({ store, open, onClose, onSaved, editServer 
               <Input placeholder="Administrator" value={username} onChange={e => setUsername(e.target.value)} required className="h-8 text-sm" />
             </Field>
             <Field label={t('rdpPassword')}>
-              <Input placeholder="••••••" type="password" value={password} onChange={e => setPassword(e.target.value)} className="h-8 text-sm" />
+              <div className="relative">
+                <Input
+                  placeholder="••••••"
+                  type={passwordVisible ? 'text' : 'password'}
+                  value={password}
+                  onChange={e => setPassword(e.target.value)}
+                  className="h-8 pr-9 text-sm"
+                />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={passwordVisible ? t('rdpHidePassword') : t('rdpShowPassword')}
+                  aria-pressed={passwordVisible}
+                  title={passwordVisible ? t('rdpHidePassword') : t('rdpShowPassword')}
+                  onClick={() => setPasswordVisible(visible => !visible)}
+                  className="absolute right-0 top-0 text-muted-foreground hover:bg-transparent hover:text-foreground"
+                >
+                  {passwordVisible ? <EyeOff /> : <Eye />}
+                </Button>
+              </div>
             </Field>
           </div>
           <div className="grid grid-cols-2 gap-3">

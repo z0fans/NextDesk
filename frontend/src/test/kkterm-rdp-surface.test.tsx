@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { KktermRdpSurface } from '@/rdp/kkterm/KktermRdpSurface';
 import type { ServerEntry } from '@/lib/rdp-types';
@@ -70,6 +70,7 @@ describe('KktermRdpSurface', () => {
   afterEach(() => {
     delete (window as typeof window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     window.localStorage.clear();
+    vi.useRealTimers();
     vi.unstubAllEnvs();
   });
 
@@ -100,8 +101,117 @@ describe('KktermRdpSurface', () => {
           domain: 'ACME',
           desktopWidth: 1600,
           desktopHeight: 900,
+          scaleFactor: window.devicePixelRatio || 1,
         }),
       });
+    });
+  });
+
+  it('delegates connection feedback to the parent RDP chrome', () => {
+    render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1600, height: 900 }}
+        cadSignal={0}
+        winSignal={0}
+        textSignal={null}
+        onConnected={vi.fn()}
+        onDisconnected={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText('正在连接 64.20.10.254...')).not.toBeInTheDocument();
+  });
+
+  it('reports a connection timeout instead of spinning forever when native start does not return', async () => {
+    vi.useFakeTimers();
+    const onError = vi.fn();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'kkterm_rdp_start') {
+        return new Promise(() => undefined);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1600, height: 900 }}
+        cadSignal={0}
+        winSignal={0}
+        textSignal={null}
+        onConnected={vi.fn()}
+        onDisconnected={vi.fn()}
+        onError={onError}
+      />,
+    );
+
+    await act(async () => {
+      vi.advanceTimersByTime(45_000);
+    });
+
+    expect(onError).toHaveBeenCalledWith(
+      'tab-public',
+      'RDP connection timed out before the remote server responded',
+    );
+    expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_disconnect', {
+      request: { tabId: 'tab-public' },
+    });
+  });
+
+  it('retries transient cloud startup failures before surfacing an error', async () => {
+    vi.useFakeTimers();
+    invokeMock.mockImplementation((command: string, payload: unknown) => {
+      if (command === 'kkterm_rdp_start') {
+        const startCalls = invokeMock.mock.calls.filter(([name]) => name === 'kkterm_rdp_start').length;
+        if (startCalls === 1) {
+          return Promise.reject(new Error('cloud prepare rejected: 429 Too Many Requests'));
+        }
+        return Promise.resolve({ tabId: 'tab-public' });
+      }
+      if (command === 'kkterm_rdp_disconnect') {
+        return Promise.resolve(undefined);
+      }
+      return Promise.resolve(payload);
+    });
+
+    render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1600, height: 900 }}
+        cadSignal={0}
+        winSignal={0}
+        textSignal={null}
+        onConnected={vi.fn()}
+        onDisconnected={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_start', {
+      request: expect.objectContaining({ reuseCloudBinding: false }),
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(800);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const startCalls = invokeMock.mock.calls.filter(([name]) => name === 'kkterm_rdp_start');
+    expect(startCalls).toHaveLength(2);
+    expect(startCalls[1]?.[1]).toEqual({
+      request: expect.objectContaining({ reuseCloudBinding: false }),
     });
   });
 
@@ -149,6 +259,35 @@ describe('KktermRdpSurface', () => {
     expect(invokeMock).not.toHaveBeenCalledWith('kkterm_rdp_start', expect.anything());
   });
 
+  it('keeps the native KKTerm session alive while its session tab is inactive', async () => {
+    const props = {
+      tabId: 'tab-public',
+      server,
+      desktopSize: { width: 1600, height: 900 },
+      cadSignal: 0,
+      winSignal: 0,
+      textSignal: null,
+      onConnected: vi.fn(),
+      onDisconnected: vi.fn(),
+      onError: vi.fn(),
+    };
+    const { rerender } = render(<KktermRdpSurface {...props} active={true} />);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_start', expect.anything());
+    });
+    invokeMock.mockClear();
+
+    rerender(<KktermRdpSurface {...props} active={false} />);
+    rerender(<KktermRdpSurface {...props} active={true} />);
+
+    expect(invokeMock).not.toHaveBeenCalledWith('kkterm_rdp_start', expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith('kkterm_rdp_disconnect', expect.anything());
+    await waitFor(() => {
+      expect(document.activeElement).toBe(screen.getByLabelText('RDP display'));
+    });
+  });
+
   it('captures keyboard focus on pointer down and sends text through KKTerm Unicode input', async () => {
     vi.stubEnv('VITE_NEXTDESK_KKTERM_KEYBOARD_MODE', 'kkterm-text');
     render(
@@ -177,6 +316,48 @@ describe('KktermRdpSurface', () => {
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_text', {
         request: { tabId: 'tab-public', text: 'a' },
+      });
+    });
+  });
+
+  it('maps pointer coordinates through the resized canvas backing store', async () => {
+    const { container } = render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1920, height: 1080 }}
+        cadSignal={0}
+        winSignal={0}
+        textSignal={null}
+        onConnected={vi.fn()}
+        onDisconnected={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+
+    const canvas = container.querySelector('canvas');
+    expect(canvas).not.toBeNull();
+    canvas!.width = 1920;
+    canvas!.height = 1080;
+    vi.spyOn(canvas!, 'getBoundingClientRect').mockReturnValue({
+      x: 100,
+      y: 50,
+      left: 100,
+      top: 50,
+      right: 1060,
+      bottom: 590,
+      width: 960,
+      height: 540,
+      toJSON: () => ({}),
+    });
+    invokeMock.mockClear();
+
+    fireEvent.pointerDown(canvas!, { clientX: 580, clientY: 320, button: 0 });
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_pointer', {
+        request: { tabId: 'tab-public', x: 960, y: 540, buttonMask: 1 },
       });
     });
   });
@@ -244,17 +425,17 @@ describe('KktermRdpSurface', () => {
     const input = await screen.findByLabelText('RDP display');
     const canvas = container.querySelector('canvas');
     expect(canvas).not.toBeNull();
-    expect(canvas).toHaveAttribute('tabindex', '0');
-    expect(input).toHaveAttribute('tabindex', '-1');
+    expect(canvas).toHaveAttribute('tabindex', '-1');
+    expect(input).toHaveAttribute('tabindex', '0');
 
     invokeMock.mockClear();
     fireEvent.pointerDown(canvas!, { clientX: 10, clientY: 20, button: 0 });
-    expect(document.activeElement).toBe(canvas);
-    fireEvent.keyDown(canvas!, {
+    expect(document.activeElement).toBe(input);
+    fireEvent.keyDown(input, {
       code: 'KeyA',
       key: 'a',
     });
-    fireEvent.keyUp(canvas!, {
+    fireEvent.keyUp(input, {
       code: 'KeyA',
       key: 'a',
     });
@@ -268,6 +449,125 @@ describe('KktermRdpSurface', () => {
       });
     });
     expect(invokeMock).not.toHaveBeenCalledWith('kkterm_rdp_text', expect.anything());
+  });
+
+  it('sends macOS IME composition text in the default remote scancode mode', async () => {
+    render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1280, height: 800 }}
+        cadSignal={0}
+        winSignal={0}
+        textSignal={null}
+        onConnected={vi.fn()}
+        onDisconnected={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+
+    const display = await screen.findByLabelText('RDP display');
+    invokeMock.mockClear();
+    fireEvent.compositionStart(display);
+    fireEvent.compositionEnd(display, { data: '中文输入' });
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_text', {
+        request: { tabId: 'tab-public', text: '中文输入' },
+      });
+    });
+    expect(invokeMock).not.toHaveBeenCalledWith('kkterm_rdp_key', expect.anything());
+  });
+
+  it('does not leak WebKit IME keyCode 229 events into the remote scancode stream', async () => {
+    render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1280, height: 800 }}
+        cadSignal={0}
+        winSignal={0}
+        textSignal={null}
+        onConnected={vi.fn()}
+        onDisconnected={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+
+    const display = await screen.findByLabelText('RDP display');
+    invokeMock.mockClear();
+    fireEvent.keyDown(display, {
+      code: 'KeyZ',
+      key: 'Unidentified',
+      isComposing: true,
+      keyCode: 229,
+    });
+    fireEvent.keyUp(display, {
+      code: 'KeyZ',
+      key: 'Unidentified',
+      isComposing: true,
+      keyCode: 229,
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(invokeMock).not.toHaveBeenCalledWith('kkterm_rdp_key', expect.anything());
+  });
+
+  it('anchors the macOS IME target inside the visible RDP surface', async () => {
+    render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1280, height: 800 }}
+        cadSignal={0}
+        winSignal={0}
+        textSignal={null}
+        onConnected={vi.fn()}
+        onDisconnected={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+
+    const display = await screen.findByLabelText('RDP display');
+    expect(window.getComputedStyle(display).left).toBe('8px');
+  });
+
+  it('maps Ctrl+Alt+End to the dedicated remote Ctrl+Alt+Delete command', async () => {
+    render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1280, height: 800 }}
+        cadSignal={0}
+        winSignal={0}
+        textSignal={null}
+        onConnected={vi.fn()}
+        onDisconnected={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+
+    const display = await screen.findByLabelText('RDP display');
+    invokeMock.mockClear();
+    fireEvent.keyDown(display, {
+      code: 'End',
+      key: 'End',
+      ctrlKey: true,
+      altKey: true,
+    });
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_ctrl_alt_delete', {
+        request: { tabId: 'tab-public' },
+      });
+    });
+    expect(invokeMock).not.toHaveBeenCalledWith('kkterm_rdp_key', expect.objectContaining({
+      request: expect.objectContaining({ scancode: 0xe04f }),
+    }));
   });
 
   it('lets shifted printable symbols flow through KKTerm input text', async () => {
@@ -676,7 +976,7 @@ describe('KktermRdpSurface', () => {
     });
   });
 
-  it('can focus the canvas and route printable keys as scancodes for remote IME mode', async () => {
+  it('focuses the IME input and routes printable keys as scancodes in remote mode', async () => {
     window.localStorage.setItem('nextdesk_kkterm_keyboard_mode', 'remote-scancode');
     const { container } = render(
       <KktermRdpSurface
@@ -693,17 +993,18 @@ describe('KktermRdpSurface', () => {
       />,
     );
 
+    const display = await screen.findByLabelText('RDP display');
     const canvas = container.querySelector('canvas');
     expect(canvas).not.toBeNull();
     invokeMock.mockClear();
     fireEvent.pointerDown(canvas!, { clientX: 10, clientY: 20, button: 0 });
-    expect(document.activeElement).toBe(canvas);
+    expect(document.activeElement).toBe(display);
 
-    fireEvent.keyDown(canvas!, {
+    fireEvent.keyDown(display, {
       code: 'KeyA',
       key: 'a',
     });
-    fireEvent.keyUp(canvas!, {
+    fireEvent.keyUp(display, {
       code: 'KeyA',
       key: 'a',
     });
@@ -717,6 +1018,45 @@ describe('KktermRdpSurface', () => {
       });
     });
     expect(invokeMock).not.toHaveBeenCalledWith('kkterm_rdp_text', expect.anything());
+  });
+
+  it('restores focus to the active KKTerm IME input after the app regains focus', async () => {
+    vi.useFakeTimers();
+    window.localStorage.setItem('nextdesk_kkterm_keyboard_mode', 'remote-scancode');
+    const { container } = render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1280, height: 800 }}
+        cadSignal={0}
+        winSignal={0}
+        textSignal={null}
+        onConnected={vi.fn()}
+        onDisconnected={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+
+    const display = screen.getByLabelText('RDP display');
+    expect(container.querySelector('canvas')).not.toBeNull();
+    await act(async () => {
+      vi.runOnlyPendingTimers();
+    });
+    expect(document.activeElement).toBe(display);
+
+    const button = document.createElement('button');
+    document.body.appendChild(button);
+    button.focus();
+    expect(document.activeElement).toBe(button);
+
+    window.dispatchEvent(new Event('focus'));
+    await act(async () => {
+      vi.runOnlyPendingTimers();
+    });
+
+    expect(document.activeElement).toBe(display);
+    button.remove();
   });
 
   it('uses the macOS produced printable key instead of the physical key position in remote scancode mode', async () => {

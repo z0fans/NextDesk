@@ -17,22 +17,16 @@ function applyTheme(effective: "light" | "dark") {
 }
 
 export function ThemeToggle() {
-  const [mode, setMode] = useState<ThemeMode>("auto");
+  const [mode, setMode] = useState<ThemeMode>(() => {
+    const saved = localStorage.getItem("nextdesk-theme");
+    return saved === "light" || saved === "dark" || saved === "auto"
+      ? saved
+      : "auto";
+  });
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Derive the effective (visual) theme from mode
   const effectiveTheme = mode === "auto" ? getAutoTheme() : mode;
-
-  // On mount: read saved preference
-  useEffect(() => {
-    const saved = localStorage.getItem("nextdesk-theme") as ThemeMode | null;
-    if (saved === "light" || saved === "dark" || saved === "auto") {
-      setMode(saved);
-    } else {
-      // First time — default to auto
-      setMode("auto");
-    }
-  }, []);
 
   // Auto-mode timer: check every 60s if theme should flip
   const updateAutoTheme = useCallback(() => {

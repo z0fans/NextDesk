@@ -8,7 +8,10 @@ const rootDir = path.resolve(scriptDir, '..');
 const cargoToml = path.join(rootDir, 'src-tauri', 'Cargo.toml');
 const cargoConfig = readFileSync(cargoToml, 'utf8');
 
-if (!cargoConfig.includes('ironrdp = { version = "0.15"')) {
+if (
+  !cargoConfig.includes('kkterm-rdp = ["ironrdp/cliprdr"]') ||
+  !cargoConfig.includes("cfg(nextdesk_kkterm_rdp)")
+) {
   console.error('src-tauri/Cargo.toml is not using the KKTerm IronRDP dependency graph');
   process.exit(1);
 }

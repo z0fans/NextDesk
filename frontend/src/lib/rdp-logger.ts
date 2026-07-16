@@ -9,26 +9,29 @@
  *   - Default: 'info' (hides debug spam like mouse events, canvas size)
  *   - Set window.__RDP_LOG_LEVEL = 'debug' in console to see everything
  *   - Set window.__RDP_LOG_MODULES = 'input,render' to filter by module
+ *   - Dev-only internal technology names require VITE_NEXTDESK_INTERNAL_LOGS=true
  *
  * Usage:
  *   import { rdpLog } from '@/lib/rdp-logger';
- *   rdpLog.info('connection', 'Session connected', { tabId, host });
+ *   rdpLog.info('rdp', 'Session connected', { tabId, host });
  *   rdpLog.error('clipboard', 'FormatList failed', { error });
  */
 
 import { invoke } from '@tauri-apps/api/core';
+import { sanitizeDiagnosticText } from '@/lib/diagnostic-logs';
 
 export type RdpLogModule =
-  | 'connection'  // connect / disconnect / reconnect
+  | 'app'          // application lifecycle and configuration
+  | 'auth'         // device authorization and account state
+  | 'cloud'        // cloud API, gateway discovery, binding health
+  | 'route'        // cloud/direct route selection and fallback
+  | 'rdp'          // connect / disconnect / reconnect / engine state
+  | 'display'      // canvas / resolution / GFX
+  | 'network'      // TCP / WebSocket / online state
   | 'clipboard'   // clipboard sync (CLIPRDR)
   | 'input'       // keyboard / mouse events
-  | 'render'      // canvas / resolution / GFX
   | 'audio'       // RDPSND audio
-  | 'file'        // file transfer (RDPDR)
-  | 'network'     // online / offline detection
-  | 'proxy'       // WebSocket / RDCleanPath proxy
-  | 'native'      // native Rust RDP backend
-  | 'wasm';       // IronRDP WASM internal logs
+  | 'file';       // file transfer (RDPDR)
 
 export type RdpLogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -39,6 +42,9 @@ interface LogEntry {
   msg: string;
   data?: string;
 }
+
+const INTERNAL_DIAGNOSTICS_ENABLED =
+  import.meta.env.DEV && import.meta.env.VITE_NEXTDESK_INTERNAL_LOGS === 'true';
 
 // Level priority for filtering
 const LEVEL_PRIORITY: Record<RdpLogLevel, number> = {
@@ -56,24 +62,25 @@ function createLogger() {
   let initialized = false;
 
   // Default minimum log level.
-  // Dev keeps rich diagnostics. Production keeps only warnings/errors by default
-  // so RDP rendering hot paths do not spend time formatting or persisting logs.
+  // Production retains operational INFO events; high-frequency rendering and
+  // input events stay DEBUG so they do not inflate routine diagnostics.
   // Override at runtime: window.__RDP_LOG_LEVEL = 'debug'
-  const DEFAULT_MIN_LEVEL: RdpLogLevel = import.meta.env.DEV ? 'info' : 'warn';
-  const DEFAULT_FILE_MIN_LEVEL: RdpLogLevel = import.meta.env.DEV ? 'debug' : 'warn';
+  const DEFAULT_MIN_LEVEL: RdpLogLevel = 'info';
+  const DEFAULT_FILE_MIN_LEVEL: RdpLogLevel = import.meta.env.DEV ? 'debug' : 'info';
 
   // Module → console color mapping
   const MODULE_COLORS: Record<RdpLogModule, string> = {
-    connection: '#4fc3f7',
+    app:        '#90a4ae',
+    auth:       '#26a69a',
+    cloud:      '#42a5f5',
+    route:      '#29b6f6',
+    rdp:        '#4fc3f7',
+    display:    '#ba68c8',
+    network:    '#4dd0e1',
     clipboard:  '#81c784',
     input:      '#ffb74d',
-    render:     '#ba68c8',
     audio:      '#f06292',
     file:       '#aed581',
-    network:    '#4dd0e1',
-    proxy:      '#ffd54f',
-    native:     '#ef5350',
-    wasm:       '#90a4ae',
   };
 
   const LEVEL_METHODS = {
@@ -86,7 +93,6 @@ function createLogger() {
   function init() {
     if (initialized) return;
     initialized = true;
-    invoke('rdp_log_clear').catch(() => {});
   }
 
   function doFlush() {
@@ -165,10 +171,20 @@ function createLogger() {
     init();
 
     const ts = new Date().toISOString();
-    const dataStr = data !== undefined
-      ? JSON.stringify(data)
-      : undefined;
-    const entry: LogEntry = { ts, level, module, msg, data: dataStr };
+    const publicMessage = INTERNAL_DIAGNOSTICS_ENABLED ? msg : sanitizeDiagnosticText(msg);
+    const rawData = data !== undefined ? JSON.stringify(data) : undefined;
+    const dataStr = rawData !== undefined && !INTERNAL_DIAGNOSTICS_ENABLED
+      ? sanitizeDiagnosticText(rawData)
+      : rawData;
+    let consoleData = data;
+    if (dataStr !== undefined && !INTERNAL_DIAGNOSTICS_ENABLED) {
+      try {
+        consoleData = JSON.parse(dataStr);
+      } catch {
+        consoleData = dataStr;
+      }
+    }
+    const entry: LogEntry = { ts, level, module, msg: publicMessage, data: dataStr };
 
     // Always store in ring buffer (for debugging)
     if (ring.length >= RING_SIZE) ring.shift();
@@ -181,11 +197,11 @@ function createLogger() {
       const method = LEVEL_METHODS[level];
       if (data !== undefined) {
         (console as any)[method](
-          tag, `color:${color};font-weight:bold`, msg, data,
+          tag, `color:${color};font-weight:bold`, publicMessage, consoleData,
         );
       } else {
         (console as any)[method](
-          tag, `color:${color};font-weight:bold`, msg,
+          tag, `color:${color};font-weight:bold`, publicMessage,
         );
       }
     }

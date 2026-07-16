@@ -4,7 +4,7 @@
 
 ## 项目概述
 
-NextDesk 是一款 **跨平台加速远程桌面客户端**，集成了 RDP 远程桌面（IronRDP WASM）与 Clash 网络加速引擎，基于 **Tauri 2 + React 19** 构建。
+NextDesk 是一款 **跨平台云端加速远程桌面客户端**，集成 RDP 远程桌面（IronRDP WASM）与设备授权云中继，基于 **Tauri 2 + React 19** 构建。
 
 - **仓库**: `z0fans/NextDesk`
 - **当前版本**: `1.0.102`
@@ -87,7 +87,7 @@ cd NextDesk && npx tauri dev
 | **构建工具** | Vite 7 | `vite@^7.2.4` |
 | **样式** | Tailwind CSS v4 + ShadcnUI | `tailwindcss@^4.1.18` |
 | **RDP 引擎** | IronRDP → WASM (WebGL2 + WebCodecs H.264) | 本地编译 |
-| **网络引擎** | Clash Meta (Mihomo) | 外部二进制 |
+| **网络加速** | 设备授权 + 云中继，失败时本地直连 | 内置 Rust 客户端 |
 | **国际化** | 自研 i18n (Context + useTranslation) | — |
 | **包管理** | npm (前端), cargo (Rust) | — |
 
@@ -137,12 +137,12 @@ NextDesk/
 │       ├── rdp_session.rs       # RDP 原生会话管理 (IronRDP native)
 │       ├── rdp_audio.rs         # RDP 音频重定向 (RDPSND + cpal)
 │       ├── frame_ws.rs          # 帧数据 WebSocket 传输
-│       ├── relay.rs             # 连接中继
-│       ├── tube.rs              # Tube 通道 (aggligator 多路复用)
-│       ├── clash.rs             # Clash 引擎管理
+│       ├── cloud_auth.rs        # 浏览器授权与设备凭证
+│       ├── cloud_gateway.rs     # 云端控制面 API
+│       ├── cloud_probe.rs       # 中继候选探测
+│       ├── connection_resolver.rs # 云端优先、直连回退路由
 │       ├── config.rs            # 配置持久化
 │       ├── state.rs             # 全局状态
-│       ├── subscription.rs      # 订阅解析 (多格式)
 │       ├── updater.rs           # GitHub Release 自动更新
 │       ├── rdpdr_backend.rs     # RDP 驱动重定向后端
 │       ├── cliprdr_backend.rs   # 剪贴板重定向后端 (CLIPRDR)
@@ -154,7 +154,6 @@ NextDesk/
 │       ├── macos_pasteboard_promise.rs
 │       └── macos_cursor_fix.rs  # macOS 光标显示修复
 │
-├── tube-server/                 # Tube 中继服务端
 │
 ├── scripts/                     # 构建/部署脚本
 ├── .backend/                    # 旧版 Python 后端 (已废弃, 保留参考)
@@ -177,7 +176,6 @@ NextDesk/
   ├─ RDP 连接 (原生模式) → Tauri invoke → rdp_session.rs → IronRDP native
   │                          ↕                                    ↕
   │                    frame_ws.rs (LZ4帧)              TCP → RDP Server
-  │                          ↕                          (可选 Tube 聚合)
   │                    Canvas (WebGL2)
   │
   ├─ RDP 连接 (WASM模式) → RdpManager.tsx → IronRDP WASM → WebSocket
@@ -186,9 +184,9 @@ NextDesk/
   │                                                      ↕
   │                                               TCP → RDP Server
   │
-  └─ 网络加速 → Tauri invoke → clash.rs → Clash Meta 进程
-                                  ↕
-                          REST API (端口 17891)
+  └─ 路由解析 → connection_resolver.rs
+                  ├─ 有效授权 + 公网目标 → 云中继
+                  └─ 局域网/未授权/云端失败 → 本地直连
 ```
 
 ### RDP 渲染管线
@@ -204,13 +202,6 @@ NextDesk/
 - WASM WebSocket 请求 → 解码 RDCleanPath → TCP 连接 RDP 服务器
 - X.224 握手 → TLS 握手获取证书 → 构建响应 → 原始双向转发
 - 支持 SOCKS5 代理上游 (`tokio-socks`)
-
-### Tube 多路复用
-
-`tube.rs` + `tube-server/` 实现基于 `aggligator` 的连接聚合：
-- 多条 TCP/WebSocket 链路聚合为单一逻辑连接
-- 提升弱网环境下的 RDP 连接稳定性
-- `tube-server/` 为独立部署的中继服务端
 
 ---
 
@@ -239,9 +230,6 @@ wasm-pack build --target web crates/ironrdp-web
 |:---|:---|
 | 5173 | Vite 开发服务器 |
 | 8765 | RDCleanPath WebSocket 代理 |
-| 17891 | 内置 Clash API |
-| 17897 | 内置 Clash SOCKS5 代理 |
-| 9090/9097 | 外部 Clash 实例检测 (复用模式) |
 
 ---
 
@@ -275,7 +263,7 @@ wasm-pack build --target web crates/ironrdp-web
 - **后台任务**: 使用 `tauri::async_runtime::spawn()` 而非裸 `tokio::spawn()`
 - **命令注册**: 所有 `#[tauri::command]` 在 `lib.rs` 中注册
 - **配置持久化**: 通过 `config.rs`，存储于平台标准目录 (`dirs::config_dir()`)
-- **外部进程**: Clash Meta 作为 sidecar 进程管理，通过 `clash.rs` 控制
+- **云端路由**: 所有 RDP 引擎必须统一经过 `connection_resolver.rs`，不得自行选择代理或中继
 - **跨平台**: macOS 特定代码使用 `#[cfg(target_os = "macos")]`，Windows 同理
 
 ### RDP 协议关键约束
@@ -307,7 +295,6 @@ wasm-pack build --target web crates/ironrdp-web
 | 陷阱 | 正确做法 |
 |:---|:---|
 | Tauri 中 `tokio::runtime::Runtime::new().block_on()` 死锁 | 用 `std::net::TcpStream` 做同步探测，或 `tauri::async_runtime` |
-| Clash API 路径中空格编码 | 使用 `urlencoding::encode()`，不用 `+` 编码 |
 | WASM import 路径 | WASM 文件必须放在 `src/` 目录下，Vite 不允许 `import()` 引入 `/public` 中的 JS |
 | Canvas 渲染黑边 | Canvas 使用 `w-full h-full`，不要用 `object-contain` |
 | 前端 `onClipboardPaste()` 滥用 | 只在剪贴板**内容变化**时调用，Ctrl+V 时绝不调用 |

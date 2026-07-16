@@ -60,8 +60,8 @@ describe('RDP engine mode selection', () => {
     expect(RDP_ENGINE_STORAGE_KEY).toBe('nextdesk_rdp_engine');
   });
 
-  it('defaults to native-drift when no override is present', () => {
-    expect(resolveRdpEngineMode({ envValue: null, storage: null, globalValue: null })).toBe('native-drift');
+  it('defaults to kkterm-copy when no override is present', () => {
+    expect(resolveRdpEngineMode({ envValue: null, storage: null, globalValue: null })).toBe('kkterm-copy');
   });
 
   it('parses official web aliases', () => {
@@ -92,13 +92,13 @@ describe('RDP engine mode selection', () => {
     })).toBe('official-web');
   });
 
-  it('uses localStorage before env', () => {
+  it('uses env before localStorage', () => {
     const storage = createStorage({ [RDP_ENGINE_STORAGE_KEY]: 'official-web' });
     expect(resolveRdpEngineMode({
       envValue: 'native',
       storage,
       globalValue: null,
-    })).toBe('official-web');
+    })).toBe('native');
   });
 
   it('uses env when no debug override exists', () => {
@@ -124,19 +124,19 @@ describe('RDP engine mode selection', () => {
     runtimeGlobal.__NEXTDESK_RDP_ENGINE__ = 'official-web';
 
     try {
-      expect(resolveRdpEngineMode({ envValue: null, storage: null, globalValue: null })).toBe('native-drift');
+      expect(resolveRdpEngineMode({ envValue: null, storage: null, globalValue: null })).toBe('kkterm-copy');
     } finally {
       runtimeGlobal.__NEXTDESK_RDP_ENGINE__ = previous;
     }
   });
 
-  it('falls back from an invalid debug global to localStorage', () => {
+  it('falls back from an invalid debug global to env', () => {
     const storage = createStorage({ [RDP_ENGINE_STORAGE_KEY]: 'official-web' });
     expect(resolveRdpEngineMode({
       envValue: 'native',
       storage,
       globalValue: 'freerdp',
-    })).toBe('official-web');
+    })).toBe('native');
   });
 
   it('falls back from invalid localStorage to env', () => {
@@ -156,12 +156,12 @@ describe('RDP engine mode selection', () => {
     })).toBe('official-web');
   });
 
-  it('falls back from throwing storage to native-drift when env is absent', () => {
+  it('falls back from throwing storage to kkterm-copy when env is absent', () => {
     expect(resolveRdpEngineMode({
       envValue: null,
       storage: createThrowingStorage(),
       globalValue: null,
-    })).toBe('native-drift');
+    })).toBe('kkterm-copy');
   });
 
   it('falls back from a blocked default localStorage getter to env', () => {
@@ -194,7 +194,7 @@ describe('RDP engine mode selection', () => {
       globalValue: null,
     };
 
-    expect(resolveRdpEngineMode(options)).toBe('native-drift');
+    expect(resolveRdpEngineMode(options)).toBe('kkterm-copy');
   });
 
   it('exposes boolean helpers', () => {

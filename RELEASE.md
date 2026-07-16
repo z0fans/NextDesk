@@ -1,106 +1,161 @@
-# NextDesk 版本发布流程
+# NextDesk Tauri 2 Release Guide
 
-## 发布前检查
+NextDesk releases are built by GitHub Actions from tags matching `v*`. The workflow
+produces a universal macOS app/DMG and a Windows NSIS installer after the shared quality
+gate succeeds.
 
-- [ ] 所有功能已完成并测试
-- [ ] 前端代码无 TypeScript 错误
-- [ ] 后端代码可正常运行
+## Signing Policy
 
-## 发布步骤
+The project owner accepts distribution without Apple Developer ID and Windows
+Authenticode certificates. Unsigned packages are buildable and publishable, but users
+should expect macOS Gatekeeper and Windows SmartScreen warnings.
 
-### 1. 确定新版本号
+Do not confuse OS code signing with Tauri updater signing:
 
-查看当前最新 tag：
-```bash
-git tag --sort=-v:refname | head -5
-```
+- Apple Developer ID / notarization and Windows Authenticode establish publisher trust.
+- Tauri updater `.sig` files authenticate update artifacts to the installed app.
+- A Tauri `.sig` does not remove Gatekeeper or SmartScreen warnings.
+- Without `TAURI_SIGNING_PRIVATE_KEY`, the release workflow disables updater artifacts.
+  The installers still build, but `latest.json` and in-app update delivery are unavailable.
 
-新版本号 = 最新版本号 + 1（如 v1.0.67 → v1.0.68）
+## 1. Choose And Synchronize The Version
 
-### 2. 更新版本号常量
+Use a semantic version such as `1.0.124`; the Git tag is the same value prefixed with `v`.
 
-编辑 `backend/core/updater.py`，修改 `CURRENT_VERSION`：
+Update these files together:
 
-```python
-CURRENT_VERSION = "1.0.68"  # 改为新版本号
-```
+- `src-tauri/tauri.conf.json`
+- `src-tauri/Cargo.toml`
+- `src-tauri/Cargo.kkterm.toml`
 
-### 3. 构建前端
+Then refresh and verify the lockfiles through the normal Cargo commands. Do not leave the
+application metadata on an older version than the tag.
 
-```bash
-cd frontend && npm run build
-```
-
-确认构建成功，无报错。
-
-### 4. 提交代码
+Verify the synchronized values:
 
 ```bash
-git add -A
-git commit -m "release: v1.0.68"
+rg -n '^version = "|"version":' \
+  src-tauri/Cargo.toml \
+  src-tauri/Cargo.kkterm.toml \
+  src-tauri/tauri.conf.json
+
+rg -n -A2 'name = "nextdesk"' \
+  src-tauri/Cargo.lock \
+  src-tauri/Cargo.kkterm.lock
 ```
 
-提交信息格式：`release: vX.X.X`
+## 2. Run The Release-Candidate Gate
 
-### 5. 推送代码和 Tag
+The repository must have the patched `IronRDP` checkout next to `NextDesk`, as documented
+in `AGENTS.md`.
 
 ```bash
+npm ci
+npm --prefix frontend ci
+npm --prefix frontend run lint
+npm --prefix frontend test -- --run
+npm --prefix frontend run build
+
+cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+RUSTFLAGS='--cfg nextdesk_kkterm_rdp' \
+  cargo test --locked --manifest-path src-tauri/Cargo.toml \
+  --lib --features kkterm-rdp -- --nocapture
+
+git diff --check
+```
+
+Also review `docs/qa/release-acceptance-gate.md`. Hardware-only rows must remain
+`Not Verified` unless they were exercised on the named platform and release candidate.
+
+## 3. Review The Release Diff
+
+Before committing, verify that the release contains only intended work:
+
+```bash
+git status --short
+git diff --stat
+git diff -- .github/workflows RELEASE.md docs/qa src-tauri frontend
+```
+
+This repository often contains parallel work. Do not use `git add -A` unless every change
+in the worktree belongs to the release.
+
+## 4. Commit, Tag And Push
+
+Example for version `1.0.124`:
+
+```bash
+git add <reviewed-files-only>
+git commit -m "release: v1.0.124"
 git push origin main
-git tag v1.0.68
-git push origin v1.0.68
+
+git tag -a v1.0.124 -m "v1.0.124"
+git push origin v1.0.124
 ```
 
-### 6. 验证发布
+The tag push triggers `.github/workflows/build.yml` (`Build & Release`). The workflow:
 
-1. 访问 GitHub Releases 页面确认 Action 触发
-2. 等待构建完成，下载安装包测试
-3. 检查应用内版本号显示正确
-4. 检查更新检测功能正常
+1. checks out the pinned IronRDP commit and applies the NextDesk patch;
+2. installs locked npm dependencies with `npm ci`;
+3. runs lint, all frontend tests, the production frontend build, Rust formatting and
+   locked Rust library tests;
+4. builds macOS first, then Windows for a normal tagged release;
+5. publishes artifacts to the matching GitHub Release.
 
-## 快速命令（一键发布）
+Use `workflow_dispatch` for packaging tests without creating a tag. It can target all
+platforms, macOS universal, macOS Intel, or Windows.
 
-替换 `X.X.X` 为新版本号：
+## 5. Verify Published Assets
 
-```bash
-# 完整流程
-cd frontend && npm run build && cd .. && \
-git add -A && \
-git commit -m "release: vX.X.X" && \
-git push origin main && \
-git tag vX.X.X && \
-git push origin vX.X.X
-```
+For every published release, confirm:
 
-## 常见问题
+- the Git tag, `tauri.conf.json`, both Cargo manifests and running application all show
+  the same version;
+- the macOS DMG/app and Windows NSIS installer are present;
+- both packages launch and connect through the default `kkterm-copy` engine;
+- no release workflow overrides the tested renderer or keyboard mode unexpectedly;
+- when updater signing is enabled, `latest.json` and the expected `.sig` assets exist and
+  `latest.json.version` matches the tag;
+- when updater signing is disabled, the release notes clearly say that the release uses
+  manual download/update only.
 
-### 更新后仍提示有新版本
+## 6. Installation, Update And Rollback Smoke Test
 
-**原因：** `CURRENT_VERSION` 未更新
+### Fresh install
 
-**解决：** 重新发布，确保步骤 2 已执行
+1. Install on a clean macOS machine and a clean Windows machine.
+2. Acknowledge the expected unsigned-app warning without claiming a verified publisher.
+3. Launch NextDesk and confirm version, login/device state and saved-session behavior.
+4. Connect to a real RDP target and verify first frame, pointer, keyboard, text clipboard,
+   Adaptive, one fixed resolution and Local scaling.
 
-### 需要重新发布同一版本
+### In-app update
 
-删除并重建 tag：
-```bash
-git tag -d vX.X.X
-git push origin :refs/tags/vX.X.X
-git tag vX.X.X
-git push origin vX.X.X
-```
+Only run this section when `latest.json` and updater `.sig` files were published:
 
-### GitHub Action 构建失败
+1. Install the previous known-good version.
+2. Use **Check for Updates**.
+3. Download/install the new release and allow the app to relaunch.
+4. Confirm the new version and repeat a basic RDP connection smoke test.
 
-1. 检查 GitHub Actions 日志
-2. 本地测试 `pyinstaller build.spec`
-3. 确认所有依赖已在 `requirements.txt` 中
+If updater artifacts were intentionally disabled, download the new installer manually and
+verify that installing over the prior version preserves expected configuration.
 
-## 版本号规范
+### Rollback
 
-格式：`v主版本.次版本.修订号`
+1. Keep the previous known-good installers before publishing.
+2. Export or back up any user configuration needed for the test.
+3. Install the previous version over the release candidate, or uninstall/reinstall if the
+   platform installer requires it.
+4. Confirm the old version launches, reads its configuration and connects successfully.
+5. If rollback fails, stop the release and document the incompatible state before retrying.
 
-- **主版本**：重大架构变更
-- **次版本**：新功能
-- **修订号**：Bug 修复、小改动（日常迭代）
+## 7. Failure Handling
 
-当前阶段建议只递增修订号。
+- Do not move or recreate a public tag until the cause is understood.
+- A green tag alone is not a successful release; inspect the actual assets.
+- If macOS succeeds but Windows fails, keep the release incomplete until the Windows job
+  and artifact are repaired.
+- If `latest.json` reports an older version than the tag, synchronize all version sources
+  and cut a new patch release instead of silently replacing an already distributed tag.
+- Never print or commit `TAURI_SIGNING_PRIVATE_KEY`.

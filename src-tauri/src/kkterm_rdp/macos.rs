@@ -4,10 +4,10 @@
 //! emits `rdp-canvas-event`s for the workspace canvas. Windows uses the native
 //! ActiveX path in `rdp.rs` instead; this module is compiled only off-Windows.
 //!
-//! # Pinned IronRDP connect sequence (verified against ironrdp 0.15 / ironrdp-tokio 0.9)
+//! # Pinned IronRDP connect sequence (verified against ironrdp 0.16 / ironrdp-tokio 0.9)
 //!
 //! ## Dependencies used
-//! - `ironrdp = "0.15"` with features `["connector", "session", "graphics", "pdu", "input"]`
+//! - `ironrdp = "0.16"` with features `["connector", "session", "graphics", "pdu", "input"]`
 //! - `ironrdp-tokio = "0.9"` (re-exports all of `ironrdp_async` via `pub use ironrdp_async::*`)
 //! - `tokio-rustls = "0.26"` (for TLS upgrade — we implement the upgrade directly, no ironrdp-tls)
 //! - `sspi = "0.21"` (for CredSSP/NTLM)
@@ -76,67 +76,15 @@ use tokio::{
     net::TcpStream,
     runtime::Runtime,
     sync::{mpsc, oneshot},
+    time::{timeout, Duration},
 };
 
 const DEFAULT_RDP_PORT: u16 = 3389;
 const DEFAULT_RDP_WIDTH: u16 = 1280;
 const DEFAULT_RDP_HEIGHT: u16 = 800;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RdpClientRoute {
-    Direct,
-    Socks5 { port: u16 },
-}
-
-fn rdp_client_route_label(route: RdpClientRoute) -> String {
-    match route {
-        RdpClientRoute::Direct => "direct".to_string(),
-        RdpClientRoute::Socks5 { port } => format!("socks5:{port}"),
-    }
-}
-
-fn choose_rdp_client_route(host: &str, socks_port: Option<u16>) -> RdpClientRoute {
-    match socks_port {
-        Some(port) if port > 0 && !is_private_or_reserved_ip(host) => {
-            RdpClientRoute::Socks5 { port }
-        }
-        _ => RdpClientRoute::Direct,
-    }
-}
-
-fn is_private_or_reserved_ip(host: &str) -> bool {
-    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
-        return false;
-    };
-
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            let o = v4.octets();
-            o[0] == 0
-                || o[0] == 10
-                || (o[0] == 100 && (o[1] & 0xC0) == 64)
-                || o[0] == 127
-                || (o[0] == 169 && o[1] == 254)
-                || (o[0] == 172 && (o[1] & 0xF0) == 16)
-                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
-                || (o[0] == 192 && o[1] == 0 && o[2] == 2)
-                || (o[0] == 192 && o[1] == 168)
-                || (o[0] == 192 && o[1] == 88 && o[2] == 99)
-                || (o[0] == 198 && (o[1] & 0xFE) == 18)
-                || (o[0] == 198 && o[1] == 51 && o[2] == 100)
-                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
-                || o[0] >= 224
-        }
-        std::net::IpAddr::V6(v6) => {
-            let s = v6.segments();
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (s[0] & 0xFE00) == 0xFC00
-                || (s[0] & 0xFFC0) == 0xFE80
-                || (s[0] & 0xFF00) == 0xFF00
-        }
-    }
-}
+const RDP_TCP_CONNECT_TIMEOUT_SECONDS: u64 = 8;
+const RDP_NEGOTIATION_TIMEOUT_SECONDS: u64 = 15;
+const RDP_FINALIZE_TIMEOUT_SECONDS: u64 = 25;
 
 // ── Session manager ───────────────────────────────────────────────────────────
 
@@ -168,6 +116,7 @@ enum RdpInput {
     /// events — layout- and IME-independent, unlike scancodes.
     Text(String),
     CtrlAltDelete,
+    ForceClipboardCheck,
 }
 
 fn rdp_input_debug(input: &RdpInput) -> serde_json::Value {
@@ -182,6 +131,7 @@ fn rdp_input_debug(input: &RdpInput) -> serde_json::Value {
             json!({ "kind": "text", "length": text.chars().count(), "text": text })
         }
         RdpInput::CtrlAltDelete => json!({ "kind": "ctrlAltDelete" }),
+        RdpInput::ForceClipboardCheck => json!({ "kind": "forceClipboardCheck" }),
     }
 }
 
@@ -201,15 +151,10 @@ pub struct StartRdpClientSessionRequest {
     desktop_width: Option<u16>,
     #[serde(default)]
     desktop_height: Option<u16>,
-    #[serde(default)]
-    socks_proxy_port: Option<u16>,
 }
 
 impl StartRdpClientSessionRequest {
-    pub fn from_kkterm_start(
-        request: crate::kkterm_rdp::types::KktermRdpStartRequest,
-        socks_proxy_port: Option<u16>,
-    ) -> Self {
+    pub fn from_kkterm_start(request: crate::kkterm_rdp::types::KktermRdpStartRequest) -> Self {
         let session_id = crate::kkterm_rdp::types::session_id_from_tab_id(&request.tab_id);
         Self {
             session_id,
@@ -221,7 +166,6 @@ impl StartRdpClientSessionRequest {
             password: Some(request.password),
             desktop_width: request.desktop_width,
             desktop_height: request.desktop_height,
-            socks_proxy_port,
         }
     }
 
@@ -238,9 +182,6 @@ impl StartRdpClientSessionRequest {
         self.desktop_height
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_RDP_HEIGHT)
-    }
-    pub fn set_socks_proxy_port(&mut self, port: Option<u16>) {
-        self.socks_proxy_port = port;
     }
 }
 
@@ -441,8 +382,6 @@ impl RdpClientSessionManager {
         let username = request.username.clone();
         let password = request.password.clone().unwrap_or_default();
         let domain = request.domain.clone();
-        let socks_proxy_port = request.socks_proxy_port;
-
         rdp_debug(
             "ironrdp.start.request",
             &rdp_client_start_debug_payload(
@@ -453,7 +392,6 @@ impl RdpClientSessionManager {
                 domain.as_deref(),
                 width,
                 height,
-                socks_proxy_port,
             ),
         );
 
@@ -474,7 +412,6 @@ impl RdpClientSessionManager {
             domain,
             width,
             height,
-            socks_proxy_port,
             cliprdr_tx,
             app.clone(),
             temp_dir_str,
@@ -573,6 +510,10 @@ impl RdpClientSessionManager {
         self.queue_input(&request.session_id, RdpInput::CtrlAltDelete)
     }
 
+    pub fn force_clipboard_check(&self, request: RdpClientSimpleRequest) -> Result<(), String> {
+        self.queue_input(&request.session_id, RdpInput::ForceClipboardCheck)
+    }
+
     pub fn close_session(&self, request: RdpClientSimpleRequest) -> Result<(), String> {
         let removed = {
             let mut sessions = self.lock_sessions()?;
@@ -648,9 +589,7 @@ fn rdp_client_start_debug_payload(
     domain: Option<&str>,
     desktop_width: u16,
     desktop_height: u16,
-    socks_proxy_port: Option<u16>,
 ) -> Value {
-    let route = choose_rdp_client_route(host, socks_proxy_port);
     json!({
         "sessionId": session_id,
         "host": host,
@@ -659,13 +598,12 @@ fn rdp_client_start_debug_payload(
         "domain": domain,
         "desktopWidth": desktop_width,
         "desktopHeight": desktop_height,
-        "route": rdp_client_route_label(route),
-        "socksProxyPort": socks_proxy_port,
+        "route": "direct",
         "security": {
             "enableCredSsp": true,
             "enableTls": false,
             "requestedProtocols": ["HYBRID", "HYBRID_EX"],
-            "legacyTlsFallbackAllowed": false,
+            "legacyTlsFallbackAllowed": true,
         },
     })
 }
@@ -735,13 +673,154 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TlsBackend {
+    Rustls,
+    NativeTls,
+}
+
+impl TlsBackend {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rustls => "rustls",
+            Self::NativeTls => "native-tls",
+        }
+    }
+}
+
+enum RdpTlsStream {
+    Rustls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    NativeTls(tokio_native_tls::TlsStream<TcpStream>),
+}
+
+impl tokio::io::AsyncRead for RdpTlsStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            Self::NativeTls(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for RdpTlsStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            Self::NativeTls(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            Self::NativeTls(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            Self::NativeTls(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
 async fn tls_upgrade(
     stream: TcpStream,
     session_id: &str,
     host: &str,
     port: u16,
     server_name: &str,
-) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+    backend: TlsBackend,
+) -> Result<RdpTlsStream, String> {
+    match backend {
+        TlsBackend::Rustls => tls_upgrade_rustls(stream, session_id, host, port, server_name).await,
+        TlsBackend::NativeTls => {
+            tls_upgrade_native(stream, session_id, host, port, server_name).await
+        }
+    }
+}
+
+async fn tls_upgrade_native(
+    stream: TcpStream,
+    session_id: &str,
+    host: &str,
+    port: u16,
+    server_name: &str,
+) -> Result<RdpTlsStream, String> {
+    use tokio_native_tls::native_tls;
+
+    rdp_debug(
+        "ironrdp.tls.start",
+        &json!({
+            "sessionId": session_id,
+            "host": host,
+            "port": port,
+            "serverName": server_name,
+            "backend": TlsBackend::NativeTls.label(),
+            "protocolVersions": ["TLS1.0", "TLS1.1", "TLS1.2"],
+            "certificateVerification": "disabled_for_rdp",
+        }),
+    );
+
+    let connector = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .min_protocol_version(Some(native_tls::Protocol::Tlsv10))
+        .build()
+        .map_err(|error| format!("TLS config error: {error}"))?;
+    let connector = tokio_native_tls::TlsConnector::from(connector);
+    match connector.connect(server_name, stream).await {
+        Ok(stream) => {
+            rdp_debug(
+                "ironrdp.tls.ok",
+                &json!({
+                    "sessionId": session_id,
+                    "host": host,
+                    "port": port,
+                    "backend": TlsBackend::NativeTls.label(),
+                }),
+            );
+            Ok(RdpTlsStream::NativeTls(stream))
+        }
+        Err(error) => {
+            let error = error_chain(&error);
+            rdp_debug(
+                "ironrdp.tls.error",
+                &json!({
+                    "sessionId": session_id,
+                    "host": host,
+                    "port": port,
+                    "backend": TlsBackend::NativeTls.label(),
+                    "error": error,
+                }),
+            );
+            Err(format!("TLS handshake failed: {error}"))
+        }
+    }
+}
+
+async fn tls_upgrade_rustls(
+    stream: TcpStream,
+    session_id: &str,
+    host: &str,
+    port: u16,
+    server_name: &str,
+) -> Result<RdpTlsStream, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let cipher_suites: Vec<String> = provider
         .cipher_suites
@@ -755,6 +834,7 @@ async fn tls_upgrade(
             "host": host,
             "port": port,
             "serverName": server_name,
+            "backend": TlsBackend::Rustls.label(),
             "protocolVersions": ["TLS1.2", "TLS1.3"],
             "cipherSuites": cipher_suites,
             "sessionResumption": false,
@@ -792,7 +872,7 @@ async fn tls_upgrade(
                     "peerCertificateCount": session.peer_certificates().map(|certs| certs.len()).unwrap_or(0),
                 }),
             );
-            Ok(tls_stream)
+            Ok(RdpTlsStream::Rustls(Box::new(tls_stream)))
         }
         Err(error) => {
             rdp_debug(
@@ -801,6 +881,7 @@ async fn tls_upgrade(
                     "sessionId": session_id,
                     "host": host,
                     "port": port,
+                    "backend": TlsBackend::Rustls.label(),
                     "error": error.to_string(),
                     "errorKind": tls_error_kind(&error),
                 }),
@@ -812,32 +893,42 @@ async fn tls_upgrade(
 
 fn extract_server_public_key(
     session_id: &str,
-    tls_stream: &tokio_rustls::client::TlsStream<TcpStream>,
+    tls_stream: &RdpTlsStream,
 ) -> Result<Vec<u8>, String> {
-    use x509_cert::der::Decode as _;
-
-    let (_, session) = tls_stream.get_ref();
-    let cert_der = session
-        .peer_certificates()
-        .and_then(|certs| certs.first())
-        .ok_or_else(|| "RDP server sent no TLS certificate".to_string())?;
-
-    let cert = x509_cert::Certificate::from_der(cert_der.as_ref())
-        .map_err(|e| format!("failed to parse server certificate: {e}"))?;
-
-    let spki_bytes = cert
-        .tbs_certificate
-        .subject_public_key_info
-        .subject_public_key
-        .as_bytes()
-        .ok_or_else(|| "server certificate subject public key is not a bitstring".to_string())?
-        .to_vec();
+    let (cert_der, peer_certificate_count) = match tls_stream {
+        RdpTlsStream::Rustls(tls_stream) => {
+            let (_, session) = tls_stream.get_ref();
+            let cert_der = session
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .ok_or_else(|| "RDP server sent no TLS certificate".to_string())?;
+            (
+                cert_der.as_ref().to_vec(),
+                session
+                    .peer_certificates()
+                    .map(|certs| certs.len())
+                    .unwrap_or(0),
+            )
+        }
+        RdpTlsStream::NativeTls(tls_stream) => {
+            let cert = tls_stream
+                .get_ref()
+                .peer_certificate()
+                .map_err(|error| format!("failed to read server certificate: {error}"))?
+                .ok_or_else(|| "RDP server sent no TLS certificate".to_string())?;
+            let cert_der = cert
+                .to_der()
+                .map_err(|error| format!("failed to encode server certificate: {error}"))?;
+            (cert_der, 1)
+        }
+    };
+    let spki_bytes = subject_public_key_from_cert_der(&cert_der)?;
 
     rdp_debug(
         "ironrdp.certificate.ok",
         &json!({
             "sessionId": session_id,
-            "peerCertificateCount": session.peer_certificates().map(|certs| certs.len()).unwrap_or(0),
+            "peerCertificateCount": peer_certificate_count,
             "subjectPublicKeyBytes": spki_bytes.len(),
         }),
     );
@@ -845,9 +936,23 @@ fn extract_server_public_key(
     Ok(spki_bytes)
 }
 
+fn subject_public_key_from_cert_der(cert_der: &[u8]) -> Result<Vec<u8>, String> {
+    use x509_cert::der::Decode as _;
+
+    let cert = x509_cert::Certificate::from_der(cert_der)
+        .map_err(|e| format!("failed to parse server certificate: {e}"))?;
+    Ok(cert
+        .tbs_certificate
+        .subject_public_key_info
+        .subject_public_key
+        .as_bytes()
+        .ok_or_else(|| "server certificate subject public key is not a bitstring".to_string())?
+        .to_vec())
+}
+
 // ── Connect helper ────────────────────────────────────────────────────────────
 
-type UpgradedFramed = ironrdp_tokio::TokioFramed<tokio_rustls::client::TlsStream<TcpStream>>;
+type UpgradedFramed = ironrdp_tokio::TokioFramed<RdpTlsStream>;
 
 /// Flatten an error and its `source()` chain into one message, so a generic
 /// top-level label (e.g. "CredSSP") surfaces the underlying reason
@@ -879,10 +984,80 @@ async fn rdp_connect(
     domain: Option<String>,
     width: u16,
     height: u16,
-    socks_proxy_port: Option<u16>,
     cliprdr_action_tx: mpsc::UnboundedSender<CliprdrAction>,
     app: AppHandle,
     cliprdr_temp_dir: String,
+) -> Result<(ironrdp::connector::ConnectionResult, UpgradedFramed), String> {
+    match rdp_connect_attempt(
+        session_id.clone(),
+        host.clone(),
+        port,
+        username.clone(),
+        password.clone(),
+        domain.clone(),
+        width,
+        height,
+        cliprdr_action_tx.clone(),
+        app.clone(),
+        cliprdr_temp_dir.clone(),
+        TlsBackend::Rustls,
+    )
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(rustls_error) if is_tls_handshake_error(&rustls_error) => {
+            rdp_debug(
+                "ironrdp.tls.fallback",
+                &json!({
+                    "sessionId": &session_id,
+                    "host": &host,
+                    "port": port,
+                    "from": TlsBackend::Rustls.label(),
+                    "to": TlsBackend::NativeTls.label(),
+                    "reason": &rustls_error,
+                }),
+            );
+            rdp_connect_attempt(
+                session_id,
+                host,
+                port,
+                username,
+                password,
+                domain,
+                width,
+                height,
+                cliprdr_action_tx,
+                app,
+                cliprdr_temp_dir,
+                TlsBackend::NativeTls,
+            )
+            .await
+            .map_err(|fallback_error| {
+                format!("{rustls_error}; legacy TLS fallback failed: {fallback_error}")
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_tls_handshake_error(error: &str) -> bool {
+    error.starts_with("TLS handshake failed:") || error.starts_with("RDP TLS handshake timed out")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rdp_connect_attempt(
+    session_id: String,
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    domain: Option<String>,
+    width: u16,
+    height: u16,
+    cliprdr_action_tx: mpsc::UnboundedSender<CliprdrAction>,
+    app: AppHandle,
+    cliprdr_temp_dir: String,
+    tls_backend: TlsBackend,
 ) -> Result<(ironrdp::connector::ConnectionResult, UpgradedFramed), String> {
     use ironrdp::connector::{
         credssp::KerberosConfig, ClientConnector, Config, Credentials, DesktopSize, ServerName,
@@ -902,8 +1077,7 @@ async fn rdp_connect(
     };
 
     // Step 1: TCP connect + create framed
-    let route = choose_rdp_client_route(&host, socks_proxy_port);
-    let route_label = rdp_client_route_label(route);
+    let route_label = "direct";
     rdp_debug(
         "ironrdp.tcp.start",
         &json!({
@@ -911,10 +1085,9 @@ async fn rdp_connect(
             "host": host,
             "port": port,
             "route": route_label,
-            "socksProxyPort": socks_proxy_port,
         }),
     );
-    let stream = match connect_rdp_transport(host.as_str(), port, route).await {
+    let stream = match connect_rdp_transport(host.as_str(), port).await {
         Ok(stream) => stream,
         Err(error) => {
             rdp_debug(
@@ -924,7 +1097,6 @@ async fn rdp_connect(
                     "host": host,
                     "port": port,
                     "route": route_label,
-                    "socksProxyPort": socks_proxy_port,
                     "error": error,
                 }),
             );
@@ -942,7 +1114,6 @@ async fn rdp_connect(
             "host": host,
             "port": port,
             "route": route_label,
-            "socksProxyPort": socks_proxy_port,
             "clientAddr": client_addr.to_string(),
             "peerAddr": peer_addr.map(|addr| addr.to_string()),
         }),
@@ -1002,7 +1173,8 @@ async fn rdp_connect(
                 "enableCredSsp": config.enable_credssp,
                 "enableTls": config.enable_tls,
                 "requestedProtocols": ["HYBRID", "HYBRID_EX"],
-                "legacyTlsFallbackAllowed": config.enable_tls,
+                "legacyTlsFallbackAllowed": true,
+                "tlsBackend": tls_backend.label(),
             },
         }),
     );
@@ -1019,9 +1191,14 @@ async fn rdp_connect(
             "port": port,
         }),
     );
-    let should_upgrade = match connect_begin(&mut framed, &mut connector).await {
-        Ok(should_upgrade) => should_upgrade,
-        Err(error) => {
+    let should_upgrade = match timeout(
+        Duration::from_secs(RDP_NEGOTIATION_TIMEOUT_SECONDS),
+        connect_begin(&mut framed, &mut connector),
+    )
+    .await
+    {
+        Ok(Ok(should_upgrade)) => should_upgrade,
+        Ok(Err(error)) => {
             let error = error_chain(&error);
             rdp_debug(
                 "ironrdp.connect_begin.error",
@@ -1033,6 +1210,22 @@ async fn rdp_connect(
                 }),
             );
             return Err(format!("RDP connect_begin failed: {error}"));
+        }
+        Err(_) => {
+            let error = "server did not respond during RDP negotiation";
+            rdp_debug(
+                "ironrdp.connect_begin.timeout",
+                &json!({
+                    "sessionId": session_id,
+                    "host": host,
+                    "port": port,
+                    "timeoutSeconds": RDP_NEGOTIATION_TIMEOUT_SECONDS,
+                    "error": error,
+                }),
+            );
+            return Err(format!(
+                "RDP connect_begin timed out after {RDP_NEGOTIATION_TIMEOUT_SECONDS}s: {error}"
+            ));
         }
     };
     rdp_debug(
@@ -1057,7 +1250,14 @@ async fn rdp_connect(
     );
 
     // Step 5: TLS upgrade
-    let tls_stream = tls_upgrade(tcp_stream, &session_id, &host, port, &host).await?;
+    let tls_stream = timeout(
+        Duration::from_secs(RDP_NEGOTIATION_TIMEOUT_SECONDS),
+        tls_upgrade(tcp_stream, &session_id, &host, port, &host, tls_backend),
+    )
+    .await
+    .map_err(|_| {
+        format!("RDP TLS handshake timed out after {RDP_NEGOTIATION_TIMEOUT_SECONDS}s")
+    })??;
 
     // Step 6: Extract server public key
     let server_public_key = extract_server_public_key(&session_id, &tls_stream)?;
@@ -1077,19 +1277,22 @@ async fn rdp_connect(
             "port": port,
         }),
     );
-    let connection_result = match connect_finalize::<_, NoopNetworkClient>(
-        upgraded,
-        connector,
-        &mut upgraded_framed,
-        &mut NoopNetworkClient,
-        ServerName::new(host.clone()),
-        server_public_key,
-        None::<KerberosConfig>,
+    let connection_result = match timeout(
+        Duration::from_secs(RDP_FINALIZE_TIMEOUT_SECONDS),
+        connect_finalize::<_, NoopNetworkClient>(
+            upgraded,
+            connector,
+            &mut upgraded_framed,
+            &mut NoopNetworkClient,
+            ServerName::new(host.clone()),
+            server_public_key,
+            None::<KerberosConfig>,
+        ),
     )
     .await
     {
-        Ok(connection_result) => connection_result,
-        Err(error) => {
+        Ok(Ok(connection_result)) => connection_result,
+        Ok(Err(error)) => {
             let error = error_chain(&error);
             rdp_debug(
                 "ironrdp.connect_finalize.error",
@@ -1101,6 +1304,22 @@ async fn rdp_connect(
                 }),
             );
             return Err(format!("RDP connect_finalize failed: {error}"));
+        }
+        Err(_) => {
+            let error = "server did not complete RDP finalization";
+            rdp_debug(
+                "ironrdp.connect_finalize.timeout",
+                &json!({
+                    "sessionId": session_id,
+                    "host": host,
+                    "port": port,
+                    "timeoutSeconds": RDP_FINALIZE_TIMEOUT_SECONDS,
+                    "error": error,
+                }),
+            );
+            return Err(format!(
+                "RDP connect_finalize timed out after {RDP_FINALIZE_TIMEOUT_SECONDS}s: {error}"
+            ));
         }
     };
     rdp_debug(
@@ -1117,23 +1336,14 @@ async fn rdp_connect(
     Ok((connection_result, upgraded_framed))
 }
 
-async fn connect_rdp_transport(
-    host: &str,
-    port: u16,
-    route: RdpClientRoute,
-) -> Result<TcpStream, String> {
-    match route {
-        RdpClientRoute::Direct => TcpStream::connect((host, port))
-            .await
-            .map_err(|error| error.to_string()),
-        RdpClientRoute::Socks5 { port: socks_port } => {
-            let socks_addr = format!("127.0.0.1:{socks_port}");
-            tokio_socks::tcp::Socks5Stream::connect(socks_addr.as_str(), (host, port))
-                .await
-                .map(|stream| stream.into_inner())
-                .map_err(|error| error.to_string())
-        }
-    }
+async fn connect_rdp_transport(host: &str, port: u16) -> Result<TcpStream, String> {
+    timeout(
+        Duration::from_secs(RDP_TCP_CONNECT_TIMEOUT_SECONDS),
+        TcpStream::connect((host, port)),
+    )
+    .await
+    .map_err(|_| format!("TCP connect timed out after {RDP_TCP_CONNECT_TIMEOUT_SECONDS}s"))?
+    .map_err(|error| error.to_string())
 }
 
 // ── Event loop ────────────────────────────────────────────────────────────────
@@ -1191,6 +1401,28 @@ fn spawn_rdp_event_loop(
                 }
                 input = input_rx.recv() => {
                     match input {
+                        Some(RdpInput::ForceClipboardCheck) => {
+                            use ironrdp::cliprdr::Client as CliprdrClient;
+                            use ironrdp::cliprdr::Cliprdr;
+
+                            if let Some(cliprdr) =
+                                active_stage.get_svc_processor_mut::<Cliprdr<CliprdrClient>>()
+                            {
+                                if let Some(backend) = cliprdr.downcast_backend_mut::<
+                                    cliprdr_module::backend::NextDeskCliprdrBackend,
+                                >() {
+                                    backend.force_local_clipboard_check().await;
+                                } else {
+                                    log::warn!(
+                                        "[cliprdr] KKTerm force check skipped: backend downcast failed"
+                                    );
+                                }
+                            } else {
+                                log::debug!(
+                                    "[cliprdr] KKTerm force check skipped: processor not ready"
+                                );
+                            }
+                        }
                         Some(rdp_input) => {
                             if let Err(e) = send_rdp_input(&mut framed, &mut input_db, &mut last_button_mask, rdp_input).await {
                                 eprintln!("[rdp {session_id}] send_rdp_input error: {e}");
@@ -1592,6 +1824,7 @@ async fn send_rdp_input(
                 Operation::KeyReleased(ctrl),
             ]);
         }
+        RdpInput::ForceClipboardCheck => return Ok(()),
     }
 
     let events = db.apply(ops);
@@ -1717,7 +1950,6 @@ mod tests {
             Some("EXAMPLE"),
             1440,
             900,
-            Some(17897),
         );
 
         assert_eq!(payload["sessionId"], "rdp-1");
@@ -1727,35 +1959,25 @@ mod tests {
         assert_eq!(payload["domain"], "EXAMPLE");
         assert_eq!(payload["desktopWidth"], 1440);
         assert_eq!(payload["desktopHeight"], 900);
-        assert_eq!(payload["route"], "socks5:17897");
-        assert_eq!(payload["socksProxyPort"], 17897);
+        assert_eq!(payload["route"], "direct");
         assert_eq!(payload["security"]["enableCredSsp"], true);
         assert_eq!(payload["security"]["enableTls"], false);
+        assert_eq!(payload["security"]["legacyTlsFallbackAllowed"], true);
         assert!(payload.get("password").is_none());
     }
 
     #[test]
-    fn chooses_socks_for_public_hosts_and_direct_for_private_hosts() {
-        assert_eq!(
-            choose_rdp_client_route("64.20.10.254", Some(17897)),
-            RdpClientRoute::Socks5 { port: 17897 }
-        );
-        assert_eq!(
-            choose_rdp_client_route("rdp.example.test", Some(17897)),
-            RdpClientRoute::Socks5 { port: 17897 }
-        );
-        assert_eq!(
-            choose_rdp_client_route("192.168.3.105", Some(17897)),
-            RdpClientRoute::Direct
-        );
-        assert_eq!(
-            choose_rdp_client_route("127.0.0.1", Some(17897)),
-            RdpClientRoute::Direct
-        );
-        assert_eq!(
-            choose_rdp_client_route("64.20.10.254", None),
-            RdpClientRoute::Direct
-        );
+    fn retries_only_tls_handshake_failures_with_legacy_backend() {
+        assert!(is_tls_handshake_error(
+            "TLS handshake failed: connection reset by peer"
+        ));
+        assert!(is_tls_handshake_error(
+            "RDP TLS handshake timed out after 15s"
+        ));
+        assert!(!is_tls_handshake_error(
+            "RDP connect_begin failed: rejected"
+        ));
+        assert!(!is_tls_handshake_error("CredSSP authentication failed"));
     }
 
     #[test]
@@ -1767,7 +1989,6 @@ mod tests {
         assert!(request.domain.is_none());
         assert_eq!(request.desktop_width(), DEFAULT_RDP_WIDTH);
         assert_eq!(request.desktop_height(), DEFAULT_RDP_HEIGHT);
-        assert_eq!(request.socks_proxy_port, None);
     }
 
     #[test]

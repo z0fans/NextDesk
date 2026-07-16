@@ -23,6 +23,9 @@ const testTranslations = {
   rdpErrAnotherUser: '已断开 — 另一用户登录了远程计算机。',
   rdpErrAdmin: '已断开 — 会话已被管理员终止。',
   rdpErrIdleTimeout: '已断开 — 会话因空闲超时已断开。',
+  rdpErrCloudAuth: '云端授权已失效，请在设置中重新授权设备。',
+  rdpErrCloudRelayUnavailable: '无法选择可用云端线路。请稍后重试，或检查目标服务器是否允许 RDP 连接。',
+  rdpErrCloudGatewayOutdated: 'Cloud Gateway 版本过旧，请更新面板插件后重试。',
 } as const;
 
 const t = (key: TranslationKey) => testTranslations[key as keyof typeof testTranslations] ?? key;
@@ -41,12 +44,21 @@ describe('isNonRecoverableRdpError', () => {
 
 describe('friendlyRdpError', () => {
   it.each([
-    'Connect failed: [TCP connect SOCKS5] custom error',
+    'Connect failed: [TCP connect direct] custom error',
     'Session error: [RDPGFX] reason: server did not negotiate AVC420/H.264',
     'IronRDP connector returned an internal transport error',
   ])('does not expose renderer or transport internals: %s', (raw) => {
     const message = friendlyRdpError(raw, t);
 
-    expect(message.toLowerCase()).not.toMatch(/socks5|rdpgfx|h\.264|h264|avc420|ironrdp/);
+    expect(message.toLowerCase()).not.toMatch(/rdpgfx|h\.264|h264|avc420|ironrdp/);
+  });
+
+  it('maps cloud candidate failures to route unavailable copy', () => {
+    expect(friendlyRdpError('cloud_all_candidates_failed', t)).toBe(testTranslations.rdpErrCloudRelayUnavailable);
+    expect(friendlyRdpError('candidate_apply_timeout', t)).toBe(testTranslations.rdpErrCloudRelayUnavailable);
+  });
+
+  it('maps unsupported prepare API to gateway outdated copy', () => {
+    expect(friendlyRdpError('cloud_prepare_unsupported', t)).toBe(testTranslations.rdpErrCloudGatewayOutdated);
   });
 });

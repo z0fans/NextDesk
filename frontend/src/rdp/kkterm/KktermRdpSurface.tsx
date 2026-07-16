@@ -1,9 +1,12 @@
 import { listen } from '@tauri-apps/api/event';
 import { readText as readClipboardText } from '@tauri-apps/plugin-clipboard-manager';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import type { ServerEntry } from '@/lib/rdp-types';
+import type { ConnectionRoute } from '@/api';
 import { cn } from '@/lib/utils';
+import { rdpLog } from '@/lib/rdp-logger';
 import {
+  cloudKeepBindingAlive,
   kktermRdpCtrlAltDelete,
   kktermRdpDisconnect,
   kktermRdpKey,
@@ -18,6 +21,9 @@ import './styles.css';
 const LEFT_WINDOWS_SCANCODE = 0xe05b;
 const LEFT_CONTROL_SCANCODE = 0x1d;
 const KKTERM_KEYBOARD_MODE_STORAGE_KEY = 'nextdesk_kkterm_keyboard_mode';
+const KKTERM_CONNECT_FEEDBACK_TIMEOUT_MS = 45_000;
+const KKTERM_START_RETRY_DELAYS_MS = [800, 1_600, 2_800, 5_000] as const;
+const CLOUD_BINDING_KEEPALIVE_INTERVAL_MS = 25_000;
 
 const MAC_EDITING_SHORTCUT_SCANCODES: Readonly<Record<string, number>> = {
   KeyA: 0x1e,
@@ -67,9 +73,11 @@ type KktermRdpSurfaceProps = {
   winSignal?: number;
   textSignal?: KktermTextSignal | null;
   desktopSize?: { width: number; height: number } | null;
+  reuseCloudBinding?: boolean;
   onConnected: (tabId: string, width?: number, height?: number) => void;
   onDisconnected: (tabId: string) => void;
   onError: (tabId: string, message: string) => void;
+  onRouteSelected?: (tabId: string, routeLabel: ConnectionRoute) => void;
   onCanvasRef?: (tabId: string, canvas: HTMLCanvasElement | null) => void;
 };
 
@@ -84,6 +92,32 @@ function base64ToBytes(base64: string): Uint8Array {
 
 function isTauriRuntime() {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise(resolve => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+function isRetryableKktermStartupError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('429')
+    || lower.includes('too many requests')
+    || lower.includes('cloud prepare')
+    || lower.includes('cloud_route_not_ready')
+    || lower.includes('not enough bytes')
+    || lower.includes('close_notify')
+    || lower.includes('peer closed')
+    || lower.includes('connection refused')
+    || lower.includes('connection reset')
+    || lower.includes('disconnected before')
+    || lower.includes('timed out')
+    || lower.includes('timeout')
+    || lower.includes('tls')
+    || lower.includes('ssl')
+  );
 }
 
 function parseKeyboardMode(value: unknown): KktermKeyboardMode | null {
@@ -144,9 +178,11 @@ export function KktermRdpSurface({
   winSignal = 0,
   textSignal = null,
   desktopSize,
+  reuseCloudBinding = false,
   onConnected,
   onDisconnected,
   onError,
+  onRouteSelected,
   onCanvasRef,
 }: KktermRdpSurfaceProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -156,18 +192,59 @@ export function KktermRdpSurface({
   const sessionIdRef = useRef<string | null>(null);
   const buttonMaskRef = useRef(0);
   const composingRef = useRef(false);
-  const callbacksRef = useRef({ onConnected, onDisconnected, onError });
+  const callbacksRef = useRef({ onConnected, onDisconnected, onError, onRouteSelected });
   const lastCadSignalRef = useRef(cadSignal);
   const lastWinSignalRef = useRef(winSignal);
   const lastTextSignalSequenceRef = useRef(textSignal?.sequence ?? 0);
   const suppressedShortcutKeyupsRef = useRef(new Set<string>());
   const pressedRemoteScancodesRef = useRef(new Map<string, number>());
   const keySendQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const [status, setStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
-  const [errorMessage, setErrorMessage] = useState('');
+  const activeRef = useRef(active);
 
-  callbacksRef.current = { onConnected, onDisconnected, onError };
-  keyboardModeRef.current = keyboardMode;
+  const focusKeyboardTarget = () => {
+    // The hidden input is also the keyboard target in scancode mode. This keeps
+    // physical-key forwarding intact while allowing macOS IME composition.
+    inputRef.current?.focus({ preventScroll: true });
+  };
+
+  const focusKeyboardTargetSoon = () => {
+    if (typeof window === 'undefined') return;
+    window.setTimeout(() => {
+      if (!activeRef.current) return;
+      focusKeyboardTarget();
+    }, 0);
+  };
+
+  useEffect(() => {
+    callbacksRef.current = { onConnected, onDisconnected, onError, onRouteSelected };
+  }, [onConnected, onDisconnected, onError, onRouteSelected]);
+
+  useEffect(() => {
+    keyboardModeRef.current = keyboardMode;
+  }, [keyboardMode]);
+
+  useEffect(() => {
+    activeRef.current = active;
+    if (active) {
+      focusKeyboardTargetSoon();
+    }
+  }, [active]);
+
+  useEffect(() => {
+    if (!active) return;
+    const refocus = () => focusKeyboardTargetSoon();
+    const refocusWhenVisible = () => {
+      if (!document.hidden) {
+        focusKeyboardTargetSoon();
+      }
+    };
+    window.addEventListener('focus', refocus);
+    document.addEventListener('visibilitychange', refocusWhenVisible);
+    return () => {
+      window.removeEventListener('focus', refocus);
+      document.removeEventListener('visibilitychange', refocusWhenVisible);
+    };
+  }, [active]);
 
   useEffect(() => {
     if (!isTauriRuntime()) {
@@ -175,6 +252,8 @@ export function KktermRdpSurface({
     }
 
     let disposed = false;
+    let connectFinished = false;
+    let timedOut = false;
     let unlisten: (() => void) | undefined;
     const sessionId = createRdpSessionId(tabId);
     const desktopWidth = desktopSize?.width && desktopSize.width > 0
@@ -185,8 +264,115 @@ export function KktermRdpSurface({
       : undefined;
 
     sessionIdRef.current = sessionId;
-    setStatus('connecting');
-    setErrorMessage('');
+
+    const clearConnectTimeout = () => {
+      window.clearTimeout(connectTimeout);
+    };
+    const failIfStillConnecting = () => {
+      if (disposed || connectFinished || timedOut) {
+        return;
+      }
+      timedOut = true;
+      callbacksRef.current.onError(
+        tabId,
+        'RDP connection timed out before the remote server responded',
+      );
+      void kktermRdpDisconnect({ tabId }).catch(() => undefined);
+    };
+    const connectTimeout = window.setTimeout(
+      failIfStillConnecting,
+      KKTERM_CONNECT_FEEDBACK_TIMEOUT_MS,
+    );
+    let hasConnected = false;
+    let keepaliveTimer: ReturnType<typeof window.setInterval> | undefined;
+    let startupRetryIndex = 0;
+    let startupRetrying = false;
+
+    const runCloudKeepalive = () => {
+      if (disposed) return;
+      void cloudKeepBindingAlive({ sessionId: tabId, host: server.host, port: server.port }).catch(error => {
+        rdpLog.warn('cloud', 'binding keepalive failed', {
+          tabId,
+          host: server.host,
+          port: server.port,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    };
+
+    const startCloudKeepalive = () => {
+      if (keepaliveTimer !== undefined) return;
+      runCloudKeepalive();
+      keepaliveTimer = window.setInterval(runCloudKeepalive, CLOUD_BINDING_KEEPALIVE_INTERVAL_MS);
+    };
+
+    const nextStartupRetryDelay = () => {
+      const delay = KKTERM_START_RETRY_DELAYS_MS[startupRetryIndex];
+      if (delay === undefined) return null;
+      startupRetryIndex += 1;
+      return delay;
+    };
+
+    const failWithMessage = (message: string) => {
+      if (disposed || connectFinished || timedOut) return;
+      connectFinished = true;
+      clearConnectTimeout();
+      callbacksRef.current.onError(tabId, message);
+    };
+
+    const startSession = async () => {
+      while (!disposed && !connectFinished && !timedOut) {
+        try {
+          const response = await kktermRdpStart({
+            tabId,
+            host: server.host,
+            port: server.port,
+            username: server.username,
+            password: server.password,
+            ...(server.domain ? { domain: server.domain } : {}),
+            ...(desktopWidth ? { desktopWidth } : {}),
+            ...(desktopHeight ? { desktopHeight } : {}),
+            scaleFactor: window.devicePixelRatio || 1,
+            reuseCloudBinding,
+          });
+          if (response?.routeLabel) {
+            callbacksRef.current.onRouteSelected?.(tabId, response.routeLabel);
+          }
+          startCloudKeepalive();
+          focusKeyboardTargetSoon();
+          return;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const delay = nextStartupRetryDelay();
+          if (delay === null || !isRetryableKktermStartupError(message)) {
+            failWithMessage(message);
+            return;
+          }
+          await kktermRdpDisconnect({ tabId }).catch(() => undefined);
+          await sleepMs(delay);
+        }
+      }
+    };
+
+    const retryEarlyStartupEvent = (message: string) => {
+      if (disposed || connectFinished || timedOut || hasConnected || startupRetrying) {
+        return false;
+      }
+      const delay = nextStartupRetryDelay();
+      if (delay === null || !isRetryableKktermStartupError(message)) {
+        return false;
+      }
+      startupRetrying = true;
+      void (async () => {
+        await kktermRdpDisconnect({ tabId }).catch(() => undefined);
+        await sleepMs(delay);
+        startupRetrying = false;
+        if (!disposed && !connectFinished && !timedOut) {
+          void startSession();
+        }
+      })();
+      return true;
+    };
 
     const draw = (event: KktermCanvasEvent) => {
       const canvas = canvasRef.current;
@@ -218,25 +404,43 @@ export function KktermRdpSurface({
     };
 
     void listen<KktermCanvasEvent>('kkterm-rdp-canvas-event', event => {
-      if (disposed || event.payload.sessionId !== sessionIdRef.current) {
+      if (disposed || timedOut || event.payload.sessionId !== sessionIdRef.current) {
         return;
       }
       const payload = event.payload;
       switch (payload.kind) {
         case 'connected':
-          setStatus('connected');
+          hasConnected = true;
+          connectFinished = true;
+          clearConnectTimeout();
+          startCloudKeepalive();
+          focusKeyboardTargetSoon();
           callbacksRef.current.onConnected(tabId);
           break;
         case 'error':
-          setErrorMessage(payload.message);
-          setStatus('disconnected');
+          if (retryEarlyStartupEvent(payload.message)) {
+            break;
+          }
+          connectFinished = true;
+          clearConnectTimeout();
           callbacksRef.current.onError(tabId, payload.message);
           break;
         case 'disconnected':
-          setStatus('disconnected');
+          if (retryEarlyStartupEvent('RDP disconnected before the remote desktop became ready')) {
+            break;
+          }
+          connectFinished = true;
+          clearConnectTimeout();
           callbacksRef.current.onDisconnected(tabId);
           break;
         default:
+          if (payload.kind === 'resolution') {
+            hasConnected = true;
+            connectFinished = true;
+            clearConnectTimeout();
+            startCloudKeepalive();
+            focusKeyboardTargetSoon();
+          }
           draw(payload);
       }
     }).then(dispose => {
@@ -247,32 +451,14 @@ export function KktermRdpSurface({
       unlisten = dispose;
     });
 
-    void kktermRdpStart({
-      tabId,
-      host: server.host,
-      port: server.port,
-      username: server.username,
-      password: server.password,
-      ...(server.domain ? { domain: server.domain } : {}),
-      ...(desktopWidth ? { desktopWidth } : {}),
-      ...(desktopHeight ? { desktopHeight } : {}),
-    })
-      .then(() => {
-        if (!disposed) {
-          setStatus('connected');
-        }
-      })
-      .catch(error => {
-        if (!disposed) {
-          const message = error instanceof Error ? error.message : String(error);
-          setErrorMessage(message);
-          setStatus('disconnected');
-          callbacksRef.current.onError(tabId, message);
-        }
-      });
+    void startSession();
 
     return () => {
       disposed = true;
+      clearConnectTimeout();
+      if (keepaliveTimer !== undefined) {
+        window.clearInterval(keepaliveTimer);
+      }
       unlisten?.();
       void kktermRdpDisconnect({ tabId }).catch(() => undefined);
       sessionIdRef.current = null;
@@ -286,6 +472,7 @@ export function KktermRdpSurface({
     server.port,
     server.username,
     tabId,
+    reuseCloudBinding,
   ]);
 
   useEffect(() => {
@@ -306,6 +493,17 @@ export function KktermRdpSurface({
     const x = Math.max(0, Math.min(canvas.width - 1, Math.round(((clientX - rect.left) / rect.width) * canvas.width)));
     const y = Math.max(0, Math.min(canvas.height - 1, Math.round(((clientY - rect.top) / rect.height) * canvas.height)));
     return { x, y };
+  };
+
+  const positionImeTarget = (clientX: number, clientY: number) => {
+    const canvas = canvasRef.current;
+    const input = inputRef.current;
+    if (!canvas || !input) return;
+    const rect = canvas.getBoundingClientRect();
+    const left = Math.max(8, Math.min(rect.width - 8, clientX - rect.left));
+    const top = Math.max(8, Math.min(rect.height - 8, clientY - rect.top));
+    input.style.left = `${Math.round(left)}px`;
+    input.style.top = `${Math.round(top)}px`;
   };
 
   const sendPointer = (clientX: number, clientY: number, buttonMask: number) => {
@@ -343,13 +541,15 @@ export function KktermRdpSurface({
     return scancodeForCode(e.code);
   };
 
-  const focusKeyboardTarget = () => {
-    if (keyboardModeRef.current === 'remote-scancode') {
-      canvasRef.current?.focus({ preventScroll: true });
-      return;
-    }
-    inputRef.current?.focus({ preventScroll: true });
-  };
+  const isImeKeyboardEvent = (
+    e: React.KeyboardEvent<HTMLInputElement | HTMLCanvasElement>,
+  ) => (
+    composingRef.current
+    || e.nativeEvent.isComposing
+    || e.nativeEvent.keyCode === 229
+    || e.key === 'Process'
+    || e.key === 'Dead'
+  );
 
   const sendCtrlShortcut = (scancode: number) => {
     sendScancode(LEFT_CONTROL_SCANCODE, true);
@@ -417,6 +617,22 @@ export function KktermRdpSurface({
     return false;
   };
 
+  const handleCtrlAltEnd = (e: React.KeyboardEvent<HTMLInputElement | HTMLCanvasElement>) => {
+    if (!e.ctrlKey || !e.altKey || e.metaKey || e.code !== 'End') {
+      return false;
+    }
+    e.preventDefault();
+    const releasedModifierCodes = releasePressedRemoteKeys(
+      'ControlLeft',
+      'ControlRight',
+      'AltLeft',
+      'AltRight',
+    );
+    suppressShortcutKeyups('End', ...releasedModifierCodes);
+    sendCtrlAltDelete();
+    return true;
+  };
+
   const suppressLocalMetaKey = (e: React.KeyboardEvent<HTMLInputElement | HTMLCanvasElement>) => {
     if (!isMetaCode(e.code) || !e.metaKey || e.ctrlKey || e.altKey) {
       return false;
@@ -441,10 +657,14 @@ export function KktermRdpSurface({
       sendScancode(scancode, false);
     }
     pressedRemoteScancodesRef.current.clear();
+    suppressedShortcutKeyupsRef.current.clear();
   };
 
   const setCanvasRef = (node: HTMLCanvasElement | null) => {
     canvasRef.current = node;
+    if (node && activeRef.current) {
+      focusKeyboardTargetSoon();
+    }
   };
 
   const onPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -453,6 +673,7 @@ export function KktermRdpSurface({
 
   const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     e.preventDefault();
+    positionImeTarget(e.clientX, e.clientY);
     focusKeyboardTarget();
     const bit = e.button === 1 ? 1 : e.button === 2 ? 2 : e.button === 0 ? 0 : -1;
     if (bit >= 0) {
@@ -475,7 +696,10 @@ export function KktermRdpSurface({
   };
 
   const sendCtrlAltDelete = () => {
-    void kktermRdpCtrlAltDelete({ tabId }).catch(() => undefined);
+    keySendQueueRef.current = keySendQueueRef.current
+      .catch(() => undefined)
+      .then(() => kktermRdpCtrlAltDelete({ tabId }))
+      .catch(() => undefined);
     focusKeyboardTarget();
   };
 
@@ -512,12 +736,7 @@ export function KktermRdpSurface({
   });
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (keyboardMode !== 'kkterm-text') {
-      e.preventDefault();
-      if (inputRef.current) {
-        inputRef.current.value = '';
-      }
-      focusKeyboardTarget();
+    if (handleCtrlAltEnd(e)) {
       return;
     }
     if (suppressLocalMetaKey(e)) {
@@ -526,7 +745,17 @@ export function KktermRdpSurface({
     if (handleMacShortcut(e)) {
       return;
     }
-    if (composingRef.current || e.key === 'Process' || e.key === 'Dead') {
+    if (isImeKeyboardEvent(e)) {
+      return;
+    }
+    if (keyboardMode === 'remote-scancode') {
+      const scancode = scancodeForRemoteKeyboardEvent(e);
+      if (scancode !== undefined) {
+        e.preventDefault();
+        if (inputRef.current) inputRef.current.value = '';
+        rememberRemoteKeyDown(e.code, scancode);
+        sendScancode(scancode, true);
+      }
       return;
     }
     const shortcut = e.ctrlKey || e.altKey || e.metaKey;
@@ -547,16 +776,19 @@ export function KktermRdpSurface({
   };
 
   const onKeyUp = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (keyboardMode !== 'kkterm-text') {
-      e.preventDefault();
-      focusKeyboardTarget();
-      return;
-    }
     if (suppressedShortcutKeyupsRef.current.delete(e.code)) {
       e.preventDefault();
       return;
     }
-    if (composingRef.current || e.key === 'Process' || e.key === 'Dead') {
+    if (isImeKeyboardEvent(e)) {
+      return;
+    }
+    if (keyboardMode === 'remote-scancode') {
+      const scancode = takeRemoteKeyUpScancode(e.code) ?? scancodeForRemoteKeyboardEvent(e);
+      if (scancode !== undefined) {
+        e.preventDefault();
+        sendScancode(scancode, false);
+      }
       return;
     }
     const shortcut = e.ctrlKey || e.altKey || e.metaKey;
@@ -573,19 +805,10 @@ export function KktermRdpSurface({
   };
 
   const onCompositionStart = () => {
-    if (keyboardMode !== 'kkterm-text') {
-      return;
-    }
     composingRef.current = true;
   };
 
   const onCompositionEnd = (e: React.CompositionEvent<HTMLInputElement>) => {
-    if (keyboardMode !== 'kkterm-text') {
-      if (inputRef.current) {
-        inputRef.current.value = '';
-      }
-      return;
-    }
     composingRef.current = false;
     if (e.data) {
       sendText(e.data);
@@ -596,17 +819,11 @@ export function KktermRdpSurface({
   };
 
   const onInput = (e: React.FormEvent<HTMLInputElement>) => {
-    if (keyboardMode !== 'kkterm-text') {
-      if (inputRef.current) {
-        inputRef.current.value = '';
-      }
-      return;
-    }
     if (composingRef.current) {
       return;
     }
     const native = e.nativeEvent as InputEvent;
-    if (native.inputType === 'insertText' && native.data) {
+    if (keyboardMode === 'kkterm-text' && native.inputType === 'insertText' && native.data) {
       sendText(native.data);
     }
     if (inputRef.current) {
@@ -618,13 +835,16 @@ export function KktermRdpSurface({
     if (keyboardMode !== 'remote-scancode') {
       return;
     }
+    if (handleCtrlAltEnd(e)) {
+      return;
+    }
     if (suppressLocalMetaKey(e)) {
       return;
     }
     if (handleMacShortcut(e)) {
       return;
     }
-    if (e.key === 'Dead') {
+    if (isImeKeyboardEvent(e)) {
       return;
     }
     const scancode = scancodeForRemoteKeyboardEvent(e);
@@ -643,6 +863,9 @@ export function KktermRdpSurface({
       e.preventDefault();
       return;
     }
+    if (isImeKeyboardEvent(e)) {
+      return;
+    }
     const scancode = takeRemoteKeyUpScancode(e.code) ?? scancodeForRemoteKeyboardEvent(e);
     if (scancode !== undefined) {
       e.preventDefault();
@@ -650,20 +873,13 @@ export function KktermRdpSurface({
     }
   };
 
-  const statusText =
-    status === 'connecting'
-      ? `正在连接 ${server.host}...`
-      : status === 'disconnected'
-        ? '已断开连接'
-        : '';
-
   return (
     <div className={cn(active ? 'absolute inset-0' : 'hidden')}>
       <div className="rdp-canvas-view" onPointerDown={focusKeyboardTarget}>
         <canvas
           ref={setCanvasRef}
           className="rdp-canvas-surface"
-          tabIndex={keyboardMode === 'remote-scancode' ? 0 : -1}
+          tabIndex={-1}
           onPointerMove={onPointerMove}
           onPointerDown={onPointerDown}
           onPointerUp={onPointerUp}
@@ -681,21 +897,18 @@ export function KktermRdpSurface({
           autoComplete="off"
           autoCapitalize="off"
           autoCorrect="off"
-          inputMode="none"
-          tabIndex={keyboardMode === 'kkterm-text' ? 0 : -1}
+          inputMode="text"
+          tabIndex={0}
           spellCheck={false}
+          style={{ left: 8, top: 8 }}
           onKeyDown={onKeyDown}
           onKeyUp={onKeyUp}
           onInput={onInput}
           onCompositionStart={onCompositionStart}
           onCompositionUpdate={onCompositionStart}
           onCompositionEnd={onCompositionEnd}
+          onBlur={releaseAllRemoteKeys}
         />
-        {(statusText || errorMessage) && (
-          <div className="rdp-canvas-status rdp-canvas-status-blackout">
-            {errorMessage || statusText}
-          </div>
-        )}
       </div>
     </div>
   );

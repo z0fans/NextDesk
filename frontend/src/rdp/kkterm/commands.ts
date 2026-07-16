@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import type { ConnectionRoute } from '@/api';
 
 export type KktermRdpStartRequest = {
   tabId: string;
@@ -10,15 +11,20 @@ export type KktermRdpStartRequest = {
   desktopWidth?: number;
   desktopHeight?: number;
   remoteResolution?: string;
+  redirectDrives?: boolean;
+  useMultimon?: boolean;
   x?: number;
   y?: number;
   width?: number;
   height?: number;
+  scaleFactor?: number;
+  reuseCloudBinding?: boolean;
 };
 
 export type KktermRdpStartResponse = {
   tabId: string;
   sessionId?: string;
+  routeLabel: ConnectionRoute;
 };
 
 export type KktermRdpClipRect = {
@@ -60,6 +66,12 @@ export type KktermRdpTextRequest = {
 
 export type KktermRdpSimpleRequest = {
   tabId: string;
+};
+
+export type CloudBindingKeepaliveRequest = {
+  sessionId: string;
+  host: string;
+  port: number;
 };
 
 export type KktermRdpStatusResponse = {
@@ -109,6 +121,18 @@ export function kktermRdpCtrlAltDelete(request: KktermRdpSimpleRequest) {
   return invoke<void>('kkterm_rdp_ctrl_alt_delete', { request });
 }
 
+export function kktermRdpSetActiveClipboardSession(tabId: string | null) {
+  return invoke<void>('kkterm_rdp_set_active_clipboard_session', { tabId });
+}
+
+export function kktermRdpForceClipboardCheck(request: KktermRdpSimpleRequest) {
+  return invoke<void>('kkterm_rdp_force_clipboard_check', { request });
+}
+
 export function kktermRdpDisconnect(request: KktermRdpSimpleRequest) {
   return invoke<void>('kkterm_rdp_disconnect', { request });
+}
+
+export function cloudKeepBindingAlive(request: CloudBindingKeepaliveRequest) {
+  return invoke<void>('cloud_keep_binding_alive', request);
 }

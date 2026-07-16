@@ -1,12 +1,12 @@
 {
   "productName": "NextDesk",
-  "version": "1.0.123",
+  "version": "1.0.124",
   "identifier": "cc.yougotme.nextdesk",
   "build": {
     "frontendDist": "../frontend/dist",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "cd frontend && npm run dev",
-    "beforeBuildCommand": "node scripts/download-geodata.mjs && cd frontend && npm run build"
+    "beforeBuildCommand": "cd frontend && npm run build"
   },
   "app": {
     "windows": [
@@ -33,11 +33,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": {
-      "../.backend/bin/Country.mmdb": "bin/Country.mmdb",
-      "../.backend/bin/geoip.metadb": "bin/geoip.metadb",
-      "../.backend/bin/geosite.dat": "bin/geosite.dat"
-    },
     "macOS": {
       "entitlements": "Entitlements.plist"
     },
@@ -59,6 +54,11 @@
       ],
       "windows": {
         "installMode": "passive"
+      }
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": ["nextdesk", "ndesk"]
       }
     }
   }

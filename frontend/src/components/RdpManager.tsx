@@ -6,19 +6,22 @@ import { RdpSidebar } from './RdpSidebar';
 import { RdpTabBar } from './RdpTabBar';
 import { RdpGridView } from './RdpGridView';
 import { NewConnectionDialog } from './NewConnectionDialog';
+import { RdpConnectionOverlay } from './RdpConnectionOverlay';
 import { KktermRdpSurface } from '@/rdp/kkterm/KktermRdpSurface';
 import {
   kktermRdpCtrlAltDelete,
   kktermRdpDisconnect,
+  kktermRdpForceClipboardCheck,
   kktermRdpKey,
   kktermRdpSetBounds,
+  kktermRdpSetActiveClipboardSession,
   kktermRdpStart,
   kktermRdpStatus,
   kktermRdpSyncDisplaySize,
   kktermRdpText,
   type KktermRdpBoundsRequest,
 } from '@/rdp/kkterm/commands';
-import { useSessionStore } from '@/lib/useSessionStore';
+import type { SessionStore } from '@/lib/useSessionStore';
 import { Monitor } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
@@ -57,6 +60,15 @@ import {
 import { GfxSurfaceCompositor } from '@/rdp/gfx-compositor';
 import { describeOfficialWebGfxFallback, type OfficialWebGfxFallbackInput } from '@/rdp/gfx-fallback';
 import {
+  planKktermLocalScaling,
+  supportsKktermLocalScaling,
+} from '@/rdp/resolution-modes';
+import {
+  MAX_RECONNECT_ATTEMPTS,
+  canRetryReconnect,
+  reconnectDelayMs,
+} from '@/rdp/reconnect-policy';
+import {
   applyIronRdpCliprdrFileCallbacks,
   applyIronRdpDisplayControlExtension,
   applyIronRdpGfxH264Callback,
@@ -74,7 +86,7 @@ const USE_NATIVE_RDP = isNativeRdpMode(RDP_ENGINE_MODE);
 const USE_NATIVE_DRIFT_RDP = isNativeDriftRdpMode(RDP_ENGINE_MODE);
 if (USE_NATIVE_RDP) {
   rdpLog.warn(
-    'native',
+    'rdp',
     USE_NATIVE_DRIFT_RDP
       ? 'Native RDP engine is running in native-drift canvas mode'
       : 'Native RDP engine is running in experimental mode',
@@ -88,6 +100,8 @@ const OFFICIAL_WEB_FEATURES = resolveOfficialWebFeatureFlags((storageKey, envKey
   return readRdpRuntimeEnvFlag(envKey);
 });
 const ADAPTIVE_RESIZE_DEBOUNCE_MS = 800;
+const KKTERM_MACOS_ADAPTIVE_RESIZE_DEBOUNCE_MS = 1_800;
+const KKTERM_WINDOWS_BOUNDS_THROTTLE_MS = 33;
 const ADAPTIVE_RESIZE_THRESHOLD_PX = 20;
 const NATIVE_CONNECT_RESIZE_COOLDOWN_MS = 2500;
 const PUBLIC_NATIVE_ADAPTIVE_SETTLE_MS = 20_000;
@@ -96,11 +110,30 @@ const CANVAS_SIZE_DEBUG_LOG_MS = 5000;
 const PUBLIC_NATIVE_MAX_DESKTOP_WIDTH = 1920;
 const PUBLIC_NATIVE_MAX_DESKTOP_HEIGHT = 1080;
 const CLIPBOARD_POLL_INPUT_IDLE_MS = 2000;
+const CLOUD_BINDING_KEEPALIVE_INTERVAL_MS = 25_000;
 const ENABLE_RDP_FRAME_DIAGNOSTICS = parseRdpBooleanFlag(
   readRdpRuntimeStorageFlag('nextdesk_rdp_frame_diagnostics') ??
   readRdpRuntimeEnvFlag('VITE_NEXTDESK_RDP_FRAME_DIAGNOSTICS'),
   false,
 );
+const KKTERM_WINDOWS_REDIRECT_DRIVES = parseRdpBooleanFlag(
+  readRdpRuntimeStorageFlag('nextdesk_kkterm_redirect_drives') ??
+  readRdpRuntimeEnvFlag('VITE_NEXTDESK_KKTERM_REDIRECT_DRIVES'),
+  false,
+);
+const KKTERM_WINDOWS_USE_MULTIMON = parseRdpBooleanFlag(
+  readRdpRuntimeStorageFlag('nextdesk_kkterm_use_multimon') ??
+  readRdpRuntimeEnvFlag('VITE_NEXTDESK_KKTERM_USE_MULTIMON'),
+  false,
+);
+const ENABLE_KKTERM_WINDOWS_FKEY_QA = import.meta.env.DEV && parseRdpBooleanFlag(
+  readRdpRuntimeEnvFlag('VITE_NEXTDESK_KKTERM_QA_FKEYS'),
+  false,
+);
+const KKTERM_WINDOWS_FKEY_SCANCODES = [
+  0x003b, 0x003c, 0x003d, 0x003e, 0x003f, 0x0040,
+  0x0041, 0x0042, 0x0043, 0x0044, 0x0057, 0x0058,
+] as const;
 
 function detectKktermCopyPlatform(): 'windows' | 'macos' | 'other' {
   if (typeof navigator === 'undefined') return 'other';
@@ -144,7 +177,7 @@ async function waitForKktermWindowsDisplay(
   for (let attempt = 1; attempt <= 60; attempt += 1) {
     try {
       const display = await kktermRdpSyncDisplaySize(bounds);
-      rdpLog.info('native', 'kkterm-rdp ActiveX display sync poll', {
+      rdpLog.info('rdp', 'kkterm-rdp ActiveX display sync poll', {
         attemptId,
         tabId,
         attempt,
@@ -161,7 +194,7 @@ async function waitForKktermWindowsDisplay(
         };
       }
       if (attempt === 60 && display.displaySynced) {
-        rdpLog.warn('native', 'kkterm-rdp ActiveX display revealed while still establishing', {
+        rdpLog.warn('rdp', 'kkterm-rdp ActiveX display revealed while still establishing', {
           attemptId,
           tabId,
           connectionState: display.connectionState,
@@ -177,7 +210,7 @@ async function waitForKktermWindowsDisplay(
       lastError = error instanceof Error ? error.message : String(error);
       try {
         const status = await kktermRdpStatus({ tabId });
-        rdpLog.info('native', 'kkterm-rdp ActiveX status poll', {
+        rdpLog.info('rdp', 'kkterm-rdp ActiveX status poll', {
           attemptId,
           tabId,
           attempt,
@@ -351,7 +384,7 @@ function installRdpConsoleBridge() {
       if (shouldForward(msg)) {
         bridgeActive = true;
         try {
-          rdpLog[level]('wasm', msg);
+          rdpLog[level]('rdp', msg);
         } finally {
           bridgeActive = false;
         }
@@ -518,9 +551,7 @@ let wasmModule: IronRdpWasm | null = null;
 let wasmReady = false;
 async function loadWasm(): Promise<IronRdpWasm> {
   if (wasmModule && wasmReady) return wasmModule;
-  // @ts-ignore
   const mod = await import('../wasm/ironrdp_web.js');
-  // @ts-ignore
   const url = new URL('../wasm/ironrdp_web_bg.wasm', import.meta.url).href;
   await mod.default(url);
   mod.setup(resolveRdpWasmLogLevel({
@@ -536,18 +567,25 @@ async function loadWasm(): Promise<IronRdpWasm> {
 export function RdpManager({
   onMainSidebarCollapse,
   isRdpViewVisible = true,
+  store,
 }: {
   onMainSidebarCollapse?: () => void;
   isRdpViewVisible?: boolean;
-} = {}) {
+  store: SessionStore;
+}) {
   const { t } = useTranslation();
-  const store = useSessionStore();
   const [rdpStats, setRdpStats] = useState({ resolution: '', fps: 0, status: 'idle' as string });
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [driveRedirectionEnabled, setDriveRedirectionEnabled] = useState(KKTERM_WINDOWS_REDIRECT_DRIVES);
+  const [multiMonitorEnabled, setMultiMonitorEnabled] = useState(KKTERM_WINDOWS_USE_MULTIMON);
   const [kktermRdpCadSignalByTab, setKktermRdpCadSignalByTab] = useState<Record<string, number>>({});
   const [kktermRdpTextSignalByTab, setKktermRdpTextSignalByTab] = useState<Record<string, KktermRdpTextSignal>>({});
   const [kktermRdpWinSignalByTab, setKktermRdpWinSignalByTab] = useState<Record<string, number>>({});
-  const [kktermRdpRestartNonce, setKktermRdpRestartNonce] = useState<Record<string, number>>({});
-  const [kktermRdpDesktopSize, setKktermRdpDesktopSize] = useState<Record<string, KktermRdpDesktopSize>>({});
+  const [kktermRdpLaunch, setKktermRdpLaunch] = useState<Record<string, {
+    nonce: number;
+    desktopSize: KktermRdpDesktopSize;
+    reuseCloudBinding: boolean;
+  }>>({});
   const [kktermOverlayBackdropRects, setKktermOverlayBackdropRects] = useState<Record<string, KktermRdpClipRect>>({});
   const [hasClipboardFolder, setHasClipboardFolder] = useState(false);
   const [macClipboardStrategy, setMacClipboardStrategy] = useState<'session-file-url' | 'pasteboard-promise'>('session-file-url');
@@ -562,7 +600,10 @@ export function RdpManager({
   const canvasSizeLogRef = useRef({ w: 0, h: 0, loggedAt: 0 });
   // Resolution mode: 'adaptive' or '1920x1080' etc.
   const RESOLUTION_PRESETS = [
-    { label: '自适应', value: 'adaptive' },
+    { label: t('rdpAuto'), value: 'adaptive' },
+    ...(USE_KKTERM_COPY_RDP && supportsKktermLocalScaling(KKTERM_COPY_PLATFORM)
+      ? [{ label: t('rdpLocalScaling'), value: 'smartSizing' }]
+      : []),
     { label: '1920×1080', value: '1920x1080' },
     { label: '1600×900', value: '1600x900' },
     { label: '1440×900', value: '1440x900' },
@@ -575,6 +616,16 @@ export function RdpManager({
   const [showNewConn, setShowNewConn] = useState(false);
   const [editServerId, setEditServerId] = useState<string | null>(null);
   const [proxyPort, setProxyPort] = useState(0);
+
+  useEffect(() => {
+    const handleNewConnectionRequest = () => {
+      setEditServerId(null);
+      setShowNewConn(true);
+    };
+
+    window.addEventListener('nextdesk-new-connection', handleNewConnectionRequest);
+    return () => window.removeEventListener('nextdesk-new-connection', handleNewConnectionRequest);
+  }, []);
 
 
 
@@ -608,7 +659,7 @@ export function RdpManager({
 
   const ensureH264Worker = useCallback((tabId: string): Worker | null => {
     if (typeof VideoDecoder === 'undefined') {
-      rdpLog.warn('render', 'WebCodecs not available, native GFX H.264 disabled');
+      rdpLog.warn('display', 'WebCodecs not available, native GFX H.264 disabled');
       return null;
     }
     if (decodeWorkerRef.current) return decodeWorkerRef.current;
@@ -633,13 +684,13 @@ export function RdpManager({
           }
           frame.close();
         } else if (msg.type === 'error') {
-          rdpLog.warn('render', 'h264 worker error', { message: msg.message });
+          rdpLog.warn('display', 'h264 worker error', { message: msg.message });
         }
       };
 
       return worker;
     } catch (e) {
-      rdpLog.warn('render', 'Worker creation failed, native GFX H.264 disabled', { error: String(e) });
+      rdpLog.warn('display', 'Worker creation failed, native GFX H.264 disabled', { error: String(e) });
       decodeWorkerRef.current = null;
       return null;
     }
@@ -649,6 +700,10 @@ export function RdpManager({
   const nativeViewBoundsRafRef = useRef<number | null>(null);
   const nativeViewLastBoundsRef = useRef<string>('');
   const kktermViewBoundsRafRef = useRef<number | null>(null);
+  const kktermViewBoundsThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const kktermScaleDisplaySyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const kktermViewBoundsPendingReasonRef = useRef('state');
+  const kktermViewBoundsLastSyncAtRef = useRef(0);
   const kktermViewLastBoundsByTabRef = useRef<Map<string, string>>(new Map());
   const kktermOverlayClipRectsRef = useRef<Map<string, KktermRdpClipRect>>(new Map());
   const kktermPostConnectSettleTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>[]>>(new Map());
@@ -657,14 +712,16 @@ export function RdpManager({
   const tabsRef = useRef(store.tabs);
   const lastSizeRef = useRef({ w: 0, h: 0 });
   const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const performAdaptiveResizeRef = useRef<(reason: string) => void>(() => undefined);
   const resizeCooldownRef = useRef(false); // suppress adaptive resize after connect
+  const driveRedirectionEnabledRef = useRef(KKTERM_WINDOWS_REDIRECT_DRIVES);
+  const multiMonitorEnabledRef = useRef(KKTERM_WINDOWS_USE_MULTIMON);
   // When user picks a fixed resolution, store it here for reconnect
   const desiredSizeRef = useRef<{ w: number; h: number } | null>(null);
   const connectSessionRef = useRef<(tabId: string) => void>(null);
   // Auto-reconnect state
   const reconnectCountRef = useRef<Map<string, number>>(new Map());
   const reconnectTimerRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
-  const MAX_RECONNECT_ATTEMPTS = 5;
   const userDisconnectedRef = useRef<Set<string>>(new Set());
   const connectingTabsRef = useRef<Set<string>>(new Set());
   const advertisedClipboardRef = useRef<Map<string, AdvertisedClipboardSnapshot>>(new Map());
@@ -690,6 +747,41 @@ export function RdpManager({
 
   // Ref to track which tabs are connected via native backend
   const nativeTabsRef = useRef<Set<string>>(new Set());
+  const cloudKeepaliveTimersRef = useRef<Map<string, ReturnType<typeof window.setInterval>>>(new Map());
+
+  const stopCloudKeepalive = useCallback((tabId: string) => {
+    const timer = cloudKeepaliveTimersRef.current.get(tabId);
+    if (timer !== undefined) {
+      window.clearInterval(timer);
+      cloudKeepaliveTimersRef.current.delete(tabId);
+    }
+  }, []);
+
+  const startCloudKeepalive = useCallback((tabId: string, host: string, port: number) => {
+    stopCloudKeepalive(tabId);
+    const renew = () => {
+      void api.cloudKeepBindingAlive(tabId, host, port).catch(error => {
+        rdpLog.warn('cloud', 'binding keepalive failed', {
+          tabId,
+          host,
+          port,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    };
+    renew();
+    cloudKeepaliveTimersRef.current.set(
+      tabId,
+      window.setInterval(renew, CLOUD_BINDING_KEEPALIVE_INTERVAL_MS),
+    );
+  }, [stopCloudKeepalive]);
+
+  useEffect(() => () => {
+    for (const timer of cloudKeepaliveTimersRef.current.values()) {
+      window.clearInterval(timer);
+    }
+    cloudKeepaliveTimersRef.current.clear();
+  }, []);
   const kktermTabsRef = useRef<Set<string>>(new Set());
   const attemptIdsRef = useRef<Map<string, string>>(new Map());
   const nativeFrameCleanupByTabRef = useRef<Map<string, () => void>>(new Map());
@@ -716,7 +808,7 @@ export function RdpManager({
     try {
       cleanup();
     } catch (error) {
-      rdpLog.warn('render', 'native frame websocket cleanup failed', {
+      rdpLog.warn('display', 'native frame websocket cleanup failed', {
         tabId,
         error: error instanceof Error ? error.message : String(error),
       });
@@ -778,16 +870,17 @@ export function RdpManager({
     if (nativeResolutionByTabRef.current.get(tabId) === resolution) return;
     nativeResolutionByTabRef.current.set(tabId, resolution);
     if (!isNativeTabRenderable(tabId)) return;
-    rdpLog.info('render', `native resolution updated (${source}): ${w} x ${h}`);
+    rdpLog.info('display', `native resolution updated (${source}): ${w} x ${h}`);
     setRdpStats(prev => (prev.resolution === resolution ? prev : { ...prev, resolution }));
   }, [isNativeTabRenderable]);
 
   const markNativeTabConnected = useCallback((tabId: string, source: string) => {
     const current = tabsRef.current.find(t => t.id === tabId);
     if (current?.status !== 'connected' || !nativeTabsRef.current.has(tabId)) {
-      rdpLog.info('native', 'mark native tab connected', { tabId, source });
+      rdpLog.info('rdp', 'mark native tab connected', { tabId, source });
     }
     store.updateTabStatus(tabId, 'connected');
+    reconnectCountRef.current.delete(tabId);
     setRdpStats(prev => ({ ...prev, status: 'connected' }));
     nativeTabsRef.current.add(tabId);
     nativeConnectedAtByTabRef.current.set(tabId, Date.now());
@@ -808,8 +901,58 @@ export function RdpManager({
     }, NATIVE_CONNECT_RESIZE_COOLDOWN_MS);
   }, [store]);
 
+  const scheduleReconnect = useCallback((tabId: string, reason: string) => {
+    if (userDisconnectedRef.current.has(tabId)) {
+      return;
+    }
+    if (reconnectTimerRef.current.has(tabId)) {
+      return;
+    }
+    const count = (reconnectCountRef.current.get(tabId) || 0) + 1;
+    if (!canRetryReconnect(count)) {
+      reconnectCountRef.current.delete(tabId);
+      rdpLog.warn('rdp', `reconnect: gave up after ${MAX_RECONNECT_ATTEMPTS} attempts`, {
+        tabId,
+        reason,
+      });
+      store.updateTabStatus(tabId, 'error', t('rdpReconnectFailed', {
+        max: String(MAX_RECONNECT_ATTEMPTS),
+      }));
+      return;
+    }
+    reconnectCountRef.current.set(tabId, count);
+    const delay = reconnectDelayMs(count);
+    rdpLog.info('rdp', `reconnect #${count}/${MAX_RECONNECT_ATTEMPTS} in ${delay}ms`, {
+      tabId,
+      reason,
+    });
+    store.updateTabStatus(tabId, 'reconnecting', t('rdpReconnectingCount', {
+      count: String(count),
+      max: String(MAX_RECONNECT_ATTEMPTS),
+    }));
+
+    const timer = setTimeout(() => {
+      reconnectTimerRef.current.delete(tabId);
+      const tab = tabsRef.current.find(item => item.id === tabId);
+      if (!tab || userDisconnectedRef.current.has(tabId)) {
+        reconnectCountRef.current.delete(tabId);
+        return;
+      }
+      connectSessionRef.current?.(tabId);
+    }, delay);
+    reconnectTimerRef.current.set(tabId, timer);
+  }, [store, t]);
+
   const markKktermTabConnected = useCallback((tabId: string, width?: number, height?: number) => {
     kktermTabsRef.current.add(tabId);
+    connectingTabsRef.current.delete(tabId);
+    const reconnectTimer = reconnectTimerRef.current.get(tabId);
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimerRef.current.delete(tabId);
+    }
+    reconnectCountRef.current.delete(tabId);
+    rdpLog.info('rdp', 'kkterm-rdp connected', { tabId, width, height });
     store.updateTabStatus(tabId, 'connected');
     setRdpStats(prev => ({
       ...prev,
@@ -822,23 +965,32 @@ export function RdpManager({
   }, [store]);
 
   const handleKktermDisconnected = useCallback((tabId: string) => {
+    const userDisconnected = userDisconnectedRef.current.has(tabId);
+    rdpLog.warn('rdp', 'kkterm-rdp disconnected', { tabId, userDisconnected });
+    connectingTabsRef.current.delete(tabId);
     kktermTabsRef.current.delete(tabId);
     kktermViewLastBoundsByTabRef.current.delete(tabId);
     stopFpsCounter(tabId);
-    if (userDisconnectedRef.current.has(tabId)) {
+    if (userDisconnected) {
       store.updateTabStatus(tabId, 'disconnected');
       return;
     }
-    store.updateTabStatus(tabId, 'disconnected');
-  }, [store, stopFpsCounter]);
+    scheduleReconnect(tabId, 'disconnected');
+  }, [scheduleReconnect, store, stopFpsCounter]);
 
   const handleKktermError = useCallback((tabId: string, message: string) => {
+    rdpLog.error('rdp', 'kkterm-rdp error', { tabId, message });
+    connectingTabsRef.current.delete(tabId);
     kktermTabsRef.current.delete(tabId);
     kktermViewLastBoundsByTabRef.current.delete(tabId);
     stopFpsCounter(tabId);
+    if (!userDisconnectedRef.current.has(tabId) && !isNonRecoverableRdpError(message)) {
+      scheduleReconnect(tabId, message);
+      return;
+    }
     store.updateTabStatus(tabId, 'error', friendlyRdpError(message, t));
     setRdpStats(prev => ({ ...prev, status: 'error' }));
-  }, [store, stopFpsCounter, t]);
+  }, [scheduleReconnect, store, stopFpsCounter, t]);
 
   const handleKktermCanvasRef = useCallback((tabId: string, canvas: HTMLCanvasElement | null) => {
     if (canvas) {
@@ -864,7 +1016,7 @@ export function RdpManager({
     : null;
 
   const handleNativeStatus = useCallback((tabId: string, status: string, message?: string) => {
-    rdpLog.info('native', `status event: ${status}`, { tabId, message });
+    rdpLog.info('rdp', `status event: ${status}`, { tabId, message });
     if (status === 'connected') {
       markNativeTabConnected(tabId, 'status-event');
     } else if (status === 'disconnected') {
@@ -878,7 +1030,7 @@ export function RdpManager({
       } else {
         if (isNonRecoverableRdpError(message ?? '')) {
           reconnectCountRef.current.delete(tabId);
-          rdpLog.warn('native', 'non-recoverable disconnect; auto-reconnect suppressed', {
+          rdpLog.warn('rdp', 'non-recoverable disconnect; auto-reconnect suppressed', {
             tabId,
             message,
           });
@@ -886,18 +1038,7 @@ export function RdpManager({
           return;
         }
 
-        // Auto-reconnect
-        store.updateTabStatus(tabId, 'reconnecting');
-        const count = reconnectCountRef.current.get(tabId) ?? 0;
-        if (count < MAX_RECONNECT_ATTEMPTS) {
-          reconnectCountRef.current.set(tabId, count + 1);
-          const delay = Math.min(1000 * (count + 1), 5000);
-          const timer = setTimeout(() => {
-            reconnectTimerRef.current.delete(tabId);
-            connectSessionRef.current?.(tabId);
-          }, delay);
-          reconnectTimerRef.current.set(tabId, timer);
-        }
+        scheduleReconnect(tabId, message ?? 'disconnected');
       }
     } else if (status === 'error') {
       nativeTabsRef.current.delete(tabId);
@@ -905,10 +1046,17 @@ export function RdpManager({
       forgetNativeResizeState(tabId);
       stopFpsCounter(tabId);
       cleanupH264Worker(tabId);
-      store.updateTabStatus(tabId, 'error', friendlyRdpError(message ?? '', t));
-      rdpLog.error('native', `session error: ${message}`, { tabId });
+      rdpLog.error('rdp', `session error: ${message}`, { tabId });
+      if (userDisconnectedRef.current.has(tabId)) {
+        store.updateTabStatus(tabId, 'disconnected');
+      } else if (isNonRecoverableRdpError(message ?? '')) {
+        reconnectCountRef.current.delete(tabId);
+        store.updateTabStatus(tabId, 'error', friendlyRdpError(message ?? '', t));
+      } else {
+        scheduleReconnect(tabId, message ?? 'native session error');
+      }
     }
-  }, [store, cleanupH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, markNativeTabConnected, stopFpsCounter, t]);
+  }, [store, cleanupH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, markNativeTabConnected, scheduleReconnect, stopFpsCounter, t]);
 
   useNativeRdp({
     tabId: USE_NATIVE_RDP ? store.activeTabId : null,
@@ -927,7 +1075,7 @@ export function RdpManager({
         })
         .catch(error => {
           setProxyPort(0);
-          rdpLog.error('connection', 'rdp proxy port unavailable', {
+          rdpLog.error('rdp', 'rdp proxy port unavailable', {
             error: error instanceof Error ? error.message : String(error),
           });
         });
@@ -944,7 +1092,7 @@ export function RdpManager({
         try {
           cleanup();
         } catch (error) {
-          rdpLog.warn('render', 'native frame websocket cleanup failed during unmount', {
+          rdpLog.warn('display', 'native frame websocket cleanup failed during unmount', {
             tabId,
             error: error instanceof Error ? error.message : String(error),
           });
@@ -1017,10 +1165,10 @@ export function RdpManager({
     const last = canvasSizeLogRef.current;
     if (w !== last.w || h !== last.h || now - last.loggedAt >= CANVAS_SIZE_DEBUG_LOG_MS) {
       canvasSizeLogRef.current = { w, h, loggedAt: now };
-      rdpLog.debug('render', `getCanvasSize: ${w} x ${h}`);
+      rdpLog.debug('display', `getCanvasSize: ${w} x ${h}`);
     }
     if ((w <= 0 || h <= 0) && lastSizeRef.current.w > 0 && lastSizeRef.current.h > 0) {
-      rdpLog.warn('render', 'getCanvasSize returned empty layout; using last known size', {
+      rdpLog.warn('display', 'getCanvasSize returned empty layout; using last known size', {
         raw: { w, h },
         fallback: lastSizeRef.current,
       });
@@ -1065,7 +1213,7 @@ export function RdpManager({
       if (key !== lastKey) {
         lastKey = key;
         stableSince = now;
-        rdpLog.debug('connection', 'kkterm.rdp.layout.observed', {
+        rdpLog.debug('rdp', 'kkterm.rdp.layout.observed', {
           attemptId,
           tabId,
           frame,
@@ -1082,7 +1230,7 @@ export function RdpManager({
       const fillsRightEdge = bounds.rightGap <= 2;
       const stableForMs = now - stableSince;
       if (sizeReady && fillsRightEdge && stableForMs >= 48) {
-        rdpLog.info('connection', 'kkterm.rdp.layout.ready', {
+        rdpLog.info('rdp', 'kkterm.rdp.layout.ready', {
           attemptId,
           tabId,
           frame,
@@ -1097,7 +1245,7 @@ export function RdpManager({
     }
 
     if (latest) {
-      rdpLog.warn('connection', 'kkterm.rdp.layout.ready timeout; using latest bounds', {
+      rdpLog.warn('rdp', 'kkterm.rdp.layout.ready timeout; using latest bounds', {
         attemptId,
         tabId,
         waitMs: Math.round(performance.now() - startedAt),
@@ -1116,7 +1264,7 @@ export function RdpManager({
       : { source: 'wrapper', ...getCanvasSize() };
     const width = Math.max(320, Math.round(selected.w));
     const height = Math.max(240, Math.round(selected.h));
-    rdpLog.info('connection', 'kkterm.rdp.size.selected', {
+    rdpLog.info('rdp', 'kkterm.rdp.size.selected', {
       attemptId,
       tabId,
       source: selected.source,
@@ -1153,7 +1301,7 @@ export function RdpManager({
     nativeViewLastBoundsRef.current = key;
 
     api.rdpNativeSetViewBounds(tabId, bounds).catch(error => {
-      rdpLog.warn('native', 'native view bounds sync failed', {
+      rdpLog.warn('rdp', 'native view bounds sync failed', {
         tabId,
         reason,
         error: error instanceof Error ? error.message : String(error),
@@ -1235,7 +1383,7 @@ export function RdpManager({
       kktermViewLastBoundsByTabRef.current.set(tabId, key);
 
       kktermRdpSetBounds(bounds).catch(error => {
-        rdpLog.warn('native', 'kkterm-rdp ActiveX bounds sync failed', {
+        rdpLog.warn('rdp', 'kkterm-rdp ActiveX bounds sync failed', {
           tabId,
           reason,
           visible: bounds.visible,
@@ -1247,16 +1395,46 @@ export function RdpManager({
 
   const scheduleKktermViewBoundsSync = useCallback((reason: string) => {
     if (!USE_KKTERM_COPY_WINDOWS) return;
-    if (kktermViewBoundsRafRef.current !== null) {
-      cancelAnimationFrame(kktermViewBoundsRafRef.current);
+    kktermViewBoundsPendingReasonRef.current = reason;
+
+    const queueAnimationFrame = () => {
+      if (kktermViewBoundsRafRef.current !== null) return;
+      kktermViewBoundsRafRef.current = requestAnimationFrame(() => {
+        kktermViewBoundsRafRef.current = null;
+        kktermViewBoundsLastSyncAtRef.current = performance.now();
+        syncKktermViewBounds(kktermViewBoundsPendingReasonRef.current);
+      });
+    };
+
+    const continuousLayoutChange =
+      reason === 'observer'
+      || reason === 'window resize'
+      || reason === 'window moved'
+      || reason === 'tauri window resized';
+    if (!continuousLayoutChange) {
+      if (kktermViewBoundsThrottleTimerRef.current) {
+        clearTimeout(kktermViewBoundsThrottleTimerRef.current);
+        kktermViewBoundsThrottleTimerRef.current = null;
+      }
+      queueAnimationFrame();
+      return;
     }
-    kktermViewBoundsRafRef.current = requestAnimationFrame(() => {
-      kktermViewBoundsRafRef.current = null;
-      syncKktermViewBounds(reason);
-    });
+
+    const elapsed = performance.now() - kktermViewBoundsLastSyncAtRef.current;
+    const remaining = KKTERM_WINDOWS_BOUNDS_THROTTLE_MS - elapsed;
+    if (remaining <= 0) {
+      queueAnimationFrame();
+      return;
+    }
+    if (kktermViewBoundsThrottleTimerRef.current) return;
+    kktermViewBoundsThrottleTimerRef.current = setTimeout(() => {
+      kktermViewBoundsThrottleTimerRef.current = null;
+      queueAnimationFrame();
+    }, remaining);
   }, [syncKktermViewBounds]);
 
   const handleKktermOverlayClipRectChange = useCallback((id: string, open: boolean, rect?: KktermRdpClipRect) => {
+    const existing = kktermOverlayClipRectsRef.current.get(id);
     if (open && rect) {
       const clippedRect = {
         x: Math.max(0, rect.x),
@@ -1264,20 +1442,30 @@ export function RdpManager({
         width: Math.max(1, rect.width),
         height: Math.max(1, rect.height),
       };
+      if (
+        existing
+        && existing.x === clippedRect.x
+        && existing.y === clippedRect.y
+        && existing.width === clippedRect.width
+        && existing.height === clippedRect.height
+      ) {
+        return;
+      }
       kktermOverlayClipRectsRef.current.set(id, clippedRect);
       setKktermOverlayBackdropRects(prev => ({ ...prev, [id]: clippedRect }));
-      rdpLog.info('native', 'kkterm-rdp ActiveX overlay clip open', {
+      rdpLog.info('rdp', 'kkterm-rdp ActiveX overlay clip open', {
         id,
         ...clippedRect,
       });
     } else {
+      if (!existing) return;
       kktermOverlayClipRectsRef.current.delete(id);
       setKktermOverlayBackdropRects(prev => {
         const next = { ...prev };
         delete next[id];
         return next;
       });
-      rdpLog.info('native', 'kkterm-rdp ActiveX overlay clip close', { id });
+      rdpLog.info('rdp', 'kkterm-rdp ActiveX overlay clip close', { id });
     }
     if (!USE_KKTERM_COPY_WINDOWS) return;
     kktermViewLastBoundsByTabRef.current.clear();
@@ -1294,7 +1482,7 @@ export function RdpManager({
     if (!bounds) return;
 
     kktermViewLastBoundsByTabRef.current.delete(tabId);
-    rdpLog.info('native', 'kkterm-rdp ActiveX forced bounds settle', {
+    rdpLog.info('rdp', 'kkterm-rdp ActiveX forced bounds settle', {
       tabId,
       reason,
       x: bounds.x,
@@ -1307,7 +1495,7 @@ export function RdpManager({
     try {
       await kktermRdpSetBounds(bounds);
     } catch (error) {
-      rdpLog.warn('native', 'kkterm-rdp ActiveX forced bounds settle failed', {
+      rdpLog.warn('rdp', 'kkterm-rdp ActiveX forced bounds settle failed', {
         tabId,
         reason,
         error: error instanceof Error ? error.message : String(error),
@@ -1322,7 +1510,11 @@ export function RdpManager({
     existing?.forEach(timer => clearTimeout(timer));
 
     const timers: ReturnType<typeof setTimeout>[] = [];
-    [0, 120, 360, 900, 1600].forEach(delay => {
+    // The regular connected-state sync reveals the control immediately. One
+    // late correction is enough after the connected poll succeeds. The
+    // previous five forced SetWindowPos/clip passes kept repainting the native
+    // surface for 1.6 seconds and made the resolution page appear to stutter.
+    [500].forEach(delay => {
       timers.push(setTimeout(() => {
         void forceKktermWindowsVisibleBoundsSync(tabId, `post-connect settle ${delay}ms ${attemptId}`);
       }, delay));
@@ -1331,7 +1523,7 @@ export function RdpManager({
       if (kktermPostConnectSettleTimersRef.current.get(tabId) === timers) {
         kktermPostConnectSettleTimersRef.current.delete(tabId);
       }
-    }, 1800));
+    }, 700));
 
     kktermPostConnectSettleTimersRef.current.set(tabId, timers);
   }, [forceKktermWindowsVisibleBoundsSync]);
@@ -1383,6 +1575,29 @@ export function RdpManager({
   }, [store.activeTabId, store.viewMode, isRdpViewVisible, forceNativeClipboardCheck]);
 
   useEffect(() => {
+    if (!USE_KKTERM_COPY_MACOS) return;
+    const tabId = store.activeTabId;
+    kktermRdpSetActiveClipboardSession(tabId)
+      .then(() => {
+        if (
+          tabId
+          && isRdpViewVisible
+          && store.viewMode === 'tab'
+          && store.activeTab?.status === 'connected'
+        ) {
+          return kktermRdpForceClipboardCheck({ tabId });
+        }
+        return undefined;
+      })
+      .catch(error => {
+        rdpLog.debug('clipboard', 'KKTerm active clipboard session update failed', {
+          tabId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+  }, [store.activeTabId, store.activeTab?.status, store.viewMode, isRdpViewVisible]);
+
+  useEffect(() => {
     forceNativeClipboardCheck('active tab');
   }, [store.activeTabId, store.viewMode, store.activeTab?.status, isRdpViewVisible, forceNativeClipboardCheck]);
 
@@ -1400,16 +1615,17 @@ export function RdpManager({
       : () => {
           const tabId = activeTabIdRef.current;
           if (!tabId || !kktermTabsRef.current.has(tabId)) {
-            rdpLog.warn('native', 'kkterm-copy virtual Win key skipped; no active Windows session', { tabId });
+            rdpLog.warn('rdp', 'kkterm-copy virtual Win key skipped; no active Windows session', { tabId });
             return;
           }
-          rdpLog.info('native', 'kkterm-copy virtual Win key requested', { tabId });
+          rdpLog.info('rdp', 'kkterm-copy virtual Win key requested', { tabId });
           kktermRdpKey({ tabId, scancode: 0xe05b, down: true })
+            .then(() => kktermRdpKey({ tabId, scancode: 0xe05b, down: false }))
             .then(() => {
-              rdpLog.info('native', 'kkterm-copy virtual Win key sent', { tabId });
+              rdpLog.info('rdp', 'kkterm-copy virtual Win key sent', { tabId });
             })
             .catch(error => {
-              rdpLog.warn('native', 'kkterm-copy virtual Win key failed', {
+              rdpLog.warn('rdp', 'kkterm-copy virtual Win key failed', {
                 tabId,
                 error: error instanceof Error ? error.message : String(error),
               });
@@ -1427,16 +1643,16 @@ export function RdpManager({
       : () => {
           const tabId = activeTabIdRef.current;
           if (!tabId || !kktermTabsRef.current.has(tabId)) {
-            rdpLog.warn('native', 'kkterm-copy Ctrl+Alt+Del skipped; no active Windows session', { tabId });
+            rdpLog.warn('rdp', 'kkterm-copy Ctrl+Alt+Del skipped; no active Windows session', { tabId });
             return;
           }
-          rdpLog.info('native', 'kkterm-copy Ctrl+Alt+Del requested', { tabId });
+          rdpLog.info('rdp', 'kkterm-copy Ctrl+Alt+Del requested', { tabId });
           kktermRdpCtrlAltDelete({ tabId })
             .then(() => {
-              rdpLog.info('native', 'kkterm-copy Ctrl+Alt+Del sent', { tabId });
+              rdpLog.info('rdp', 'kkterm-copy Ctrl+Alt+Del sent', { tabId });
             })
             .catch(error => {
-              rdpLog.warn('native', 'kkterm-copy Ctrl+Alt+Del failed', {
+              rdpLog.warn('rdp', 'kkterm-copy Ctrl+Alt+Del failed', {
                 tabId,
                 error: error instanceof Error ? error.message : String(error),
               });
@@ -1538,7 +1754,7 @@ export function RdpManager({
           }
         })
         .catch(error => {
-          rdpLog.debug('native', 'kkterm-rdp ActiveX window listener registration failed', {
+          rdpLog.debug('rdp', 'kkterm-rdp ActiveX window listener registration failed', {
             error: error instanceof Error ? error.message : String(error),
           });
         });
@@ -1546,7 +1762,38 @@ export function RdpManager({
     const appWindow = getCurrentWindow();
     registerWindowListener(appWindow.onMoved(() => forceBoundsSync('window moved')));
     registerWindowListener(appWindow.onResized(() => forceBoundsSync('tauri window resized')));
-    registerWindowListener(appWindow.onScaleChanged(() => forceBoundsSync('window scale changed')));
+    registerWindowListener(appWindow.onScaleChanged(() => {
+      forceBoundsSync('window scale changed');
+      if (kktermScaleDisplaySyncTimerRef.current) {
+        clearTimeout(kktermScaleDisplaySyncTimerRef.current);
+      }
+      kktermScaleDisplaySyncTimerRef.current = setTimeout(() => {
+        kktermScaleDisplaySyncTimerRef.current = null;
+        if (resModeRef.current !== 'adaptive') return;
+        const tabId = activeTabIdRef.current;
+        const tab = tabsRef.current.find(item => item.id === tabId);
+        if (!tabId || tab?.status !== 'connected' || !kktermTabsRef.current.has(tabId)) return;
+        const bounds = buildKktermVisibleBounds(tabId);
+        if (!bounds) return;
+        const startedAt = performance.now();
+        kktermRdpSyncDisplaySize(bounds).then(display => {
+          rdpLog.info('display', 'window scale change display synchronized', {
+            tabId,
+            scaleFactor: bounds.scaleFactor,
+            desktopWidth: display.desktopWidth,
+            desktopHeight: display.desktopHeight,
+            displaySynced: display.displaySynced,
+            elapsedMs: Math.round(performance.now() - startedAt),
+          });
+        }).catch(error => {
+          rdpLog.warn('display', 'window scale change display synchronization failed', {
+            tabId,
+            scaleFactor: bounds.scaleFactor,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }, 250);
+    }));
 
     return () => {
       active = false;
@@ -1558,8 +1805,16 @@ export function RdpManager({
         cancelAnimationFrame(kktermViewBoundsRafRef.current);
         kktermViewBoundsRafRef.current = null;
       }
+      if (kktermViewBoundsThrottleTimerRef.current) {
+        clearTimeout(kktermViewBoundsThrottleTimerRef.current);
+        kktermViewBoundsThrottleTimerRef.current = null;
+      }
+      if (kktermScaleDisplaySyncTimerRef.current) {
+        clearTimeout(kktermScaleDisplaySyncTimerRef.current);
+        kktermScaleDisplaySyncTimerRef.current = null;
+      }
     };
-  }, [store.activeTabId, scheduleKktermViewBoundsSync]);
+  }, [buildKktermVisibleBounds, store.activeTabId, scheduleKktermViewBoundsSync]);
 
   // ── Suppress adaptive resize when sidebar collapses/expands ──
   useEffect(() => {
@@ -1567,17 +1822,21 @@ export function RdpManager({
     if (prevSidebarOpenRef.current === store.sidebarOpen) return;
     prevSidebarOpenRef.current = store.sidebarOpen;
 
-    // Activate resize cooldown to prevent ResizeObserver from triggering reconnect
+    // Ignore intermediate animation frames, then issue one final Windows
+    // display sync after the sidebar transition settles.
     resizeCooldownRef.current = true;
 
-    // After sidebar transition animation completes (~300ms), update lastSizeRef
-    // to the new canvas size so future genuine resizes are measured correctly
+    // After the transition animation completes (~300ms), synchronize the
+    // automatic ActiveX desktop once. Other engines keep their historical
+    // suppression behavior to avoid an unnecessary reconnect.
     const timer = setTimeout(() => {
-      const cur = getCanvasSize();
-      if (cur.w > 0 && cur.h > 0) {
-        lastSizeRef.current = { w: cur.w, h: cur.h };
-      }
       resizeCooldownRef.current = false;
+      if (USE_KKTERM_COPY_WINDOWS && resModeRef.current === 'adaptive') {
+        performAdaptiveResizeRef.current('sidebar transition');
+        return;
+      }
+      const cur = getCanvasSize();
+      if (cur.w > 0 && cur.h > 0) lastSizeRef.current = { w: cur.w, h: cur.h };
     }, 500);
 
     return () => clearTimeout(timer);
@@ -1594,14 +1853,18 @@ export function RdpManager({
       for (const entry of entries) {
         const isVisible = entry.isIntersecting;
         if (isVisible && wasHidden) {
-          // Transitioning hidden → visible: suppress resize-triggered reconnect
+          // Transitioning hidden → visible: ignore intermediate layout frames,
+          // then synchronize a Windows automatic desktop once if its viewport
+          // changed while hidden.
           resizeCooldownRef.current = true;
           setTimeout(() => {
-            const cur = getCanvasSize();
-            if (cur.w > 0 && cur.h > 0) {
-              lastSizeRef.current = { w: cur.w, h: cur.h };
-            }
             resizeCooldownRef.current = false;
+            if (USE_KKTERM_COPY_WINDOWS && resModeRef.current === 'adaptive') {
+              performAdaptiveResizeRef.current('view restored');
+              return;
+            }
+            const cur = getCanvasSize();
+            if (cur.w > 0 && cur.h > 0) lastSizeRef.current = { w: cur.w, h: cur.h };
           }, 500);
         }
         wasHidden = !isVisible;
@@ -1615,37 +1878,41 @@ export function RdpManager({
   // ── Connect to server ──
   const connectSession = useCallback(async (tabId: string) => {
     if (connectingTabsRef.current.has(tabId)) {
-      rdpLog.warn('connection', 'connectSession skipped: local connect lock active', { tabId });
+      rdpLog.warn('rdp', 'connectSession skipped: local connect lock active', { tabId });
       return;
     }
     const tab = store.tabs.find(t => t.id === tabId);
     if (!tab) return;
     // Guard: prevent double-connection
     if (tab.status === 'connecting' || tab.status === 'connected') {
-      rdpLog.warn('connection', `connectSession skipped: already ${tab.status}`, { tabId });
+      rdpLog.warn('rdp', `connectSession skipped: already ${tab.status}`, { tabId });
       return;
     }
     if (sessionRefs.current.has(tabId)) {
-      rdpLog.warn('connection', 'connectSession skipped: session already exists', { tabId });
+      rdpLog.warn('rdp', 'connectSession skipped: session already exists', { tabId });
       return;
     }
     const server = store.getServerById(tab.serverId);
     if (!server) return;
+    connectingTabsRef.current.add(tabId);
+    store.updateTabRoute(tabId, undefined);
     const attemptId = createAttemptId(tabId);
+    const reuseCloudBinding = false;
     attemptIdsRef.current.set(tabId, attemptId);
-    rdpLog.info('connection', 'connect.start', {
+    rdpLog.info('rdp', 'connect.start', {
       attemptId,
       tabId,
       host: server.host,
       port: server.port,
       renderer: RDP_ENGINE_MODE,
       status: tab.status,
+      reuseCloudBinding,
     });
 
     if (USE_KKTERM_COPY_MACOS) {
       await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())));
       const desktopSize = selectKktermRdpDesktopSize(attemptId, tabId);
-      rdpLog.warn('connection', 'Using opt-in KKTerm RDP path', {
+      rdpLog.warn('rdp', 'Using opt-in KKTerm RDP path', {
         attemptId,
         tabId,
         platform: KKTERM_COPY_PLATFORM,
@@ -1653,20 +1920,19 @@ export function RdpManager({
         desktopHeight: desktopSize.height,
       });
       kktermTabsRef.current.add(tabId);
-      setKktermRdpDesktopSize(prev => ({
+      setKktermRdpLaunch(prev => ({
         ...prev,
-        [tabId]: desktopSize,
-      }));
-      setKktermRdpRestartNonce(prev => ({
-        ...prev,
-        [tabId]: (prev[tabId] ?? 0) + 1,
+        [tabId]: {
+          nonce: (prev[tabId]?.nonce ?? 0) + 1,
+          desktopSize,
+          reuseCloudBinding,
+        },
       }));
       store.updateTabStatus(tabId, 'connecting');
       setRdpStats(prev => ({ ...prev, status: 'connecting' }));
       return;
     }
 
-    connectingTabsRef.current.add(tabId);
     // Keep 'reconnecting' UI during auto-reconnect instead of flashing back to 'Connecting to...'
     if (tab.status !== 'reconnecting') {
       store.updateTabStatus(tabId, 'connecting');
@@ -1687,7 +1953,7 @@ export function RdpManager({
       if (desiredDesktopSize) {
         w = desiredDesktopSize.w;
         h = desiredDesktopSize.h;
-        rdpLog.info('connection', 'layout.size.selected', {
+        rdpLog.info('rdp', 'layout.size.selected', {
           attemptId,
           tabId,
           source: 'desired',
@@ -1697,7 +1963,7 @@ export function RdpManager({
       } else if (kktermStableLayoutBounds) {
         w = Math.floor(kktermStableLayoutBounds.width);
         h = Math.floor(kktermStableLayoutBounds.height);
-        rdpLog.info('connection', 'layout.size.selected', {
+        rdpLog.info('rdp', 'layout.size.selected', {
           attemptId,
           tabId,
           source: 'stable-wrapper',
@@ -1707,7 +1973,7 @@ export function RdpManager({
       } else {
         const cs = getCanvasSize();
         w = cs.w; h = cs.h;
-        rdpLog.info('connection', 'layout.size.selected', {
+        rdpLog.info('rdp', 'layout.size.selected', {
           attemptId,
           tabId,
           source: 'wrapper',
@@ -1718,7 +1984,7 @@ export function RdpManager({
       if (USE_NATIVE_RDP) {
         const normalized = normalizeNativeDesktopSizeForHost(w, h, server.host);
         if (normalized.w !== w || normalized.h !== h) {
-          rdpLog.info('render', 'native connect size normalized', {
+          rdpLog.info('display', 'native connect size normalized', {
             requested: { w, h },
             normalized: { w: normalized.w, h: normalized.h },
             host: server.host,
@@ -1749,7 +2015,7 @@ export function RdpManager({
           throw new Error(`kkterm-copy RDP engine is unsupported on this platform: ${KKTERM_COPY_PLATFORM}`);
         }
 
-        rdpLog.warn('connection', 'Using opt-in KKTerm copy RDP path', {
+        rdpLog.warn('rdp', 'Using opt-in KKTerm copy RDP path', {
           attemptId,
           tabId,
           platform: KKTERM_COPY_PLATFORM,
@@ -1764,7 +2030,7 @@ export function RdpManager({
         const kktermRemoteResolution = resModeRef.current === 'adaptive'
           ? 'automatic'
           : resModeRef.current;
-        await kktermRdpStart({
+        const startResponse = await kktermRdpStart({
           tabId,
           host: server.host,
           port: server.port,
@@ -1775,10 +2041,16 @@ export function RdpManager({
           y: wrapY,
           width: wrapWidth,
           height: wrapHeight,
+          scaleFactor,
           desktopWidth: w,
           desktopHeight: h,
           remoteResolution: kktermRemoteResolution,
+          redirectDrives: USE_KKTERM_COPY_WINDOWS && driveRedirectionEnabledRef.current,
+          useMultimon: USE_KKTERM_COPY_WINDOWS && multiMonitorEnabledRef.current,
+          reuseCloudBinding,
         });
+        store.updateTabRoute(tabId, startResponse.routeLabel);
+        rdpLog.info('route', 'route.selected', { tabId, routeLabel: startResponse.routeLabel });
 
         kktermTabsRef.current.add(tabId);
         if (USE_KKTERM_COPY_WINDOWS) {
@@ -1792,7 +2064,7 @@ export function RdpManager({
             visible: false,
           };
           await kktermRdpSetBounds(activeXBounds).catch(error => {
-            rdpLog.warn('native', 'kkterm-rdp ActiveX staging after connect failed', { tabId, error: String(error) });
+            rdpLog.warn('rdp', 'kkterm-rdp ActiveX staging after connect failed', { tabId, error: String(error) });
           });
           const connectedSize = await waitForKktermWindowsDisplay(
             attemptId,
@@ -1802,12 +2074,31 @@ export function RdpManager({
             h,
           );
           markKktermTabConnected(tabId, connectedSize.width, connectedSize.height);
+          if (ENABLE_KKTERM_WINDOWS_FKEY_QA) {
+            setTimeout(() => {
+              void (async () => {
+                rdpLog.info('input', 'kkterm-windows QA F1-F12 sequence started', { tabId });
+                for (const scancode of KKTERM_WINDOWS_FKEY_SCANCODES) {
+                  await kktermRdpKey({ tabId, scancode, down: true });
+                  await kktermRdpKey({ tabId, scancode, down: false });
+                  await new Promise(resolve => setTimeout(resolve, 150));
+                }
+                rdpLog.info('input', 'kkterm-windows QA F1-F12 sequence completed', { tabId });
+              })().catch(error => {
+                rdpLog.warn('input', 'kkterm-windows QA F1-F12 sequence failed', {
+                  tabId,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              });
+            }, 3000);
+          }
           kktermViewLastBoundsByTabRef.current.delete(tabId);
           scheduleKktermViewBoundsSync('connected');
           scheduleKktermWindowsPostConnectSettle(tabId, attemptId);
         }
 
         startOfficialWebFpsCounter(tabId, canvas);
+        startCloudKeepalive(tabId, server.host, server.port);
         connectingTabsRef.current.delete(tabId);
         return;
       }
@@ -1815,13 +2106,13 @@ export function RdpManager({
       // ── Native RDP mode: connect via Rust backend ──
       if (USE_NATIVE_RDP) {
         rdpLog.warn(
-          'native',
+          'rdp',
           USE_NATIVE_DRIFT_RDP
             ? 'Using native-drift canvas RDP path'
             : 'Using experimental native RDP path instead of IronRDP official-web',
         );
         cleanupNativeFrameStream(tabId);
-        rdpLog.info('native', 'native.connect.request', {
+        rdpLog.info('rdp', 'native.connect.request', {
           attemptId,
           tabId,
           host: server.host,
@@ -1854,7 +2145,7 @@ export function RdpManager({
           : undefined;
 
         // Connect via Rust backend — returns WS port for frame streaming
-        const wsPort = await api.rdpNativeConnect({
+        const connectResponse = await api.rdpNativeConnect({
           tabId,
           host: server.host,
           port: server.port,
@@ -1864,8 +2155,12 @@ export function RdpManager({
           width: w,
           height: h,
           renderProfile: RDP_ENGINE_MODE,
+          reuseCloudBinding,
         });
-        rdpLog.info('native', 'native.connect.ok', { attemptId, tabId, wsPort });
+        const { wsPort, routeLabel } = connectResponse;
+        startCloudKeepalive(tabId, server.host, server.port);
+        store.updateTabRoute(tabId, routeLabel);
+        rdpLog.info('rdp', 'native.connect.ok', { attemptId, tabId, wsPort, routeLabel });
         nativeTabsRef.current.add(tabId);
         updateNativeResolution(tabId, w, h, 'connect-request');
 
@@ -1901,7 +2196,7 @@ export function RdpManager({
               if (cleanupWs && nativeFrameCleanupByTabRef.current.get(tabId) === cleanupWs) {
                 nativeFrameCleanupByTabRef.current.delete(tabId);
               }
-              rdpLog.warn('render', 'native frame websocket closed unexpectedly', {
+              rdpLog.warn('display', 'native frame websocket closed unexpectedly', {
                 tabId,
                 wsPort,
                 code: event.code,
@@ -1912,8 +2207,10 @@ export function RdpManager({
               forgetNativeResizeState(tabId);
               stopFpsCounter(tabId);
               cleanupH264Worker(tabId);
-              store.updateTabStatus(tabId, 'error', t('rdpFrameStreamDisconnected'));
               setRdpStats(prev => ({ ...prev, status: 'disconnected' }));
+              if (!userDisconnectedRef.current.has(tabId)) {
+                scheduleReconnect(tabId, event.reason || t('rdpFrameStreamDisconnected'));
+              }
             }
           },
           {
@@ -1970,7 +2267,7 @@ export function RdpManager({
       const officialWebGfxDisabledByFallback = officialWebGfxDisabledByFallbackRef.current.has(tabId);
       const officialWebGfxEnabled = OFFICIAL_WEB_FEATURES.gfx && !officialWebGfxDisabledByFallback;
 
-      rdpLog.info('connection', 'official ironrdp web connect request', {
+      rdpLog.info('rdp', 'official ironrdp web connect request', {
         attemptId,
         tabId,
         host: server.host,
@@ -1996,7 +2293,7 @@ export function RdpManager({
       const size = new wasm.DesktopSize(w, h);
       const builder = new wasm.SessionBuilder()
         .proxyAddress(`ws://127.0.0.1:${currentProxyPort}`)
-        .authToken('nextdesk-local')
+        .authToken(`nextdesk-local:${tabId}`)
         .destination(`${server.host}:${server.port}`)
         .username(server.username)
         .password(server.password)
@@ -2020,7 +2317,7 @@ export function RdpManager({
         .canvasResizedCallback(() => {
           // WASM renderer sets canvas.width/height internally when server responds
           const cw = canvas.width, ch = canvas.height;
-          rdpLog.info('render', `canvasResizedCallback → canvas: ${cw} x ${ch}`);
+          rdpLog.info('display', `canvasResizedCallback → canvas: ${cw} x ${ch}`);
           if (cw > 0 && ch > 0) {
             lastSizeRef.current = { w: cw, h: ch };
             fpsCountRef.current++;
@@ -2502,7 +2799,9 @@ export function RdpManager({
         try {
           applyIronRdpRdpdrDriveSharingExtensions(wasm, builder, { shareName: 'NextDesk' });
           cblog('[rdpdr] drive_share_name fallback configured:', 'NextDesk');
-        } catch {}
+        } catch {
+          // The fallback extension is best-effort; the session can continue without RDPDR.
+        }
       }
       } else {
         rdpdrEnabledRef.current.delete(tabId);
@@ -2605,7 +2904,7 @@ export function RdpManager({
           officialWebGfxDisabledByFallbackRef.current.has(tabId) ||
           officialWebGfxFallbackInFlightRef.current.has(tabId)
         ) {
-          rdpLog.warn('render', 'official-web GFX fallback already active', {
+          rdpLog.warn('display', 'official-web GFX fallback already active', {
             tabId,
             reason: decision.reason,
             bitmapHexPrefix: input.bitmapHexPrefix,
@@ -2616,7 +2915,7 @@ export function RdpManager({
 
         officialWebGfxDisabledByFallbackRef.current.add(tabId);
         officialWebGfxFallbackInFlightRef.current.add(tabId);
-        rdpLog.warn('render', 'official-web GFX fallback: reconnecting without GFX', {
+        rdpLog.warn('display', 'official-web GFX fallback: reconnecting without GFX', {
           tabId,
           reason: decision.reason,
           codec: input.codec,
@@ -2669,12 +2968,12 @@ export function RdpManager({
               frame.close();
             } else if (msg.type === 'error') {
               const detail = msg.message || 'unknown';
-              rdpLog.warn('render', 'h264 worker error', { message: detail });
+              rdpLog.warn('display', 'h264 worker error', { message: detail });
               triggerOfficialWebGfxFallback({ type: 'decode_error', detail });
             }
           };
         } catch (e) {
-          rdpLog.warn('render', 'Worker creation failed, official-web GFX disabled for this attempt', {
+          rdpLog.warn('display', 'Worker creation failed, official-web GFX disabled for this attempt', {
             error: String(e),
           });
           decodeWorkerRef.current = null;
@@ -2768,7 +3067,7 @@ export function RdpManager({
           }
 
           if (type === 'gfx_codec') {
-            rdpLog.info('render', 'official-web GFX codec', {
+            rdpLog.info('display', 'official-web GFX codec', {
               codec,
               h264: Boolean(data?.h264),
               surfaceId: data?.surfaceId,
@@ -2784,7 +3083,7 @@ export function RdpManager({
           }
 
           if (type === 'clearcodec_frame') {
-            rdpLog.info('render', 'official-web ClearCodec frame', {
+            rdpLog.info('display', 'official-web ClearCodec frame', {
               codec,
               surfaceId: data?.surfaceId,
               width: data?.width,
@@ -2830,7 +3129,7 @@ export function RdpManager({
             const patchCount = (officialWebClearCodecPatchCountRef.current.get(tabId) ?? 0) + 1;
             officialWebClearCodecPatchCountRef.current.set(tabId, patchCount);
             if (patchCount <= 3 || patchCount % 60 === 0) {
-              rdpLog.info('render', 'official-web ClearCodec RGBA patch', {
+              rdpLog.info('display', 'official-web ClearCodec RGBA patch', {
                 tabId,
                 patchCount,
                 codec,
@@ -2871,7 +3170,7 @@ export function RdpManager({
             const frameCount = (officialWebH264FrameCountRef.current.get(tabId) ?? 0) + 1;
             officialWebH264FrameCountRef.current.set(tabId, frameCount);
             if (frameCount <= 3 || frameCount % 60 === 0) {
-              rdpLog.info('render', 'official-web H.264 frame', {
+              rdpLog.info('display', 'official-web H.264 frame', {
                 tabId,
                 frameCount,
                 codec,
@@ -2904,9 +3203,9 @@ export function RdpManager({
           }
         };
         applyIronRdpGfxH264Callback(wasm, builder, { gfx: gfxCallback });
-        rdpLog.info('render', 'GFX H.264 pipeline enabled (WebCodecs Worker)');
+        rdpLog.info('display', 'GFX H.264 pipeline enabled (WebCodecs Worker)');
       } else {
-        rdpLog.info('render', officialWebGfxEnabled
+        rdpLog.info('display', officialWebGfxEnabled
           ? 'WebCodecs not available, official-web GFX disabled'
           : officialWebGfxDisabledByFallback
             ? 'official-web GFX disabled by fallback for this tab'
@@ -2918,9 +3217,9 @@ export function RdpManager({
       // Enable DisplayControl DVC for dynamic resolution updates (no reconnect needed)
       if (OFFICIAL_WEB_FEATURES.displayControl) {
         applyIronRdpDisplayControlExtension(wasm, builder, true);
-        rdpLog.info('render', 'DisplayControl DVC enabled for dynamic resolution');
+        rdpLog.info('display', 'DisplayControl DVC enabled for dynamic resolution');
       } else {
-        rdpLog.info('render', 'DisplayControl DVC disabled');
+        rdpLog.info('display', 'DisplayControl DVC disabled');
       }
 
       if (OFFICIAL_WEB_FEATURES.fileTransfer) {
@@ -2935,7 +3234,7 @@ export function RdpManager({
       }
 
       const session = await builder.connect();
-      rdpLog.info('connection', 'official ironrdp web connected', {
+      rdpLog.info('rdp', 'official ironrdp web connected', {
         attemptId,
         tabId,
         host: server.host,
@@ -2943,6 +3242,7 @@ export function RdpManager({
       });
       sessionRefs.current.set(tabId, session);
       store.updateTabStatus(tabId, 'connected');
+      reconnectCountRef.current.delete(tabId);
 
       // Re-activate resize cooldown AFTER connect succeeds.
       // Even though the status bar is now an auto-hide overlay,
@@ -2956,10 +3256,11 @@ export function RdpManager({
 
       // Check what resolution the server actually gave us
       const negotiated = session.desktopSize();
-      rdpLog.info('connection', `negotiated resolution: ${negotiated.width} x ${negotiated.height} (requested ${w} x ${h})`);
+      rdpLog.info('rdp', `negotiated resolution: ${negotiated.width} x ${negotiated.height} (requested ${w} x ${h})`);
       setRdpStats(prev => ({ ...prev, resolution: `${negotiated.width}×${negotiated.height}`, status: 'connected' }));
 
       startOfficialWebFpsCounter(tabId, canvas);
+      startCloudKeepalive(tabId, server.host, server.port);
 
       // Try dynamic resize first (may not work if DVC not ready)
       setTimeout(() => {
@@ -2970,14 +3271,14 @@ export function RdpManager({
         const cur = session.desktopSize();
         const dpr = window.devicePixelRatio || 1;
         if (curW > 0 && curH > 0 && (cur.width !== curW || cur.height !== curH)) {
-          rdpLog.info('render', `delayed resize attempt: ${curW} x ${curH} DPR: ${dpr}`);
-          try { session.resize(curW, curH); } catch (e) { rdpLog.warn('render', 'resize failed', { error: e }); }
+          rdpLog.warn('display', `delayed resize attempt: ${curW} x ${curH} DPR: ${dpr}`);
+          try { session.resize(curW, curH); } catch (e) { rdpLog.warn('display', 'resize failed', { error: e }); }
         }
       }, 2000);
 
       const info = await session.run();
       const reason = info?.reason?.() || 'unknown';
-      rdpLog.info('connection', 'session.ended', { attemptId, tabId, reason });
+      rdpLog.info('rdp', 'session.ended', { attemptId, tabId, reason });
       connectingTabsRef.current.delete(tabId);
       attemptIdsRef.current.delete(tabId);
       sessionRefs.current.delete(tabId);
@@ -3006,14 +3307,14 @@ export function RdpManager({
       } else {
         // Check if the disconnect reason is non-recoverable
         if (isNonRecoverableRdpError(reason)) {
-          rdpLog.warn('connection', 'non-recoverable disconnect', { reason });
+          rdpLog.warn('rdp', 'non-recoverable disconnect', { reason });
           store.updateTabStatus(tabId, 'error', friendlyRdpError(reason, t));
         } else {
           scheduleReconnect(tabId, reason);
         }
       }
     } catch (err: any) {
-      rdpLog.error('connection', 'connect.failed', {
+      rdpLog.error('rdp', 'connect.failed', {
         attemptId,
         tabId,
         host: server.host,
@@ -3044,36 +3345,8 @@ export function RdpManager({
         store.updateTabStatus(tabId, 'error', friendlyRdpError(raw, t));
       }
     }
-  }, [store, proxyPort, getCanvasSize, selectKktermRdpDesktopSize, waitForCanvas, waitForKktermWindowsLayoutReady, ensureH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, markNativeTabConnected, scheduleKktermWindowsPostConnectSettle, startNativeFpsCounter, startOfficialWebFpsCounter, stopFpsCounter, updateNativeResolution]);
+  }, [store, proxyPort, getCanvasSize, selectKktermRdpDesktopSize, waitForCanvas, waitForKktermWindowsLayoutReady, ensureH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, markNativeTabConnected, scheduleKktermWindowsPostConnectSettle, scheduleReconnect, startCloudKeepalive, startNativeFpsCounter, startOfficialWebFpsCounter, stopFpsCounter, updateNativeResolution]);
   connectSessionRef.current = connectSession;
-
-  // ── Auto-reconnect with exponential backoff ──
-  const scheduleReconnect = useCallback((tabId: string, _reason: string) => {
-    const count = (reconnectCountRef.current.get(tabId) || 0) + 1;
-    if (count > MAX_RECONNECT_ATTEMPTS) {
-      rdpLog.warn('connection', `reconnect: gave up after ${MAX_RECONNECT_ATTEMPTS} attempts`, { tabId });
-      reconnectCountRef.current.delete(tabId);
-      store.updateTabStatus(tabId, 'error', t('rdpReconnectFailed', { max: String(MAX_RECONNECT_ATTEMPTS) }));
-      return;
-    }
-    reconnectCountRef.current.set(tabId, count);
-    // Exponential backoff: 1s, 2s, 4s, 8s, 16s
-    const delay = Math.min(1000 * Math.pow(2, count - 1), 16000);
-    rdpLog.info('connection', `reconnect #${count}/${MAX_RECONNECT_ATTEMPTS} for ${tabId} in ${delay}ms`);
-    store.updateTabStatus(tabId, 'reconnecting', t('rdpReconnectingCount', { count: String(count), max: String(MAX_RECONNECT_ATTEMPTS) }));
-
-    const timer = setTimeout(() => {
-      reconnectTimerRef.current.delete(tabId);
-      // Check tab still exists and hasn't been manually closed
-      const tab = store.tabs.find(t => t.id === tabId);
-      if (!tab || userDisconnectedRef.current.has(tabId)) {
-        reconnectCountRef.current.delete(tabId);
-        return;
-      }
-      connectSessionRef.current?.(tabId);
-    }, delay);
-    reconnectTimerRef.current.set(tabId, timer);
-  }, [store]);
 
   // Reset reconnect counter on successful connection
   useEffect(() => {
@@ -3113,6 +3386,7 @@ export function RdpManager({
     const timer = reconnectTimerRef.current.get(tabId);
     if (timer) { clearTimeout(timer); reconnectTimerRef.current.delete(tabId); }
     reconnectCountRef.current.delete(tabId);
+    stopCloudKeepalive(tabId);
     // Disconnect native session if any
     if (nativeTabsRef.current.has(tabId)) {
       api.rdpNativeDisconnect(tabId).catch(() => {});
@@ -3123,7 +3397,7 @@ export function RdpManager({
       kktermTabsRef.current.delete(tabId);
       kktermViewLastBoundsByTabRef.current.delete(tabId);
     }
-    setKktermRdpRestartNonce(prev => {
+    setKktermRdpLaunch(prev => {
       const next = { ...prev };
       delete next[tabId];
       return next;
@@ -3143,11 +3417,6 @@ export function RdpManager({
       delete next[tabId];
       return next;
     });
-    setKktermRdpDesktopSize(prev => {
-      const next = { ...prev };
-      delete next[tabId];
-      return next;
-    });
     cleanupNativeFrameStream(tabId);
     forgetNativeResizeState(tabId);
     stopFpsCounter(tabId);
@@ -3160,7 +3429,11 @@ export function RdpManager({
     // Shutdown WASM session if any
     const session = sessionRefs.current.get(tabId);
     if (session) {
-      try { session.shutdown(); } catch { }
+      try {
+        session.shutdown();
+      } catch {
+        // The session may already be closed by the transport error path.
+      }
       sessionRefs.current.delete(tabId);
     }
     connectingTabsRef.current.delete(tabId);
@@ -3176,7 +3449,7 @@ export function RdpManager({
     if (store.tabs.length <= 1) {
       store.setSidebarOpen(true);
     }
-  }, [store, cleanupH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, stopFpsCounter]);
+  }, [store, cleanupH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, stopCloudKeepalive, stopFpsCounter]);
 
   const handleNewSaved = useCallback((serverId: string, connect: boolean) => {
     setShowNewConn(false);
@@ -3197,16 +3470,21 @@ export function RdpManager({
             const current = getCanvasSize();
             return { width: Math.round(current.w), height: Math.round(current.h) };
           })();
-      setKktermRdpDesktopSize(prev => ({
+      setKktermRdpLaunch(prev => ({
         ...prev,
         [tabId]: {
-          width: Math.max(320, size.width),
-          height: Math.max(240, size.height),
+          nonce: (prev[tabId]?.nonce ?? 0) + 1,
+          desktopSize: {
+            width: Math.max(320, size.width),
+            height: Math.max(240, size.height),
+          },
+          reuseCloudBinding: false,
         },
       }));
     }
     // Mark as user-initiated so session end handler won't trigger yellow reconnect UI
     userDisconnectedRef.current.add(tabId);
+    stopCloudKeepalive(tabId);
     // Disconnect native session if any
     if (nativeTabsRef.current.has(tabId)) {
       api.rdpNativeDisconnect(tabId).catch(() => {});
@@ -3241,7 +3519,7 @@ export function RdpManager({
       userDisconnectedRef.current.delete(tabId);
       connectSessionRef.current?.(tabId);
     }, 500);
-  }, [store, cleanupH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, getCanvasSize, stopFpsCounter]);
+  }, [store, cleanupH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, getCanvasSize, stopCloudKeepalive, stopFpsCounter]);
 
   const performAdaptiveResize = useCallback((reason: string) => {
     if (resModeRef.current !== 'adaptive') return;
@@ -3295,7 +3573,7 @@ export function RdpManager({
 
     if (isKktermMacTab) {
       lastSizeRef.current = { w, h };
-      rdpLog.info('render', `adaptive resize (${reason}, kkterm-macos) → reconnect: ${w} x ${h}`, {
+      rdpLog.info('display', `adaptive resize (${reason}, kkterm-macos) → reconnect: ${w} x ${h}`, {
         tabId,
         width: w,
         height: h,
@@ -3305,15 +3583,49 @@ export function RdpManager({
     }
 
     if (isKktermWindowsTab) {
-      lastSizeRef.current = { w, h };
       desiredSizeRef.current = null;
-      kktermViewLastBoundsByTabRef.current.delete(tabId);
-      rdpLog.info('render', `adaptive resize (${reason}, kkterm-windows) → ActiveX display sync: ${w} x ${h}`, {
+      const bounds = buildKktermVisibleBounds(tabId);
+      if (!bounds) return;
+      scheduleKktermViewBoundsSync(`adaptive resize ${reason}`);
+      const startedAt = performance.now();
+      rdpLog.info('display', `adaptive resize (${reason}, kkterm-windows) → debounced display sync: ${w} x ${h}`, {
         tabId,
         width: w,
         height: h,
       });
-      scheduleKktermViewBoundsSync(`adaptive resize ${reason}`);
+      kktermRdpSyncDisplaySize(bounds).then(display => {
+        const elapsedMs = Math.round(performance.now() - startedAt);
+        if (!display.displaySynced) {
+          rdpLog.warn('display', `adaptive resize (${reason}, kkterm-windows) did not synchronize`, {
+            tabId,
+            width: w,
+            height: h,
+            elapsedMs,
+            connectionState: display.connectionState,
+          });
+          return;
+        }
+        lastSizeRef.current = {
+          w: display.desktopWidth || w,
+          h: display.desktopHeight || h,
+        };
+        rdpLog.info('display', `adaptive resize (${reason}, kkterm-windows) synchronized`, {
+          tabId,
+          requestedWidth: w,
+          requestedHeight: h,
+          desktopWidth: display.desktopWidth,
+          desktopHeight: display.desktopHeight,
+          elapsedMs,
+        });
+      }).catch(error => {
+        rdpLog.warn('display', `adaptive resize (${reason}, kkterm-windows) failed`, {
+          tabId,
+          width: w,
+          height: h,
+          elapsedMs: Math.round(performance.now() - startedAt),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
       return;
     }
 
@@ -3323,7 +3635,7 @@ export function RdpManager({
         const now = Date.now();
         const connectedAt = nativeConnectedAtByTabRef.current.get(tabId);
         if (connectedAt && now - connectedAt < PUBLIC_NATIVE_ADAPTIVE_SETTLE_MS) {
-          rdpLog.info('render', `adaptive resize (${reason}, native) suppressed during public-route settle`, {
+          rdpLog.info('display', `adaptive resize (${reason}, native) suppressed during public-route settle`, {
             tabId,
             host: server?.host,
             width: w,
@@ -3339,7 +3651,7 @@ export function RdpManager({
           lastPublicAdaptiveReconnect &&
           now - lastPublicAdaptiveReconnect < PUBLIC_NATIVE_ADAPTIVE_RECONNECT_MIN_INTERVAL_MS
         ) {
-          rdpLog.info('render', `adaptive resize (${reason}, native) suppressed by public-route reconnect throttle`, {
+          rdpLog.info('display', `adaptive resize (${reason}, native) suppressed by public-route reconnect throttle`, {
             tabId,
             host: server?.host,
             width: w,
@@ -3352,7 +3664,7 @@ export function RdpManager({
 
         lastSizeRef.current = { w, h };
         nativePublicAdaptiveReconnectAtRef.current.set(tabId, now);
-        rdpLog.info('render', `adaptive resize (${reason}, native) → reconnect for public route`, {
+        rdpLog.info('display', `adaptive resize (${reason}, native) → reconnect for public route`, {
           tabId,
           host: server?.host,
           width: w,
@@ -3366,27 +3678,27 @@ export function RdpManager({
       if (pending && pending.w === w && pending.h === h) return;
 
       if (nativeCappedResizeLog) {
-        rdpLog.info('render', 'native adaptive size capped for public route', {
+        rdpLog.info('display', 'native adaptive size capped for public route', {
           tabId,
           host: server?.host,
           ...nativeCappedResizeLog,
         });
       }
       nativeResizePendingByTabRef.current.set(tabId, { w, h, sentAt: Date.now() });
-      rdpLog.info('render', `adaptive resize (${reason}, native) → enqueue DVC: ${w} x ${h}`);
+      rdpLog.info('display', `adaptive resize (${reason}, native) → enqueue DVC: ${w} x ${h}`);
       api.rdpNativeResize(tabId, w, h)
         .then(() => {
-          rdpLog.info('render', `adaptive resize (${reason}, native) → DVC enqueued: ${w} x ${h}`);
+          rdpLog.info('display', `adaptive resize (${reason}, native) → DVC enqueued: ${w} x ${h}`);
         })
         .catch(() => {
           const currentPending = nativeResizePendingByTabRef.current.get(tabId);
           if (currentPending?.w === w && currentPending.h === h) {
             nativeResizePendingByTabRef.current.delete(tabId);
-            rdpLog.warn('render', `adaptive resize (${reason}, native) → DVC failed, reconnecting`);
+            rdpLog.warn('display', `adaptive resize (${reason}, native) → DVC failed, reconnecting`);
             reconnectWithSize(tabId);
             return;
           }
-          rdpLog.warn('render', `adaptive resize (${reason}, native) → stale DVC failure ignored`);
+          rdpLog.warn('display', `adaptive resize (${reason}, native) → stale DVC failure ignored`);
         });
       return;
     }
@@ -3397,20 +3709,101 @@ export function RdpManager({
     if (!session) return;
     try {
       session.resize(w, h);
-      rdpLog.info('render', `adaptive resize (${reason}, official-web) → dynamic PDU sent: ${w} x ${h}`);
+      rdpLog.info('display', `adaptive resize (${reason}, official-web) → dynamic PDU sent: ${w} x ${h}`);
       return;
     } catch (e) {
-      rdpLog.warn('render', `adaptive resize (${reason}, official-web) → dynamic resize failed`, { error: e });
+      rdpLog.warn('display', `adaptive resize (${reason}, official-web) → dynamic resize failed`, { error: e });
     }
 
-    rdpLog.info('render', `adaptive resize (${reason}, official-web) → reconnect fallback: ${w} x ${h}`);
+    rdpLog.info('display', `adaptive resize (${reason}, official-web) → reconnect fallback: ${w} x ${h}`);
     reconnectWithSize(tabId);
-  }, [getCanvasSize, reconnectWithSize, store]);
+  }, [buildKktermVisibleBounds, getCanvasSize, reconnectWithSize, scheduleKktermViewBoundsSync, store]);
+  performAdaptiveResizeRef.current = performAdaptiveResize;
+
+  const toggleFullscreen = useCallback(async () => {
+    const appWindow = getCurrentWindow();
+    try {
+      const next = !(await appWindow.isFullscreen());
+      await appWindow.setFullscreen(next);
+      setIsFullscreen(next);
+      rdpLog.info('display', `native fullscreen ${next ? 'entered' : 'exited'}`);
+    } catch (error) {
+      rdpLog.error('display', 'native fullscreen toggle failed', { error: String(error) });
+    }
+  }, []);
+
+  const toggleDriveRedirection = useCallback((enabled: boolean) => {
+    driveRedirectionEnabledRef.current = enabled;
+    setDriveRedirectionEnabled(enabled);
+    try {
+      window.localStorage.setItem('nextdesk_kkterm_redirect_drives', enabled ? 'true' : 'false');
+    } catch {
+      // The in-memory choice still applies to the reconnect.
+    }
+    const tabId = activeTabIdRef.current;
+    rdpLog.info('clipboard', 'Windows drive redirection changed', { tabId, enabled });
+    if (tabId && kktermTabsRef.current.has(tabId)) {
+      reconnectWithSize(tabId);
+    }
+  }, [reconnectWithSize]);
+
+  const toggleMultiMonitor = useCallback((enabled: boolean) => {
+    multiMonitorEnabledRef.current = enabled;
+    setMultiMonitorEnabled(enabled);
+    try {
+      window.localStorage.setItem('nextdesk_kkterm_use_multimon', enabled ? 'true' : 'false');
+    } catch {
+      // The in-memory choice still applies to the reconnect.
+    }
+    const tabId = activeTabIdRef.current;
+    rdpLog.info('display', 'Windows multi-monitor changed', { tabId, enabled });
+    if (tabId && kktermTabsRef.current.has(tabId)) {
+      reconnectWithSize(tabId);
+    }
+  }, [reconnectWithSize]);
+
+  useEffect(() => {
+    const appWindow = getCurrentWindow();
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    const refresh = () => {
+      void appWindow.isFullscreen().then(value => {
+        if (!disposed) setIsFullscreen(value);
+      }).catch(() => undefined);
+    };
+    refresh();
+    void appWindow.onResized(refresh).then(value => {
+      if (disposed) value();
+      else unlisten = value;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    const activeConnected = store.activeTab?.status === 'connected';
+    if (!isFullscreen || (isRdpViewVisible && activeConnected)) return;
+    const appWindow = getCurrentWindow();
+    void appWindow.setFullscreen(false).then(() => {
+      setIsFullscreen(false);
+      rdpLog.info('display', 'native fullscreen exited because the active RDP session is unavailable');
+    }).catch(error => {
+      rdpLog.warn('display', 'failed to exit native fullscreen after RDP session state changed', {
+        error: String(error),
+      });
+    });
+  }, [isFullscreen, isRdpViewVisible, store.activeTab?.status]);
 
   // ── Switch resolution mode ──
   const applyResolution = useCallback((requestedMode: string) => {
     const mode = requestedMode;
-    rdpLog.info('render', `applyResolution called: ${mode}`);
+    rdpLog.info('display', `applyResolution called: ${mode}`);
+    if (mode === resModeRef.current) {
+      rdpLog.info('display', `applyResolution skipped: ${mode} is already active`);
+      return;
+    }
     setResMode(mode);
     resModeRef.current = mode;
     const tabId = store.activeTabId;
@@ -3418,26 +3811,54 @@ export function RdpManager({
     const tab = tabsRef.current.find(t => t.id === tabId);
     const server = tab ? store.getServerById(tab.serverId) : null;
 
+    if (mode === 'smartSizing') {
+      const plan = kktermTabsRef.current.has(tabId)
+        ? planKktermLocalScaling(KKTERM_COPY_PLATFORM, lastSizeRef.current, getCanvasSize())
+        : null;
+      if (!plan) {
+        setResMode('adaptive');
+        resModeRef.current = 'adaptive';
+        return;
+      }
+      const size = plan.desktopSize;
+      desiredSizeRef.current = size;
+      lastSizeRef.current = size;
+      kktermViewLastBoundsByTabRef.current.delete(tabId);
+      rdpLog.info('display', `switching to local scaling: ${size.w} x ${size.h}`, {
+        tabId,
+        platform: KKTERM_COPY_PLATFORM,
+        reconnect: plan.reconnect,
+      });
+      if (plan.reconnect) {
+        reconnectWithSize(tabId, size.w, size.h);
+      }
+      return;
+    }
+
     if (mode === 'adaptive') {
       let { w, h } = getCanvasSize();
-      rdpLog.info('render', `switching to adaptive: ${w} x ${h}`);
+      rdpLog.info('display', `switching to adaptive: ${w} x ${h}`);
       if (USE_KKTERM_COPY_WINDOWS && kktermTabsRef.current.has(tabId)) {
         desiredSizeRef.current = null;
         lastSizeRef.current = { w, h };
         kktermViewLastBoundsByTabRef.current.delete(tabId);
-        rdpLog.info('render', 'kkterm-windows adaptive resolution → ActiveX display sync', {
+        // ActiveX keeps the resolution mode that was configured at startup.
+        // Reconnect when leaving a fixed mode so the new session uses
+        // `automatic`; a bounds sync alone would keep SmartSizing at the old
+        // fixed desktop size while the UI incorrectly reported Adaptive.
+        rdpLog.info('display', 'kkterm-windows adaptive resolution → reconnect with ActiveX automatic mode', {
           tabId,
           width: w,
           height: h,
         });
-        scheduleKktermViewBoundsSync('resolution adaptive');
+        reconnectWithSize(tabId);
         return;
       }
       // Try native resize first
       if (USE_NATIVE_RDP && nativeTabsRef.current.has(tabId)) {
         const normalized = normalizeNativeDesktopSizeForHost(w, h, server?.host);
         if (normalized.capped && (normalized.w !== w || normalized.h !== h)) {
-          rdpLog.info('render', 'native adaptive size capped for public route', {
+          rdpLog.info('display', 'native adaptive size capped for public route', {
             tabId,
             host: server?.host,
             requested: { w, h },
@@ -3450,14 +3871,14 @@ export function RdpManager({
         if (actual?.w === w && actual.h === h) {
           desiredSizeRef.current = null;
           nativeResizePendingByTabRef.current.delete(tabId);
-          rdpLog.info('render', 'native resize skipped (adaptive already current)', { width: w, height: h });
+          rdpLog.info('display', 'native resize skipped (adaptive already current)', { width: w, height: h });
           return;
         }
         if (!canUseNativeDynamicResizeForHost(server?.host)) {
           desiredSizeRef.current = null;
           nativeResizePendingByTabRef.current.delete(tabId);
           lastSizeRef.current = { w, h };
-          rdpLog.info('render', 'native resize reconnect (adaptive public route)', {
+          rdpLog.info('display', 'native resize reconnect (adaptive public route)', {
             tabId,
             host: server?.host,
             width: w,
@@ -3469,22 +3890,22 @@ export function RdpManager({
         const pending = nativeResizePendingByTabRef.current.get(tabId);
         if (pending?.w === w && pending.h === h) {
           desiredSizeRef.current = null;
-          rdpLog.info('render', 'native resize skipped (adaptive already pending)', { width: w, height: h });
+          rdpLog.info('display', 'native resize skipped (adaptive already pending)', { width: w, height: h });
           return;
         }
         nativeResizePendingByTabRef.current.set(tabId, { w, h, sentAt: Date.now() });
         api.rdpNativeResize(tabId, w, h).then(() => {
           desiredSizeRef.current = null;
-          rdpLog.info('render', 'native resize enqueued (adaptive)', { width: w, height: h });
+          rdpLog.info('display', 'native resize enqueued (adaptive)', { width: w, height: h });
         }).catch(() => {
           const currentPending = nativeResizePendingByTabRef.current.get(tabId);
           if (currentPending?.w === w && currentPending.h === h) {
             nativeResizePendingByTabRef.current.delete(tabId);
-            rdpLog.warn('render', 'native resize failed, falling back to reconnect');
+            rdpLog.warn('display', 'native resize failed, falling back to reconnect');
             reconnectWithSize(tabId);
             return;
           }
-          rdpLog.warn('render', 'stale native resize failure ignored');
+          rdpLog.warn('display', 'stale native resize failure ignored');
         });
         return;
       }
@@ -3494,22 +3915,22 @@ export function RdpManager({
           session.resize(w, h);
           desiredSizeRef.current = null;
           lastSizeRef.current = { w, h };
-          rdpLog.info('render', 'official-web dynamic resize PDU sent (adaptive)');
+          rdpLog.info('display', 'official-web dynamic resize PDU sent (adaptive)');
           return;
         } catch (e) {
-          rdpLog.warn('render', 'dynamic resize failed, falling back to reconnect', { error: e });
+          rdpLog.warn('display', 'dynamic resize failed, falling back to reconnect', { error: e });
         }
       }
       reconnectWithSize(tabId);
     } else {
       const [ws, hs] = mode.split('x').map(Number);
       if (!ws || !hs) return;
-      rdpLog.info('render', `switching to fixed resolution: ${ws} x ${hs}`);
+      rdpLog.info('display', `switching to fixed resolution: ${ws} x ${hs}`);
       if (USE_KKTERM_COPY_WINDOWS && kktermTabsRef.current.has(tabId)) {
         desiredSizeRef.current = { w: ws, h: hs };
         lastSizeRef.current = { w: ws, h: hs };
         kktermViewLastBoundsByTabRef.current.delete(tabId);
-        rdpLog.info('render', 'kkterm-windows fixed resolution → reconnect with ActiveX remoteResolution', {
+        rdpLog.info('display', 'kkterm-windows fixed resolution → reconnect with ActiveX remoteResolution', {
           tabId,
           width: ws,
           height: hs,
@@ -3524,7 +3945,7 @@ export function RdpManager({
         const targetW = normalized.w;
         const targetH = normalized.h;
         if (normalized.capped && (targetW !== ws || targetH !== hs)) {
-          rdpLog.info('render', 'native fixed size capped for public route', {
+          rdpLog.info('display', 'native fixed size capped for public route', {
             tabId,
             host: server?.host,
             requested: { w: ws, h: hs },
@@ -3535,14 +3956,14 @@ export function RdpManager({
         if (actual?.w === targetW && actual.h === targetH) {
           desiredSizeRef.current = { w: targetW, h: targetH };
           nativeResizePendingByTabRef.current.delete(tabId);
-          rdpLog.info('render', 'native resize skipped (fixed already current)', { width: targetW, height: targetH });
+          rdpLog.info('display', 'native resize skipped (fixed already current)', { width: targetW, height: targetH });
           return;
         }
         if (!canUseNativeDynamicResizeForHost(server?.host)) {
           desiredSizeRef.current = { w: targetW, h: targetH };
           nativeResizePendingByTabRef.current.delete(tabId);
           lastSizeRef.current = { w: targetW, h: targetH };
-          rdpLog.info('render', 'native resize reconnect (fixed public route)', {
+          rdpLog.info('display', 'native resize reconnect (fixed public route)', {
             tabId,
             host: server?.host,
             width: targetW,
@@ -3554,22 +3975,22 @@ export function RdpManager({
         const pending = nativeResizePendingByTabRef.current.get(tabId);
         if (pending?.w === targetW && pending.h === targetH) {
           desiredSizeRef.current = { w: targetW, h: targetH };
-          rdpLog.info('render', 'native resize skipped (fixed already pending)', { width: targetW, height: targetH });
+          rdpLog.info('display', 'native resize skipped (fixed already pending)', { width: targetW, height: targetH });
           return;
         }
         nativeResizePendingByTabRef.current.set(tabId, { w: targetW, h: targetH, sentAt: Date.now() });
         api.rdpNativeResize(tabId, targetW, targetH).then(() => {
           desiredSizeRef.current = { w: targetW, h: targetH };
-          rdpLog.info('render', 'native resize enqueued (fixed)', { width: targetW, height: targetH });
+          rdpLog.info('display', 'native resize enqueued (fixed)', { width: targetW, height: targetH });
         }).catch(() => {
           const currentPending = nativeResizePendingByTabRef.current.get(tabId);
           if (currentPending?.w === targetW && currentPending.h === targetH) {
             nativeResizePendingByTabRef.current.delete(tabId);
-            rdpLog.warn('render', 'native resize failed, falling back to reconnect');
+            rdpLog.warn('display', 'native resize failed, falling back to reconnect');
             reconnectWithSize(tabId, targetW, targetH);
             return;
           }
-          rdpLog.warn('render', 'stale native resize failure ignored');
+          rdpLog.warn('display', 'stale native resize failure ignored');
         });
         return;
       }
@@ -3579,17 +4000,17 @@ export function RdpManager({
         if (canvas?.width === ws && canvas.height === hs) {
           desiredSizeRef.current = { w: ws, h: hs };
           lastSizeRef.current = { w: ws, h: hs };
-          rdpLog.info('render', 'official-web resize skipped (fixed already current)', { width: ws, height: hs });
+          rdpLog.info('display', 'official-web resize skipped (fixed already current)', { width: ws, height: hs });
           return;
         }
         try {
           session.resize(ws, hs);
           desiredSizeRef.current = { w: ws, h: hs };
           lastSizeRef.current = { w: ws, h: hs };
-          rdpLog.info('render', 'official-web dynamic resize PDU sent (fixed)');
+          rdpLog.info('display', 'official-web dynamic resize PDU sent (fixed)');
           return;
         } catch (e) {
-          rdpLog.warn('render', 'dynamic resize failed, falling back to reconnect', { error: e });
+          rdpLog.warn('display', 'dynamic resize failed, falling back to reconnect', { error: e });
         }
       }
       reconnectWithSize(tabId, ws, hs);
@@ -4317,9 +4738,12 @@ export function RdpManager({
   useEffect(() => {
     const scheduleResize = (reason: string) => {
       if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
+      const debounceMs = USE_KKTERM_COPY_MACOS
+        ? KKTERM_MACOS_ADAPTIVE_RESIZE_DEBOUNCE_MS
+        : ADAPTIVE_RESIZE_DEBOUNCE_MS;
       resizeTimerRef.current = setTimeout(
-        () => performAdaptiveResize(reason),
-        ADAPTIVE_RESIZE_DEBOUNCE_MS,
+        () => performAdaptiveResizeRef.current(reason),
+        debounceMs,
       );
     };
 
@@ -4336,7 +4760,7 @@ export function RdpManager({
       window.visualViewport?.removeEventListener('resize', onVisualViewportResize);
       if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
     };
-  }, [store.activeTabId, performAdaptiveResize]);
+  }, [store.activeTabId]);
 
   const activeTab = store.activeTab;
   const hasActiveTabs = store.tabs.length > 0;
@@ -4384,7 +4808,7 @@ export function RdpManager({
           }));
           return true;
         } catch (error) {
-          rdpLog.warn('render', 'session thumbnail snapshot request failed; falling back to canvas capture', {
+          rdpLog.warn('display', 'session thumbnail snapshot request failed; falling back to canvas capture', {
             tabId,
             error: error instanceof Error ? error.message : String(error),
           });
@@ -4393,7 +4817,7 @@ export function RdpManager({
       },
     });
     if (captured > 0) {
-      rdpLog.debug('render', `captured ${captured} tab thumbnail(s) for grid view`);
+      rdpLog.debug('display', `captured ${captured} tab thumbnail(s) for grid view`);
     }
   }, [store.updateTabThumbnail]);
 
@@ -4453,9 +4877,17 @@ export function RdpManager({
               macClipboardStrategy,
               hasClipboardFolder,
               showClipboardManagement: !USE_KKTERM_COPY_RDP,
+              showDriveRedirection: USE_KKTERM_COPY_WINDOWS,
+              driveRedirectionEnabled,
+              showMultiMonitor: USE_KKTERM_COPY_WINDOWS,
+              multiMonitorEnabled,
               showWinKey: !USE_KKTERM_COPY_WINDOWS,
               ctrlAltDelMode: USE_KKTERM_COPY_WINDOWS ? 'hint' : 'send',
+              fullscreen: isFullscreen,
               onApplyResolution: applyResolution,
+              onToggleFullscreen: () => { void toggleFullscreen(); },
+              onToggleDriveRedirection: toggleDriveRedirection,
+              onToggleMultiMonitor: toggleMultiMonitor,
               onToggleClipboardStrategy: toggleMacClipboardStrategy,
               onOpenClipboardFolder: openClipboardFolder,
               onSendClipboardText: USE_KKTERM_COPY_RDP ? () => sendClipboardTextRef.current?.() : undefined,
@@ -4484,25 +4916,29 @@ export function RdpManager({
         {hasActiveTabs && (
           <div className={store.viewMode !== 'tab' ? 'hidden' : 'contents'}>
             {/* Canvas wrapper — fills remaining flex space */}
-            <div ref={canvasWrapRef} className="flex-1 relative min-h-0 min-w-0 bg-black overflow-hidden">
+            <div ref={canvasWrapRef} className="flex-1 relative min-h-0 min-w-0 rdp-stage-background overflow-hidden">
               {/* Canvas layers: one per tab, absolutely positioned */}
               {USE_KKTERM_COPY_MACOS
                 ? store.tabs.map(tab => {
                     const server = store.getServerById(tab.serverId);
                     if (!server) return null;
+                    const launch = kktermRdpLaunch[tab.id];
+                    if (!launch) return null;
                     return (
                       <KktermRdpSurface
-                        key={`${tab.id}:${kktermRdpRestartNonce[tab.id] ?? 0}`}
+                        key={`${tab.id}:${launch.nonce}`}
                         tabId={tab.id}
                         server={server}
                         active={tab.id === activeTab?.id}
                         cadSignal={kktermRdpCadSignalByTab[tab.id] ?? 0}
                         textSignal={kktermRdpTextSignalByTab[tab.id] ?? null}
                         winSignal={kktermRdpWinSignalByTab[tab.id] ?? 0}
-                        desktopSize={kktermRdpDesktopSize[tab.id] ?? null}
+                        desktopSize={launch.desktopSize}
+                        reuseCloudBinding={launch.reuseCloudBinding}
                         onConnected={markKktermTabConnected}
                         onDisconnected={handleKktermDisconnected}
                         onError={handleKktermError}
+                        onRouteSelected={store.updateTabRoute}
                         onCanvasRef={handleKktermCanvasRef}
                       />
                     );
@@ -4544,12 +4980,7 @@ export function RdpManager({
 
               {/* Overlays for non-connected states */}
               {activeTab?.status === 'connecting' && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
-                  <div className="h-12 w-12 rounded-full border-4 border-cyan-500/30 border-t-cyan-500 animate-spin" />
-                  <div className="min-h-[90px] flex flex-col items-center justify-start gap-3">
-                    <p className="text-sm text-muted-foreground">{t('rdpConnectingTo', { name: activeTab.name })}</p>
-                  </div>
-                </div>
+                <RdpConnectionOverlay name={activeTab.name} routeLabel={activeTab.routeLabel} />
               )}
 
               {activeTab?.status === 'error' && (
@@ -4605,13 +5036,16 @@ export function RdpManager({
 
       </div>
 
-      <NewConnectionDialog
-        store={store}
-        open={showNewConn}
-        onClose={() => { setShowNewConn(false); setEditServerId(null); }}
-        onSaved={(id, connect) => { setEditServerId(null); handleNewSaved(id, connect); }}
-        editServer={editServerId ? store.getServerById(editServerId) : null}
-      />
+      {showNewConn && (
+        <NewConnectionDialog
+          key={editServerId ?? 'new-connection'}
+          store={store}
+          open
+          onClose={() => { setShowNewConn(false); setEditServerId(null); }}
+          onSaved={(id, connect) => { setEditServerId(null); handleNewSaved(id, connect); }}
+          editServer={editServerId ? store.getServerById(editServerId) : null}
+        />
+      )}
     </div>
   );
 }

@@ -1,6 +1,7 @@
 import { useRef, useCallback, useEffect, useLayoutEffect, useState } from 'react';
-import { X, LayoutGrid, LayoutList, RefreshCw, MoreHorizontal, ChevronDown, FolderOpen, Monitor, ClipboardCopy, PanelLeftOpen, Keyboard, ShieldAlert } from 'lucide-react';
+import { X, LayoutGrid, LayoutList, RefreshCw, MoreHorizontal, ChevronDown, FolderOpen, Monitor, ClipboardCopy, PanelLeftOpen, Keyboard, ShieldAlert, Maximize2, Minimize2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Switch } from '@/components/ui/switch';
 import { cn } from '@/lib/utils';
 import type { SessionTab, ViewMode } from '@/lib/rdp-types';
 import { useTranslation } from '@/i18n/useTranslation';
@@ -13,9 +14,17 @@ export interface SessionControls {
   macClipboardStrategy: 'session-file-url' | 'pasteboard-promise';
   hasClipboardFolder: boolean;
   showClipboardManagement?: boolean;
+  showDriveRedirection?: boolean;
+  driveRedirectionEnabled: boolean;
+  showMultiMonitor?: boolean;
+  multiMonitorEnabled?: boolean;
   showWinKey?: boolean;
   ctrlAltDelMode?: 'send' | 'hint' | 'hidden';
+  fullscreen: boolean;
   onApplyResolution: (mode: string) => void;
+  onToggleFullscreen: () => void;
+  onToggleDriveRedirection: (enabled: boolean) => void;
+  onToggleMultiMonitor?: (enabled: boolean) => void;
   onToggleClipboardStrategy: () => void;
   onOpenClipboardFolder: () => void;
   onSendClipboardText?: () => void;
@@ -57,6 +66,13 @@ const STATUS_COLOR: Record<string, string> = {
   disconnected: 'bg-slate-600',
 };
 
+const ROUTE_TRANSLATION_KEYS = {
+  cloud: 'routeCloudAccelerated',
+  lan_direct: 'routeLanDirect',
+  local_direct: 'routeLocalDirect',
+  cloud_fallback: 'routeCloudFallback',
+} as const;
+
 const DRAG_THRESHOLD = 4; // px before activating drag
 
 function rectFromElement(element: HTMLElement | null): SessionControlsMenuRect | undefined {
@@ -81,7 +97,8 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
   const [dragIdx, setDragIdx] = useState<number | null>(null);
   const [dragOffsetX, setDragOffsetX] = useState(0);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
-  const [ctxMenu, setCtxMenu] = useState<{ tabId: string; x: number; y: number } | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{ tabId: string; x: number; y: number; safeTop: number } | null>(null);
+  const [dragActive, setDragActive] = useState(false);
   const [showControlsMenu, setShowControlsMenu] = useState(false);
   const [showResSubmenu, setShowResSubmenu] = useState(false);
   const dragState = useRef<{ idx: number; startX: number; active: boolean } | null>(null);
@@ -93,6 +110,11 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
   const hasSessionControls = Boolean(sessionControls);
   const showWinKeyControl = sessionControls?.showWinKey !== false;
   const ctrlAltDelMode = sessionControls?.ctrlAltDelMode ?? 'send';
+  const resolutionModeLabel = sessionControls?.resMode === 'adaptive'
+    ? t('rdpAuto')
+    : sessionControls?.resMode === 'smartSizing'
+      ? t('rdpLocalScaling')
+      : (sessionControls?.resolution || '—');
 
   const notifySessionControlsMenuState = useCallback(() => {
     if (!hasSessionControls || !showControlsMenu) {
@@ -167,6 +189,7 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
       const dx = e.clientX - d.startX;
       if (!d.active && Math.abs(dx) < DRAG_THRESHOLD) return;
       d.active = true;
+      setDragActive(true);
       setDragOffsetX(dx);
       setHoverIdx(hitTest(e.clientX, d.idx));
     };
@@ -181,6 +204,7 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
       }
       dragState.current = null;
       setDragIdx(null);
+      setDragActive(false);
       setDragOffsetX(0);
       setHoverIdx(null);
     };
@@ -220,8 +244,20 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
             key={tab.id}
             ref={(el) => { if (el) tabRefs.current.set(idx, el); else tabRefs.current.delete(idx); }}
             onMouseDown={(e) => startDrag(idx, e)}
-            onContextMenu={(e) => { e.preventDefault(); setCtxMenu({ tabId: tab.id, x: e.clientX, y: e.clientY }); }}
-            style={dragIdx === idx && dragState.current?.active
+            onContextMenu={(e) => {
+              e.preventDefault();
+              const barRect = barRef.current?.getBoundingClientRect();
+              const menuHeight = 32;
+              setCtxMenu({
+                tabId: tab.id,
+                x: e.clientX,
+                y: e.clientY,
+                safeTop: barRect
+                  ? Math.max(0, Math.round(barRect.top + (barRect.height - menuHeight) / 2))
+                  : Math.max(0, e.clientY - menuHeight),
+              });
+            }}
+            style={dragIdx === idx && dragActive
               ? { transform: `translateX(${dragOffsetX}px)`, zIndex: 50, position: 'relative' as const }
               : undefined}
             className={cn(
@@ -229,7 +265,7 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
               tab.id === activeTabId
                 ? "bg-accent text-foreground"
                 : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
-              dragIdx === idx && dragState.current?.active && "opacity-80 shadow-lg",
+              dragIdx === idx && dragActive && "opacity-80 shadow-lg",
               hoverIdx === idx && dragIdx !== idx && "ring-2 ring-primary ring-offset-1 ring-offset-background",
             )}
           >
@@ -237,13 +273,21 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
               type="button"
               className="flex min-w-0 flex-1 items-center gap-1.5 px-3 py-1.5 text-xs font-medium cursor-grab active:cursor-grabbing transition-colors"
               onClick={() => {
-                if (dragState.current?.active) return; // suppress click after drag
+                  if (dragActive) return; // suppress click after drag
                 onSelectTab(tab.id);
                 onViewModeChange('tab');
               }}
             >
               <span className={cn("h-1.5 w-1.5 rounded-full shrink-0", STATUS_COLOR[tab.status])} title={tab.status} />
               <span className="truncate">{tab.name}</span>
+              {tab.routeLabel && (
+                <span
+                  className="max-w-[92px] truncate text-[10px] font-normal text-muted-foreground"
+                  title={t(ROUTE_TRANSLATION_KEYS[tab.routeLabel])}
+                >
+                  {t(ROUTE_TRANSLATION_KEYS[tab.routeLabel])}
+                </span>
+              )}
             </button>
             <button
               type="button"
@@ -272,14 +316,10 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
             )}
             style={activeXSafeMenus
               ? (() => {
-                  const barRect = barRef.current?.getBoundingClientRect();
                   const menuWidth = onReconnectTab ? 224 : 96;
-                  const menuHeight = 32;
                   return {
                     left: clampContextMenuLeft(ctxMenu.x, menuWidth),
-                    top: barRect
-                      ? Math.max(0, Math.round(barRect.top + (barRect.height - menuHeight) / 2))
-                      : Math.max(0, ctxMenu.y - menuHeight),
+                    top: ctxMenu.safeTop,
                   };
                 })()
               : { left: ctxMenu.x, top: ctxMenu.y }}
@@ -341,7 +381,7 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
                 {/* FPS & Resolution display */}
                 <div className="flex items-center justify-between px-2 py-1.5 text-[11px] font-mono">
                   <span className="text-cyan-400/80">
-                    {sessionControls.resMode === 'adaptive' ? t('rdpAuto') : (sessionControls.resolution || '—')}
+                    {resolutionModeLabel}
                   </span>
                   {sessionControls.fps !== null && (
                     <span className="text-emerald-400/80">{sessionControls.fps} fps</span>
@@ -388,6 +428,19 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
 
                 <div className="h-px bg-border/60 my-0.5" />
 
+                <button
+                  type="button"
+                  className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs hover:bg-accent hover:text-accent-foreground cursor-pointer"
+                  onClick={() => { sessionControls.onToggleFullscreen(); setShowControlsMenu(false); }}
+                >
+                  {sessionControls.fullscreen
+                    ? <Minimize2 className="h-3.5 w-3.5" />
+                    : <Maximize2 className="h-3.5 w-3.5" />}
+                  {sessionControls.fullscreen ? t('rdpExitFullscreen') : t('rdpFullscreen')}
+                </button>
+
+                <div className="h-px bg-border/60 my-0.5" />
+
                 {sessionControls.showClipboardManagement !== false && (
                   <button
                     type="button"
@@ -397,6 +450,40 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
                     <ClipboardCopy className="h-3.5 w-3.5 shrink-0" />
                     {t('rdpClipboard')} {sessionControls.macClipboardStrategy === 'session-file-url' ? t('rdpClipboardStandard') : t('rdpClipboardExperimental')}
                   </button>
+                )}
+
+                {sessionControls.showDriveRedirection && (
+                  <div className="flex w-full items-center justify-between gap-3 px-2 py-1.5 text-xs">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <FolderOpen className="h-3.5 w-3.5 shrink-0" />
+                      <span className="whitespace-nowrap">{t('rdpDriveRedirection')}</span>
+                    </div>
+                    <Switch
+                      checked={sessionControls.driveRedirectionEnabled}
+                      onCheckedChange={enabled => {
+                        sessionControls.onToggleDriveRedirection(enabled);
+                        setShowControlsMenu(false);
+                      }}
+                      aria-label={t('rdpDriveRedirection')}
+                    />
+                  </div>
+                )}
+
+                {sessionControls.showMultiMonitor && (
+                  <div className="flex w-full items-center justify-between gap-3 px-2 py-1.5 text-xs">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <Monitor className="h-3.5 w-3.5 shrink-0" />
+                      <span className="whitespace-nowrap">{t('rdpMultiMonitor')}</span>
+                    </div>
+                    <Switch
+                      checked={sessionControls.multiMonitorEnabled ?? false}
+                      onCheckedChange={enabled => {
+                        sessionControls.onToggleMultiMonitor?.(enabled);
+                        setShowControlsMenu(false);
+                      }}
+                      aria-label={t('rdpMultiMonitor')}
+                    />
+                  </div>
                 )}
 
                 {sessionControls.onSendClipboardText && (

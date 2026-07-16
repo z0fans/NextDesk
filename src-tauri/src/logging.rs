@@ -2,9 +2,12 @@
 //!
 //! Initializes env_logger with:
 //! - Output to both stderr (visible in `npx tauri dev` console) and a log file
-//! - Log file path: `/tmp/nextdesk_debug.log` (truncated on every startup)
-//! - Default level: INFO in dev, WARN in release builds
+//! - Log file path: `/tmp/nextdesk_debug.log`
+//! - Rotation: 10 MB per file, five retained backups
+//! - Default level: INFO in dev and release builds
 //! - Override via `RUST_LOG` env var
+//! - Public logs use Next RDP branding; debug builds can opt into internal names with
+//!   `NEXTDESK_INTERNAL_LOGS=1`
 //!
 //! ## Usage
 //!
@@ -16,10 +19,233 @@
 //! log::trace!("hot path: chunk={}", i);
 //! ```
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
+
+pub const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+pub const LOG_BACKUP_COUNT: usize = 5;
+
+const PUBLIC_LOG_REPLACEMENTS: &[(&str, &str)] = &[
+    (
+        "https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+        "Next RDP TLS unexpected EOF guidance",
+    ),
+    ("cliprdr-watcher", "Next RDP Clipboard"),
+    ("cliprdr_watcher", "Next RDP Clipboard"),
+    ("ironrdp_cliprdr", "Next RDP Clipboard"),
+    ("ironrdp-cliprdr", "Next RDP Clipboard"),
+    ("kkterm-windows", "Next RDP Windows"),
+    ("kkterm_windows", "Next RDP Windows"),
+    ("kkterm-macos", "Next RDP macOS"),
+    ("kkterm_macos", "Next RDP macOS"),
+    ("kkterm-rdp", "Next RDP"),
+    ("kkterm_rdp", "Next RDP"),
+    ("kkterm rdp", "Next RDP"),
+    ("kkterm-copy", "Next RDP"),
+    ("kkterm_copy", "Next RDP"),
+    ("kkterm-text", "Next RDP text input"),
+    ("kkterm_text", "Next RDP text input"),
+    ("official-web", "Next RDP Web"),
+    ("official_web", "Next RDP Web"),
+    ("native-tls", "Next RDP TLS"),
+    ("rdcleanpath", "Next RDP transport"),
+    ("webcodecs", "Next RDP media"),
+    ("webgl2", "Next RDP display"),
+    ("webgl", "Next RDP display"),
+    ("activex", "Next RDP Windows"),
+    ("ironrdp", "Next RDP"),
+    ("rustls", "Next RDP TLS"),
+    ("wgpu", "Next RDP display"),
+    ("cpal", "Next RDP Audio"),
+    ("cliprdr", "Next RDP Clipboard"),
+    ("rdpsnd", "Next RDP Audio"),
+    ("rdpdr", "Next RDP File"),
+    ("wasm", "Next RDP Web"),
+    ("kkterm", "Next RDP"),
+    ("Next RDP Next RDP Windows", "Next RDP Windows"),
+    ("Next RDP Next RDP Web", "Next RDP Web"),
+    ("Next RDP Next RDP Clipboard", "Next RDP Clipboard"),
+    ("Next RDP Next RDP Audio", "Next RDP Audio"),
+    ("Next RDP Next RDP File", "Next RDP File"),
+];
+
+const PUBLIC_IDENTIFIER_REPLACEMENTS: &[(&str, &str)] = &[
+    (
+        "https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof",
+        "next_rdp_tls_unexpected_eof_guidance",
+    ),
+    ("cliprdr-watcher", "next_rdp_clipboard"),
+    ("cliprdr_watcher", "next_rdp_clipboard"),
+    ("ironrdp_cliprdr", "next_rdp_clipboard"),
+    ("ironrdp-cliprdr", "next_rdp_clipboard"),
+    ("kkterm-windows", "next_rdp_windows"),
+    ("kkterm_windows", "next_rdp_windows"),
+    ("kkterm-macos", "next_rdp_macos"),
+    ("kkterm_macos", "next_rdp_macos"),
+    ("kkterm-rdp", "next_rdp"),
+    ("kkterm_rdp", "next_rdp"),
+    ("kkterm rdp", "next_rdp"),
+    ("kkterm-copy", "next_rdp"),
+    ("kkterm_copy", "next_rdp"),
+    ("kkterm-text", "next_rdp_text_input"),
+    ("kkterm_text", "next_rdp_text_input"),
+    ("official-web", "next_rdp_web"),
+    ("official_web", "next_rdp_web"),
+    ("native-tls", "next_rdp_tls"),
+    ("rdcleanpath", "next_rdp_transport"),
+    ("webcodecs", "next_rdp_media"),
+    ("webgl2", "next_rdp_display"),
+    ("webgl", "next_rdp_display"),
+    ("activex", "next_rdp_windows"),
+    ("ironrdp", "next_rdp"),
+    ("rustls", "next_rdp_tls"),
+    ("wgpu", "next_rdp_display"),
+    ("cpal", "next_rdp_audio"),
+    ("cliprdr", "next_rdp_clipboard"),
+    ("rdpsnd", "next_rdp_audio"),
+    ("rdpdr", "next_rdp_file"),
+    ("wasm", "next_rdp_web"),
+    ("kkterm", "next_rdp"),
+    ("next_rdp next_rdp_windows", "next_rdp_windows"),
+    ("next_rdp next_rdp_web", "next_rdp_web"),
+    ("next_rdp next_rdp_clipboard", "next_rdp_clipboard"),
+    ("next_rdp next_rdp_audio", "next_rdp_audio"),
+    ("next_rdp next_rdp_file", "next_rdp_file"),
+];
+
+pub fn internal_diagnostics_enabled() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("NEXTDESK_INTERNAL_LOGS")
+            .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+}
+
+fn replace_ascii_case_insensitive(value: &str, needle: &str, replacement: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+
+    while let Some(relative) = lower[cursor..].find(&needle) {
+        let start = cursor + relative;
+        output.push_str(&value[cursor..start]);
+        output.push_str(replacement);
+        cursor = start + needle.len();
+    }
+    output.push_str(&value[cursor..]);
+    output
+}
+
+fn apply_replacements(value: &str, replacements: &[(&str, &str)]) -> String {
+    replacements
+        .iter()
+        .fold(value.to_string(), |current, (needle, replacement)| {
+            replace_ascii_case_insensitive(&current, needle, replacement)
+        })
+}
+
+pub fn public_log_text(value: &str) -> String {
+    apply_replacements(value, PUBLIC_LOG_REPLACEMENTS)
+}
+
+pub fn public_log_identifier(value: &str) -> String {
+    apply_replacements(value, PUBLIC_IDENTIFIER_REPLACEMENTS)
+}
+
+pub fn public_log_target(target: &str) -> String {
+    let target = target.to_ascii_lowercase();
+    if let Some(module) = target.strip_prefix("nextdesk::") {
+        let module = match module {
+            "app" | "auth" | "cloud" | "route" | "next_rdp" | "display" | "network" | "input"
+            | "clipboard" | "file" | "audio" => module,
+            _ => "app",
+        };
+        return format!("nextdesk::{module}");
+    }
+    let module = if target.contains("connection_resolver") {
+        "route"
+    } else if target.contains("cloud_auth") {
+        "auth"
+    } else if target.contains("cloud_gateway") || target.contains("cloud_probe") {
+        "cloud"
+    } else if target.contains("cliprdr") || target.contains("clipboard") {
+        "clipboard"
+    } else if target.contains("rdp_audio") || target.contains("rdpsnd") {
+        "audio"
+    } else if target.contains("rdpdr") || target.contains("file_transfer") {
+        "file"
+    } else if target.contains("rdp_proxy") {
+        "network"
+    } else if target.contains("rdp") || target.contains("kkterm") || target.contains("ironrdp") {
+        "next_rdp"
+    } else {
+        "app"
+    };
+    format!("nextdesk::{module}")
+}
+
+pub fn public_log_location(target: &str, location: &str) -> String {
+    let public_target = public_log_target(target);
+    let module = public_target.strip_prefix("nextdesk::").unwrap_or("app");
+    let line = location
+        .rsplit_once(':')
+        .and_then(|(_, line)| line.parse::<u32>().ok())
+        .unwrap_or(0);
+    format!("nextdesk/{module}:{line}")
+}
+
+fn take_log_segment(value: &str) -> Option<(&str, &str)> {
+    let value = value.strip_prefix('[')?;
+    let end = value.find(']')?;
+    Some((&value[..end], &value[end + 1..]))
+}
+
+pub fn public_log_line(line: &str) -> String {
+    let Some((timestamp, rest)) = take_log_segment(line) else {
+        return public_log_text(line);
+    };
+    let Some((level, rest)) = take_log_segment(rest) else {
+        return public_log_text(line);
+    };
+    let Some((target, rest)) = take_log_segment(rest) else {
+        return public_log_text(line);
+    };
+    let Some((location, message)) = take_log_segment(rest) else {
+        return public_log_text(line);
+    };
+    format!(
+        "[{timestamp}][{level}][{}][{}] {}",
+        public_log_target(target),
+        public_log_location(target, location),
+        public_log_text(message.trim_start())
+    )
+}
+
+pub fn sanitize_log_family(path: &std::path::Path) -> std::io::Result<()> {
+    if internal_diagnostics_enabled() {
+        return Ok(());
+    }
+    for item in log_family_paths(path) {
+        if !item.exists() {
+            continue;
+        }
+        let original = fs::read_to_string(&item)?;
+        let mut sanitized = original
+            .lines()
+            .map(public_log_line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if original.ends_with('\n') {
+            sanitized.push('\n');
+        }
+        if sanitized != original {
+            fs::write(item, sanitized)?;
+        }
+    }
+    Ok(())
+}
 
 /// Path to the rotating debug log file.
 pub fn log_file_path() -> PathBuf {
@@ -33,15 +259,116 @@ pub fn rdp_debug(event: &str, payload: &serde_json::Value) {
 
 /// A writer that fans out to both a file and stderr.
 struct FanoutWriter {
-    file: Mutex<File>,
+    file: Mutex<RotatingFile>,
 }
 
 impl FanoutWriter {
-    fn new(file: File) -> Self {
+    fn new(path: PathBuf, file: File) -> Self {
         Self {
-            file: Mutex::new(file),
+            file: Mutex::new(RotatingFile {
+                path,
+                file: Some(file),
+            }),
         }
     }
+}
+
+struct RotatingFile {
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl RotatingFile {
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        let current_size = self
+            .file
+            .as_ref()
+            .and_then(|file| file.metadata().ok())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if current_size.saturating_add(buf.len() as u64) > LOG_MAX_BYTES {
+            self.file.take();
+            rotate_log_files(&self.path, LOG_BACKUP_COUNT)?;
+            self.file = Some(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)?,
+            );
+        }
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("log file is unavailable"))?
+            .write_all(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("log file is unavailable"))?
+            .flush()
+    }
+}
+
+pub fn rotate_log_files(path: &std::path::Path, backup_count: usize) -> std::io::Result<()> {
+    if backup_count == 0 || !path.exists() {
+        return Ok(());
+    }
+
+    let oldest = path.with_extension(format!("log.{backup_count}"));
+    if oldest.exists() {
+        fs::remove_file(oldest)?;
+    }
+    for index in (1..backup_count).rev() {
+        let source = path.with_extension(format!("log.{index}"));
+        if source.exists() {
+            fs::rename(source, path.with_extension(format!("log.{}", index + 1)))?;
+        }
+    }
+    fs::rename(path, path.with_extension("log.1"))
+}
+
+pub fn append_rotating(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let current_size = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if current_size.saturating_add(bytes.len() as u64) > LOG_MAX_BYTES {
+        rotate_log_files(path, LOG_BACKUP_COUNT)?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(bytes)
+}
+
+pub fn log_family_paths(path: &std::path::Path) -> Vec<PathBuf> {
+    let mut paths = vec![path.to_path_buf()];
+    paths.extend((1..=LOG_BACKUP_COUNT).map(|index| path.with_extension(format!("log.{index}"))));
+    paths
+}
+
+pub fn log_family_size(path: &std::path::Path) -> u64 {
+    log_family_paths(path)
+        .into_iter()
+        .filter_map(|item| fs::metadata(item).ok())
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
+pub fn clear_log_family(path: &std::path::Path) -> std::io::Result<()> {
+    if path.exists() {
+        OpenOptions::new().write(true).truncate(true).open(path)?;
+    }
+    for backup in log_family_paths(path).into_iter().skip(1) {
+        if backup.exists() {
+            fs::remove_file(backup)?;
+        }
+    }
+    Ok(())
 }
 
 impl Write for FanoutWriter {
@@ -78,8 +405,11 @@ pub fn init() {
         }
     }
 
-    // Truncate on startup so each session starts clean.
-    let file = match File::create(&path) {
+    if let Err(e) = sanitize_log_family(&path) {
+        eprintln!("[logging] Failed to sanitize existing logs: {e}");
+    }
+
+    let file = match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(f) => f,
         Err(e) => {
             eprintln!(
@@ -91,12 +421,12 @@ pub fn init() {
         }
     };
 
-    let writer = FanoutWriter::new(file);
+    let writer = FanoutWriter::new(path.clone(), file);
 
     let mut builder = env_logger::Builder::new();
 
-    // Default per-module levels. Dev keeps rich diagnostics; release keeps
-    // backend logging off RDP hot paths unless warnings/errors occur.
+    // High-frequency paths remain DEBUG, while release builds retain the
+    // INFO/WARN/ERROR events needed for user-facing diagnostics.
     let default_filters = if cfg!(debug_assertions) {
         "info,\
          nextdesk_lib::cliprdr=trace,\
@@ -108,8 +438,8 @@ pub fn init() {
          ironrdp_connector=info,\
          tracing=warn"
     } else {
-        "warn,\
-         nextdesk_lib=warn,\
+        "info,\
+         nextdesk_lib=info,\
          ironrdp=warn,\
          ironrdp_cliprdr=warn,\
          ironrdp_session=warn,\
@@ -134,15 +464,30 @@ pub fn init() {
             .map(|s| format!("src-tauri/{s}"))
             .unwrap_or_else(|| file.to_string());
         let line = record.line().unwrap_or(0);
+        let internal = internal_diagnostics_enabled();
+        let public_target = if internal {
+            target.to_string()
+        } else {
+            public_log_target(target)
+        };
+        let public_location = if internal {
+            format!("{short_file}:{line}")
+        } else {
+            public_log_location(target, &format!("{short_file}:{line}"))
+        };
+        let public_args = if internal {
+            record.args().to_string()
+        } else {
+            public_log_text(&record.args().to_string())
+        };
         writeln!(
             buf,
-            "[{ts}][{level:5}][{target}][{short_file}:{line}] {args}",
+            "[{ts}][{level:5}][{target}][{location}] {args}",
             ts = ts,
             level = level,
-            target = target,
-            short_file = short_file,
-            line = line,
-            args = record.args()
+            target = public_target,
+            location = public_location,
+            args = public_args
         )
     });
 
@@ -224,6 +569,72 @@ mod tests {
         assert_eq!(&s[19..20], ".");
         assert_eq!(&s[23..24], "Z");
     }
+
+    #[test]
+    fn rotates_logs_and_keeps_numbered_backups() {
+        let base = std::env::temp_dir().join(format!(
+            "nextdesk-log-rotation-{}-{}.log",
+            std::process::id(),
+            chrono_lite_now().replace([':', '.'], "-")
+        ));
+        fs::write(&base, b"current").unwrap();
+        fs::write(base.with_extension("log.1"), b"previous").unwrap();
+
+        rotate_log_files(&base, 2).unwrap();
+
+        assert_eq!(fs::read(base.with_extension("log.1")).unwrap(), b"current");
+        assert_eq!(fs::read(base.with_extension("log.2")).unwrap(), b"previous");
+        let _ = fs::remove_file(base.with_extension("log.1"));
+        let _ = fs::remove_file(base.with_extension("log.2"));
+    }
+
+    #[test]
+    fn public_logs_hide_internal_rdp_technology_names() {
+        let message =
+            "[cliprdr-watcher] kkterm-rdp ActiveX ironrdp_cliprdr rustls failure code=0x204";
+        let public = public_log_text(message);
+
+        assert_eq!(
+            public,
+            "[Next RDP Clipboard] Next RDP Windows Next RDP Clipboard Next RDP TLS failure code=0x204"
+        );
+        assert!(!public.to_ascii_lowercase().contains("kkterm"));
+        assert!(!public.to_ascii_lowercase().contains("cliprdr"));
+        assert!(!public.to_ascii_lowercase().contains("ironrdp"));
+        assert!(!public.to_ascii_lowercase().contains("rustls"));
+        assert!(public.contains("code=0x204"));
+    }
+
+    #[test]
+    fn public_targets_keep_module_and_line_for_troubleshooting() {
+        assert_eq!(
+            public_log_target("nextdesk_lib::cliprdr::watcher"),
+            "nextdesk::clipboard"
+        );
+        assert_eq!(
+            public_log_location(
+                "nextdesk_lib::cliprdr::watcher",
+                "src-tauri/src/cliprdr/watcher.rs:288"
+            ),
+            "nextdesk/clipboard:288"
+        );
+        assert_eq!(
+            public_log_target("nextdesk::clipboard"),
+            "nextdesk::clipboard"
+        );
+    }
+
+    #[test]
+    fn existing_backend_lines_are_migrated_to_public_targets_and_locations() {
+        let public = public_log_line(
+            "[2026-07-16T16:17:19.805Z][INFO ][nextdesk_lib::cliprdr::watcher][src/cliprdr/watcher.rs:287] [cliprdr-watcher] kkterm-rdp failed code=0x204",
+        );
+
+        assert_eq!(
+            public,
+            "[2026-07-16T16:17:19.805Z][INFO ][nextdesk::clipboard][nextdesk/clipboard:287] [Next RDP Clipboard] Next RDP failed code=0x204"
+        );
+    }
 }
 
 // ── Tauri commands for the in-app log management UI ──
@@ -287,12 +698,7 @@ pub fn log_copy_to_desktop() -> Result<String, String> {
 #[tauri::command]
 pub fn log_clear() -> Result<(), String> {
     let path = log_file_path();
-    use std::fs::OpenOptions;
-    OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(&path)
-        .map_err(|e| format!("truncate failed: {e}"))?;
+    clear_log_family(&path).map_err(|e| format!("clear logs failed: {e}"))?;
     log::info!("Log cleared by user");
     Ok(())
 }
@@ -306,7 +712,5 @@ pub fn log_file_path_str() -> String {
 /// Get the current size of the log file in bytes (for display in UI).
 #[tauri::command]
 pub fn log_file_size() -> u64 {
-    std::fs::metadata(log_file_path())
-        .map(|m| m.len())
-        .unwrap_or(0)
+    log_family_size(&log_file_path())
 }

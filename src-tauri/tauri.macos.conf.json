@@ -1,7 +1,3 @@
 {
-  "bundle": {
-    "resources": {
-      "../.backend/bin/nextdesk-core": "bin/nextdesk-core"
-    }
-  }
+  "bundle": {}
 }

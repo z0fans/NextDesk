@@ -3,14 +3,8 @@ mod platform {
     use std::{
         collections::HashMap,
         ffi::c_void,
-        io,
         mem::ManuallyDrop,
-        net::{SocketAddr, TcpListener, TcpStream},
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            mpsc, Arc, Mutex, MutexGuard, OnceLock,
-        },
-        thread::{self, JoinHandle},
+        sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock},
         time::{Duration, Instant},
     };
 
@@ -23,8 +17,8 @@ mod platform {
         core::{IUnknown_Vtbl, Interface, BSTR, GUID, PCSTR, PCWSTR},
         Win32::{
             Foundation::{
-                HANDLE, HGLOBAL, HWND, LPARAM, POINT, RECT, VARIANT_BOOL, VARIANT_FALSE,
-                VARIANT_TRUE, WPARAM,
+                GetLastError, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
+                VARIANT_BOOL, VARIANT_FALSE, VARIANT_TRUE, WPARAM,
             },
             Graphics::Gdi::{
                 ClientToScreen, CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, RGN_DIFF,
@@ -36,7 +30,7 @@ mod platform {
                     DISPPARAMS,
                 },
                 DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
-                LibraryLoader::{GetProcAddress, LoadLibraryW},
+                LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
                 Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
                 Ole::{OleInitialize, CF_UNICODETEXT, DISPID_PROPERTYPUT},
                 Variant::{
@@ -45,14 +39,18 @@ mod platform {
             },
             UI::{
                 Input::KeyboardAndMouse::{
-                    MapVirtualKeyW, SendInput, SetFocus, VkKeyScanW, INPUT, INPUT_0,
-                    INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-                    MAPVK_VK_TO_VSC, MAPVK_VK_TO_VSC_EX, VIRTUAL_KEY,
+                    GetActiveWindow, GetFocus, MapVirtualKeyW, SendInput, SetActiveWindow,
+                    SetFocus, VkKeyScanW, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+                    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC,
+                    MAPVK_VK_TO_VSC_EX, MAPVK_VSC_TO_VK_EX, VIRTUAL_KEY,
                 },
                 WindowsAndMessaging::{
-                    CreateWindowExW, DestroyWindow, GetWindowRect, SendMessageW,
-                    SetForegroundWindow, SetWindowPos, ShowWindow, HMENU, SWP_NOACTIVATE,
-                    SWP_NOZORDER, SW_SHOWNOACTIVATE, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+                    CallNextHookEx, CreateWindowExW, DestroyWindow, GetForegroundWindow,
+                    GetWindowRect, IsChild, PostMessageW, SendMessageW, SetForegroundWindow,
+                    SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx,
+                    WindowFromPoint, HC_ACTION, HHOOK, HMENU, MSLLHOOKSTRUCT, SWP_NOACTIVATE,
+                    SWP_NOZORDER, SW_SHOWNOACTIVATE, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
+                    WM_RBUTTONDOWN, WM_XBUTTONDOWN, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
                     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
                 },
             },
@@ -88,13 +86,14 @@ mod platform {
     const VK_DOWN_KEY: usize = 0x28;
     const VK_PAGE_UP_KEY: usize = 0x21;
     const VK_PAGE_DOWN_KEY: usize = 0x22;
-    const VK_LWIN_KEY: usize = 0x5B;
     const WM_LBUTTONDOWN_MSG: u32 = 0x0201;
     const WM_LBUTTONUP_MSG: u32 = 0x0202;
     const WM_RBUTTONDOWN_MSG: u32 = 0x0204;
     const WM_RBUTTONUP_MSG: u32 = 0x0205;
     const WM_MBUTTONDOWN_MSG: u32 = 0x0207;
     const WM_MBUTTONUP_MSG: u32 = 0x0208;
+    const WM_KEYDOWN_MSG: u32 = 0x0100;
+    const WM_KEYUP_MSG: u32 = 0x0101;
     const MK_LBUTTON_WPARAM: usize = 0x0001;
     const MK_RBUTTON_WPARAM: usize = 0x0002;
     const MK_MBUTTON_WPARAM: usize = 0x0010;
@@ -175,6 +174,46 @@ mod platform {
         ) -> windows::core::HRESULT,
     }
 
+    #[repr(transparent)]
+    #[derive(Clone)]
+    struct IMsRdpClientNonScriptable3(windows::core::IUnknown);
+
+    unsafe impl Interface for IMsRdpClientNonScriptable3 {
+        type Vtable = IMsRdpClientNonScriptable3Vtbl;
+        const IID: GUID = GUID::from_u128(0xb3378d90_0728_45c7_8ed7_b6159fb92219);
+    }
+
+    #[repr(C)]
+    struct IMsRdpClientNonScriptable3Vtbl {
+        base__: IUnknown_Vtbl,
+        reserved_before_dynamic_drives: [usize; 22],
+        put_redirect_dynamic_drives:
+            unsafe extern "system" fn(*mut c_void, VARIANT_BOOL) -> windows::core::HRESULT,
+        get_redirect_dynamic_drives:
+            unsafe extern "system" fn(*mut c_void, *mut VARIANT_BOOL) -> windows::core::HRESULT,
+        put_redirect_dynamic_devices:
+            unsafe extern "system" fn(*mut c_void, VARIANT_BOOL) -> windows::core::HRESULT,
+    }
+
+    #[repr(transparent)]
+    #[derive(Clone)]
+    struct IMsRdpClientNonScriptable5(windows::core::IUnknown);
+
+    unsafe impl Interface for IMsRdpClientNonScriptable5 {
+        type Vtable = IMsRdpClientNonScriptable5Vtbl;
+        const IID: GUID = GUID::from_u128(0x4f6996d5_d7b1_412c_b0ff_063718566907);
+    }
+
+    #[repr(C)]
+    struct IMsRdpClientNonScriptable5Vtbl {
+        base__: IUnknown_Vtbl,
+        reserved_before_use_multimon: [usize; 50],
+        put_use_multimon:
+            unsafe extern "system" fn(*mut c_void, VARIANT_BOOL) -> windows::core::HRESULT,
+        get_use_multimon:
+            unsafe extern "system" fn(*mut c_void, *mut VARIANT_BOOL) -> windows::core::HRESULT,
+    }
+
     type AtlAxWinInit = unsafe extern "system" fn() -> i32;
     type AtlAxGetControl =
         unsafe extern "system" fn(HWND, *mut *mut c_void) -> windows::core::HRESULT;
@@ -202,15 +241,8 @@ mod platform {
         y: f64,
         width: f64,
         height: f64,
+        scale_factor: Option<f64>,
         options: Option<RdpSessionOptions>,
-        #[serde(skip, default = "default_connection_route")]
-        connection_route: RdpConnectionRoute,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum RdpConnectionRoute {
-        Direct,
-        Socks5 { port: u16 },
     }
 
     #[derive(Clone, Deserialize, Serialize)]
@@ -222,6 +254,8 @@ mod platform {
         redirect_clipboard: bool,
         #[serde(default)]
         redirect_drives: bool,
+        #[serde(default)]
+        use_multimon: bool,
         #[serde(default = "default_true")]
         bitmap_cache: bool,
         #[serde(default = "default_performance_profile")]
@@ -391,6 +425,7 @@ mod platform {
         y: f64,
         width: f64,
         height: f64,
+        scale_factor: Option<f64>,
         // When set, re-issue the remote desktop resize even if the cached
         // desktop size/scale already matches. Used by the post-connect settle
         // passes: the ActiveX control often ignores the first resize, so we
@@ -409,6 +444,7 @@ mod platform {
         y: f64,
         width: f64,
         height: f64,
+        scale_factor: Option<f64>,
         #[serde(default)]
         clip_rects: Vec<crate::kkterm_rdp::types::KktermRdpClipRect>,
     }
@@ -421,6 +457,7 @@ mod platform {
         y: f64,
         width: f64,
         height: f64,
+        scale_factor: Option<f64>,
     }
 
     #[derive(Serialize)]
@@ -453,7 +490,8 @@ mod platform {
     #[serde(rename_all = "camelCase")]
     pub struct SendRdpKeyPressRequest {
         session_id: String,
-        key: String,
+        scancode: u16,
+        down: bool,
     }
 
     #[derive(Deserialize)]
@@ -478,35 +516,13 @@ mod platform {
         hwnd: HWND,
         owner: HWND,
         dispatch: IDispatch,
-        relay: Option<RdpTcpRelay>,
         desktop_width: i32,
         desktop_height: i32,
         desktop_scale_factor: i32,
         device_scale_factor: i32,
         dynamic_resize_failures: u32,
         resolution_mode: RemoteResolutionMode,
-    }
-
-    struct RdpTcpRelay {
-        local_addr: SocketAddr,
-        running: Arc<AtomicBool>,
-        join: Option<JoinHandle<()>>,
-    }
-
-    impl RdpTcpRelay {
-        fn local_port(&self) -> u16 {
-            self.local_addr.port()
-        }
-    }
-
-    impl Drop for RdpTcpRelay {
-        fn drop(&mut self) {
-            self.running.store(false, Ordering::SeqCst);
-            let _ = TcpStream::connect_timeout(&self.local_addr, Duration::from_millis(100));
-            if let Some(join) = self.join.take() {
-                let _ = join.join();
-            }
-        }
+        visible: bool,
     }
 
     // These values are always created, used, and destroyed through closures
@@ -515,6 +531,12 @@ mod platform {
     unsafe impl Send for RdpSession {}
 
     struct VariantArg(VARIANT);
+
+    fn rdp_request_scale_factor(requested: Option<f64>, host_scale_factor: f64) -> f64 {
+        requested
+            .filter(|scale| scale.is_finite() && *scale >= 0.25 && *scale <= 8.0)
+            .unwrap_or(host_scale_factor)
+    }
 
     impl RdpSessionManager {
         pub fn new() -> Self {
@@ -544,9 +566,11 @@ mod platform {
                 let host_window = app
                     .get_webview_window(HOST_WINDOW_LABEL)
                     .ok_or_else(|| format!("host window '{HOST_WINDOW_LABEL}' is not available"))?;
-                let scale_factor = host_window
+                let host_scale_factor = host_window
                     .scale_factor()
                     .map_err(|error| format!("failed to read host window scale factor: {error}"))?;
+                let scale_factor =
+                    rdp_request_scale_factor(request.scale_factor, host_scale_factor);
                 let mut sessions = lock_sessions(&sessions)?;
                 let session = sessions
                     .get_mut(&request.session_id)
@@ -573,19 +597,22 @@ mod platform {
                 let host_window = app
                     .get_webview_window(HOST_WINDOW_LABEL)
                     .ok_or_else(|| format!("host window '{HOST_WINDOW_LABEL}' is not available"))?;
-                let scale_factor = host_window
+                let host_scale_factor = host_window
                     .scale_factor()
                     .map_err(|error| format!("failed to read host window scale factor: {error}"))?;
-                let sessions = lock_sessions(&sessions)?;
+                let scale_factor =
+                    rdp_request_scale_factor(request.scale_factor, host_scale_factor);
+                let mut sessions = lock_sessions(&sessions)?;
                 if request.visible {
                     let mut parked_other_sessions = 0;
-                    for (other_session_id, other_session) in sessions.iter() {
+                    for (other_session_id, other_session) in sessions.iter_mut() {
                         if other_session_id != &request.session_id {
                             park_rdp_at_current_size(other_session.hwnd)?;
+                            other_session.visible = false;
                             parked_other_sessions += 1;
                         }
                     }
-                    let session = sessions.get(&request.session_id).ok_or_else(|| {
+                    let session = sessions.get_mut(&request.session_id).ok_or_else(|| {
                         format!("RDP session '{}' was not found", request.session_id)
                     })?;
                     let connection_state =
@@ -609,6 +636,8 @@ mod platform {
                         &request.clip_rects,
                         scale_factor,
                     )?;
+                    session.visible = true;
+                    set_rdp_overlay_focus_targets(Some(session.hwnd), Some(session.owner));
                     rdp_debug(
                         "visibility.set",
                         &json!({
@@ -617,6 +646,7 @@ mod platform {
                             "connectionState": connection_state,
                             "connectionStateLabel": rdp_connection_state_label(connection_state),
                             "scaleFactor": scale_factor,
+                            "hostScaleFactor": host_scale_factor,
                             "requestBounds": {
                                 "x": request.x,
                                 "y": request.y,
@@ -640,7 +670,7 @@ mod platform {
                     );
                     Ok(())
                 } else {
-                    let session = sessions.get(&request.session_id).ok_or_else(|| {
+                    let session = sessions.get_mut(&request.session_id).ok_or_else(|| {
                         format!("RDP session '{}' was not found", request.session_id)
                     })?;
                     let connection_state =
@@ -654,6 +684,8 @@ mod platform {
                         request.height,
                     )?;
                     reset_rdp_clip_region(session.hwnd)?;
+                    session.visible = false;
+                    clear_rdp_overlay_focus_targets(session.hwnd);
                     rdp_debug(
                         "visibility.set",
                         &json!({
@@ -691,38 +723,30 @@ mod platform {
                 let host_window = app
                     .get_webview_window(HOST_WINDOW_LABEL)
                     .ok_or_else(|| format!("host window '{HOST_WINDOW_LABEL}' is not available"))?;
-                let scale_factor = host_window
+                let host_scale_factor = host_window
                     .scale_factor()
                     .map_err(|error| format!("failed to read host window scale factor: {error}"))?;
+                let scale_factor =
+                    rdp_request_scale_factor(request.scale_factor, host_scale_factor);
                 let mut sessions = lock_sessions(&sessions)?;
                 let session = sessions
                     .get_mut(&request.session_id)
                     .ok_or_else(|| format!("RDP session '{}' was not found", request.session_id))?;
                 let tracks_pane_size = session.resolution_mode.tracks_pane_size();
-                let (rect, geometry_source) = if tracks_pane_size {
-                    (
-                        stage_rdp(
-                            session.hwnd,
-                            scale_factor,
-                            request.x,
-                            request.y,
-                            request.width,
-                            request.height,
-                        )?,
-                        "staged",
-                    )
-                } else {
-                    (
-                        scaled_rect(
-                            request.x,
-                            request.y,
-                            request.width,
-                            request.height,
-                            scale_factor,
-                        ),
-                        "computed",
-                    )
-                };
+                // Display-size synchronization must not move the native window.
+                // Bounds updates run continuously while the user drags the host
+                // window; coupling them to UpdateSessionDisplaySettings caused
+                // repeated remote resizes and visible frame stalls. The caller
+                // positions/clips the ActiveX HWND separately, while this command
+                // issues at most one debounced display update for the final size.
+                let rect = scaled_rect(
+                    request.x,
+                    request.y,
+                    request.width,
+                    request.height,
+                    scale_factor,
+                );
+                let geometry_source = "computed-without-window-move";
                 let display_settings = session.resolution_mode.display_settings(
                     request.width,
                     request.height,
@@ -753,6 +777,7 @@ mod platform {
                         "displaySyncCompleted": display_sync_completed,
                         "displaySynced": display_synced,
                         "scaleFactor": scale_factor,
+                        "hostScaleFactor": host_scale_factor,
                         "requestBounds": {
                             "x": request.x,
                             "y": request.y,
@@ -800,13 +825,20 @@ mod platform {
             let sessions = Arc::clone(&self.sessions);
             run_on_main_thread("close_rdp_session", app, move |_app| {
                 let mut sessions = lock_sessions(&sessions)?;
+                let mut closed_hwnd = None;
                 if let Some(session) = sessions.remove(&request.session_id) {
+                    closed_hwnd = Some(session.hwnd);
                     let _ = invoke_method(&session.dispatch, "Disconnect");
                     unsafe {
                         DestroyWindow(session.hwnd).map_err(|error| {
                             format!("failed to destroy RDP host window: {error}")
                         })?;
                     }
+                }
+                if sessions.is_empty() {
+                    uninstall_rdp_overlay_focus_hook();
+                } else if let Some(hwnd) = closed_hwnd {
+                    clear_rdp_overlay_focus_targets(hwnd);
                 }
                 Ok(())
             })
@@ -851,6 +883,12 @@ mod platform {
                             .to_string(),
                     );
                 }
+                if !session.visible {
+                    return Err(
+                        "RDP session is not visible; refusing to send Ctrl+Alt+Delete to a background tab"
+                            .to_string(),
+                    );
+                }
                 send_ctrl_alt_end_via_windows_input(session.owner, session.hwnd)
                     .or_else(|_| send_ctrl_alt_end_to_rdp(&session.dispatch))
                     .or_else(|_| invoke_method(&session.dispatch, "SendCtrlAltDel"))
@@ -887,6 +925,12 @@ mod platform {
                 if !is_rdp_connected_state(connection_state) {
                     return Err(
                         "RDP session is not connected; cannot send text to remote desktop"
+                            .to_string(),
+                    );
+                }
+                if !session.visible {
+                    return Err(
+                        "RDP session is not visible; refusing to send text to a background tab"
                             .to_string(),
                     );
                 }
@@ -955,15 +999,48 @@ mod platform {
                             .to_string(),
                     );
                 }
-                focus_rdp_control(session.owner, session.hwnd);
-                let normalized_key = normalize_remote_key_name(&request.key);
-                if normalized_key == "ctrlaltdelete" {
-                    return send_ctrl_alt_end_via_windows_input(session.owner, session.hwnd)
-                        .or_else(|_| send_ctrl_alt_end_to_rdp(&session.dispatch))
-                        .or_else(|_| invoke_method(&session.dispatch, "SendCtrlAltDel"));
+                if !session.visible {
+                    return Err(
+                        "RDP session is not visible; refusing to inject a key into a background tab"
+                            .to_string(),
+                    );
                 }
-                let vk = rdp_virtual_key_for_name(&request.key)?;
-                send_key_chord(&session.dispatch, &[KeyEvent::press(vk)])
+                let focus = focus_rdp_control(session.owner, session.hwnd);
+                match send_scancode_event(&session.dispatch, request.scancode, request.down) {
+                    Ok(()) => Ok(()),
+                    Err(send_keys_error) => {
+                        rdp_debug(
+                            "input.send_keys.fallback",
+                            &json!({
+                                "sessionId": &request.session_id,
+                                "scancode": request.scancode,
+                                "down": request.down,
+                                "sendKeysError": &send_keys_error,
+                                "focus": focus.as_json(),
+                            }),
+                        );
+                        send_scancode_to_focused_rdp_window(
+                            session.owner,
+                            session.hwnd,
+                            request.scancode,
+                            request.down,
+                        )
+                        .map_err(|fallback_error| {
+                            format!(
+                                "{send_keys_error}; targeted RDP window fallback also failed: {fallback_error}"
+                            )
+                        })?;
+                        rdp_debug(
+                            "input.send_keys.fallback.ok",
+                            &json!({
+                                "sessionId": &request.session_id,
+                                "scancode": request.scancode,
+                                "down": request.down,
+                            }),
+                        );
+                        Ok(())
+                    }
+                }
             })
         }
 
@@ -1022,6 +1099,7 @@ mod platform {
                     .height
                     .or_else(|| request.desktop_height.map(f64::from))
                     .unwrap_or(800.0),
+                scale_factor: request.scale_factor,
                 options: Some(RdpSessionOptions {
                     remote_resolution: request
                         .remote_resolution
@@ -1030,17 +1108,11 @@ mod platform {
                         .filter(|value| !value.is_empty())
                         .map(ToOwned::to_owned)
                         .unwrap_or_else(default_remote_resolution),
+                    redirect_drives: request.redirect_drives,
+                    use_multimon: request.use_multimon,
                     ..RdpSessionOptions::default()
                 }),
-                connection_route: RdpConnectionRoute::Direct,
             }
-        }
-
-        pub fn set_socks_proxy_port(&mut self, port: Option<u16>) {
-            self.connection_route = match port {
-                Some(port) if port > 0 => RdpConnectionRoute::Socks5 { port },
-                _ => RdpConnectionRoute::Direct,
-            };
         }
 
         pub(crate) fn secret_owner_id(&self) -> Option<&str> {
@@ -1059,10 +1131,6 @@ mod platform {
         }
     }
 
-    fn default_connection_route() -> RdpConnectionRoute {
-        RdpConnectionRoute::Direct
-    }
-
     impl UpdateRdpBoundsRequest {
         pub fn from_kkterm_bounds(
             request: crate::kkterm_rdp::types::KktermRdpBoundsRequest,
@@ -1074,6 +1142,7 @@ mod platform {
                 y: request.y,
                 width: request.width,
                 height: request.height,
+                scale_factor: Some(request.scale_factor),
                 force,
             }
         }
@@ -1089,6 +1158,7 @@ mod platform {
                 y,
                 width,
                 height,
+                scale_factor,
                 visible,
                 clip_rect,
                 mut clip_rects,
@@ -1106,6 +1176,7 @@ mod platform {
                 y,
                 width,
                 height,
+                scale_factor: Some(scale_factor),
                 clip_rects,
             }
         }
@@ -1121,6 +1192,7 @@ mod platform {
                 y: request.y,
                 width: request.width,
                 height: request.height,
+                scale_factor: Some(request.scale_factor),
             }
         }
     }
@@ -1154,7 +1226,8 @@ mod platform {
         pub fn from_kkterm_key(request: crate::kkterm_rdp::types::KktermRdpKeyRequest) -> Self {
             Self {
                 session_id: request.tab_id,
-                key: windows_key_name_for_scancode(request.scancode).to_string(),
+                scancode: request.scancode,
+                down: request.down,
             }
         }
     }
@@ -1193,161 +1266,6 @@ mod platform {
         }
     }
 
-    fn rdp_connection_route_label(route: RdpConnectionRoute) -> String {
-        match route {
-            RdpConnectionRoute::Direct => "direct".to_string(),
-            RdpConnectionRoute::Socks5 { port } => format!("socks5:{port}"),
-        }
-    }
-
-    fn start_socks_rdp_relay(
-        session_id: String,
-        target_host: String,
-        target_port: u16,
-        socks_port: u16,
-    ) -> Result<RdpTcpRelay, String> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|error| format!("failed to bind local RDP SOCKS relay: {error}"))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| format!("failed to configure local RDP SOCKS relay: {error}"))?;
-        let local_addr = listener
-            .local_addr()
-            .map_err(|error| format!("failed to read local RDP SOCKS relay address: {error}"))?;
-        let running = Arc::new(AtomicBool::new(true));
-        let thread_running = Arc::clone(&running);
-        let thread_session_id = session_id.clone();
-        let thread_target_host = target_host.clone();
-        let join = thread::Builder::new()
-            .name(format!("kkterm-rdp-relay-{session_id}"))
-            .spawn(move || {
-                rdp_debug(
-                    "windows.relay.start",
-                    &json!({
-                        "sessionId": &thread_session_id,
-                        "localAddr": local_addr.to_string(),
-                        "targetHost": &thread_target_host,
-                        "targetPort": target_port,
-                        "socksPort": socks_port,
-                    }),
-                );
-                while thread_running.load(Ordering::SeqCst) {
-                    match listener.accept() {
-                        Ok((client, peer_addr)) => {
-                            let client_session_id = thread_session_id.clone();
-                            let client_target_host = thread_target_host.clone();
-                            thread::spawn(move || {
-                                if let Err(error) = relay_rdp_client_via_socks(
-                                    client,
-                                    client_target_host,
-                                    target_port,
-                                    socks_port,
-                                ) {
-                                    rdp_debug(
-                                        "windows.relay.client_error",
-                                        &json!({
-                                            "sessionId": &client_session_id,
-                                            "peerAddr": peer_addr.to_string(),
-                                            "error": error,
-                                        }),
-                                    );
-                                }
-                            });
-                        }
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(20));
-                        }
-                        Err(error) => {
-                            if thread_running.load(Ordering::SeqCst) {
-                                rdp_debug(
-                                    "windows.relay.accept_error",
-                                    &json!({
-                                        "sessionId": &thread_session_id,
-                                        "error": error.to_string(),
-                                    }),
-                                );
-                            }
-                            break;
-                        }
-                    }
-                }
-                rdp_debug(
-                    "windows.relay.stop",
-                    &json!({
-                        "sessionId": &thread_session_id,
-                        "localAddr": local_addr.to_string(),
-                    }),
-                );
-            })
-            .map_err(|error| format!("failed to start local RDP SOCKS relay: {error}"))?;
-
-        rdp_debug(
-            "windows.relay.ready",
-            &json!({
-                "sessionId": &session_id,
-                "localAddr": local_addr.to_string(),
-                "targetHost": &target_host,
-                "targetPort": target_port,
-                "socksPort": socks_port,
-            }),
-        );
-
-        Ok(RdpTcpRelay {
-            local_addr,
-            running,
-            join: Some(join),
-        })
-    }
-
-    fn relay_rdp_client_via_socks(
-        client: TcpStream,
-        target_host: String,
-        target_port: u16,
-        socks_port: u16,
-    ) -> Result<(), String> {
-        client
-            .set_nonblocking(true)
-            .map_err(|error| format!("failed to prepare RDP relay client socket: {error}"))?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-            .map_err(|error| format!("failed to start RDP relay runtime: {error}"))?;
-        runtime.block_on(async move {
-            let mut inbound = tokio::net::TcpStream::from_std(client)
-                .map_err(|error| format!("failed to attach RDP relay client socket: {error}"))?;
-            let socks_addr = format!("127.0.0.1:{socks_port}");
-            let socks_stream = tokio_socks::tcp::Socks5Stream::connect(
-                socks_addr.as_str(),
-                (target_host.as_str(), target_port),
-            )
-            .await
-            .map_err(|error| {
-                format!("failed to connect RDP relay through SOCKS5 {socks_addr}: {error}")
-            })?;
-            let mut outbound = socks_stream.into_inner();
-            tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
-                .await
-                .map(|_| ())
-                .map_err(|error| format!("RDP relay transfer failed: {error}"))
-        })?;
-        Ok(())
-    }
-
-    fn windows_key_name_for_scancode(scancode: u16) -> &'static str {
-        match scancode {
-            0xe05b => "win",
-            0x001d | 0xe01d => "ctrl",
-            0x0038 | 0xe038 => "alt",
-            0x0053 | 0xe053 => "delete",
-            0x001c | 0xe01c => "enter",
-            0x0001 => "escape",
-            0x000e => "backspace",
-            0x000f => "tab",
-            0x0039 => "space",
-            _ => "unknown",
-        }
-    }
-
     fn start_session_on_main_thread(
         sessions: Arc<Mutex<HashMap<String, RdpSession>>>,
         app: &AppHandle,
@@ -1362,21 +1280,8 @@ mod platform {
         if port == 0 {
             return Err("RDP port must be between 1 and 65535".to_string());
         }
-        let relay = match request.connection_route {
-            RdpConnectionRoute::Direct => None,
-            RdpConnectionRoute::Socks5 { port: socks_port } => Some(start_socks_rdp_relay(
-                session_id.clone(),
-                host.clone(),
-                port,
-                socks_port,
-            )?),
-        };
-        let connect_host = if relay.is_some() {
-            "127.0.0.1"
-        } else {
-            host.as_str()
-        };
-        let connect_port = relay.as_ref().map_or(port, RdpTcpRelay::local_port);
+        let connect_host = host.as_str();
+        let connect_port = port;
         let requested_bounds = json!({
             "x": request.x,
             "y": request.y,
@@ -1400,7 +1305,7 @@ mod platform {
                 "port": port,
                 "connectHost": connect_host,
                 "connectPort": connect_port,
-                "route": rdp_connection_route_label(request.connection_route),
+                "route": "direct",
                 "keychainOwnerPresent": secret_owner_id_present,
                 "passwordSupplied": password_supplied,
                 "bounds": requested_bounds,
@@ -1425,9 +1330,10 @@ mod platform {
             .map_err(|error| format!("failed to get host window handle: {error}"))?;
 
         let parent_hwnd = HWND(parent_hwnd.0);
-        let scale_factor = host_window
+        let host_scale_factor = host_window
             .scale_factor()
             .map_err(|error| format!("failed to read host window scale factor: {error}"))?;
+        let scale_factor = rdp_request_scale_factor(request.scale_factor, host_scale_factor);
         let size = scaled_rect(
             request.x,
             request.y,
@@ -1441,6 +1347,7 @@ mod platform {
             &json!({
                 "sessionId": &session_id,
                 "scaleFactor": scale_factor,
+                "hostScaleFactor": host_scale_factor,
                 "scaledRect": {
                     "x": size.0,
                     "y": size.1,
@@ -1501,7 +1408,7 @@ mod platform {
                 "port": port,
                 "connectHost": connect_host,
                 "connectPort": connect_port,
-                "route": rdp_connection_route_label(request.connection_route),
+                "route": "direct",
                 "passwordSupplied": password_supplied,
                 "options": &options,
             }),
@@ -1522,7 +1429,6 @@ mod platform {
                 hwnd,
                 owner: parent_hwnd,
                 dispatch,
-                relay,
                 // DesktopWidth/DesktopHeight seed the initial connection, but the
                 // ActiveX control may not apply dynamic sizing until after Connect
                 // has progressed. Keep the initial values as the best known
@@ -1534,6 +1440,7 @@ mod platform {
                 device_scale_factor: display_settings.device_scale_factor,
                 dynamic_resize_failures: 0,
                 resolution_mode,
+                visible: false,
             },
         );
 
@@ -1695,8 +1602,25 @@ mod platform {
             // Windows shortcut replacements (including Ctrl+Alt+End for SAS) must be routed to
             // the remote host, while higher-risk device redirects stay disabled until KKTerm
             // exposes durable Connection settings for them.
-            let _ = set_property_bool(&advanced, "RedirectClipboard", options.redirect_clipboard);
-            let _ = set_property_bool(&advanced, "RedirectDrives", options.redirect_drives);
+            set_property_bool(&advanced, "RedirectClipboard", options.redirect_clipboard)?;
+            set_property_bool(&advanced, "RedirectDrives", options.redirect_drives)?;
+            // Newer mstscax builds expose dynamic device redirection separately.
+            // Enabling it alongside RedirectDrives keeps shell clipboard FileContents
+            // available when Explorer uses delayed rendering for copied files.
+            let dynamic_redirection =
+                configure_dynamic_redirection(dispatch, options.redirect_drives);
+            rdp_debug(
+                "clipboard.redirection.configured",
+                &json!({
+                    "redirectClipboardRequested": options.redirect_clipboard,
+                    "redirectClipboardReadback": get_property_i32(&advanced, "RedirectClipboard").ok(),
+                    "redirectDrivesRequested": options.redirect_drives,
+                    "redirectDrivesReadback": get_property_i32(&advanced, "RedirectDrives").ok(),
+                    "redirectDynamicDrivesReadback": dynamic_redirection.as_ref().ok().map(|value| value.0),
+                    "redirectDynamicDevicesConfigured": dynamic_redirection.as_ref().ok().map(|value| value.1),
+                    "dynamicRedirectionError": dynamic_redirection.as_ref().err(),
+                }),
+            );
             let _ = set_property_bool(&advanced, "RedirectPorts", false);
             let _ = set_property_bool(&advanced, "RedirectPrinters", false);
             let _ = set_property_bool(&advanced, "RedirectSmartCards", false);
@@ -1711,6 +1635,16 @@ mod platform {
                 performance_flags_for(&options.performance_profile),
             );
         }
+        let multimon_result = configure_multimon(dispatch, options.use_multimon);
+        rdp_debug(
+            "display.multimon.configured",
+            &json!({
+                "requested": options.use_multimon,
+                "configured": multimon_result.is_ok(),
+                "readback": multimon_result.as_ref().ok(),
+                "error": multimon_result.as_ref().err(),
+            }),
+        );
         if display_settings.desktop_scale_factor != RDP_DISPLAY_SCALE_FACTOR_PERCENT {
             if let Some(extended) = get_extended_settings(dispatch) {
                 let _ = set_extended_setting_u32(
@@ -1732,12 +1666,53 @@ mod platform {
         Ok(())
     }
 
+    fn configure_dynamic_redirection(
+        dispatch: &IDispatch,
+        enabled: bool,
+    ) -> Result<(bool, bool), String> {
+        let settings = dispatch
+            .cast::<IMsRdpClientNonScriptable3>()
+            .map_err(|error| format!("IMsRdpClientNonScriptable3 unavailable: {error}"))?;
+        let value = if enabled { VARIANT_TRUE } else { VARIANT_FALSE };
+        unsafe {
+            (settings.vtable().put_redirect_dynamic_drives)(settings.as_raw(), value)
+                .ok()
+                .map_err(|error| format!("RedirectDynamicDrives failed: {error}"))?;
+            (settings.vtable().put_redirect_dynamic_devices)(settings.as_raw(), value)
+                .ok()
+                .map_err(|error| format!("RedirectDynamicDevices failed: {error}"))?;
+            let mut readback = VARIANT_FALSE;
+            (settings.vtable().get_redirect_dynamic_drives)(settings.as_raw(), &mut readback)
+                .ok()
+                .map_err(|error| format!("RedirectDynamicDrives readback failed: {error}"))?;
+            Ok((readback != VARIANT_FALSE, true))
+        }
+    }
+
+    fn configure_multimon(dispatch: &IDispatch, enabled: bool) -> Result<bool, String> {
+        let settings = dispatch
+            .cast::<IMsRdpClientNonScriptable5>()
+            .map_err(|error| format!("IMsRdpClientNonScriptable5 unavailable: {error}"))?;
+        let value = if enabled { VARIANT_TRUE } else { VARIANT_FALSE };
+        unsafe {
+            (settings.vtable().put_use_multimon)(settings.as_raw(), value)
+                .ok()
+                .map_err(|error| format!("UseMultimon failed: {error}"))?;
+            let mut readback = VARIANT_FALSE;
+            (settings.vtable().get_use_multimon)(settings.as_raw(), &mut readback)
+                .ok()
+                .map_err(|error| format!("UseMultimon readback failed: {error}"))?;
+            Ok(readback != VARIANT_FALSE)
+        }
+    }
+
     impl Default for RdpSessionOptions {
         fn default() -> Self {
             Self {
                 color_depth: default_color_depth(),
                 redirect_clipboard: true,
                 redirect_drives: false,
+                use_multimon: false,
                 bitmap_cache: true,
                 performance_profile: default_performance_profile(),
                 remote_resolution: default_remote_resolution(),
@@ -2129,20 +2104,180 @@ mod platform {
         events.push(KeyEvent::up(vk));
     }
 
-    fn focus_rdp_control(owner: HWND, hwnd: HWND) {
-        // Bring the RDP ActiveX HWND forward and give it keyboard focus so synthesised
-        // keystrokes route into the remote session even when the assistant panel
-        // currently holds focus. Ignore errors: SetForegroundWindow can be denied by
-        // Windows foreground-lock rules, but SetFocus on the in-process HWND still
-        // delivers messages to the control.
-        unsafe {
-            let _ = SetForegroundWindow(owner);
-            let _ = SetFocus(Some(hwnd));
+    #[derive(Default)]
+    struct RdpOverlayFocusHook {
+        hook: Option<HHOOK>,
+        overlay: Option<HWND>,
+        owner: Option<HWND>,
+    }
+
+    fn rdp_overlay_focus_hook() -> &'static Mutex<RdpOverlayFocusHook> {
+        static HOOK: OnceLock<Mutex<RdpOverlayFocusHook>> = OnceLock::new();
+        HOOK.get_or_init(|| Mutex::new(RdpOverlayFocusHook::default()))
+    }
+
+    fn is_rdp_overlay_click_message(message: u32) -> bool {
+        matches!(
+            message,
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+        )
+    }
+
+    unsafe extern "system" fn rdp_overlay_focus_hook_proc(
+        code: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if code == HC_ACTION as i32 && is_rdp_overlay_click_message(wparam.0 as u32) {
+            let target = if lparam.0 != 0 {
+                let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+                let target = unsafe { WindowFromPoint(info.pt) };
+                (!target.0.is_null()).then_some(target)
+            } else {
+                None
+            };
+            let focus_target = {
+                let state = rdp_overlay_focus_hook()
+                    .lock()
+                    .expect("RDP overlay focus hook mutex poisoned");
+                match (state.overlay, state.owner, target) {
+                    (Some(overlay), Some(owner), Some(target))
+                        if target == overlay || unsafe { IsChild(overlay, target).as_bool() } =>
+                    {
+                        Some((owner, overlay, target))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((owner, overlay, focus)) = focus_target {
+                focus_rdp_window(owner, overlay, focus);
+            }
+        }
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+
+    fn set_rdp_overlay_focus_targets(overlay: Option<HWND>, owner: Option<HWND>) {
+        let mut state = rdp_overlay_focus_hook()
+            .lock()
+            .expect("RDP overlay focus hook mutex poisoned");
+        state.overlay = overlay;
+        state.owner = owner;
+        if overlay.is_some() && state.hook.is_none() {
+            let module = unsafe { GetModuleHandleW(PCWSTR::null()) }
+                .ok()
+                .map(|handle| HINSTANCE(handle.0));
+            match unsafe {
+                SetWindowsHookExW(WH_MOUSE_LL, Some(rdp_overlay_focus_hook_proc), module, 0)
+            } {
+                Ok(hook) => state.hook = Some(hook),
+                Err(error) => rdp_debug(
+                    "focus_hook.install_error",
+                    &json!({ "error": error.to_string() }),
+                ),
+            }
         }
     }
 
+    fn clear_rdp_overlay_focus_targets(overlay: HWND) {
+        let mut state = rdp_overlay_focus_hook()
+            .lock()
+            .expect("RDP overlay focus hook mutex poisoned");
+        if state.overlay == Some(overlay) {
+            state.overlay = None;
+            state.owner = None;
+        }
+    }
+
+    fn uninstall_rdp_overlay_focus_hook() {
+        let mut state = rdp_overlay_focus_hook()
+            .lock()
+            .expect("RDP overlay focus hook mutex poisoned");
+        if let Some(hook) = state.hook.take() {
+            if let Err(error) = unsafe { UnhookWindowsHookEx(hook) } {
+                rdp_debug(
+                    "focus_hook.uninstall_error",
+                    &json!({ "error": error.to_string() }),
+                );
+            }
+        }
+        state.overlay = None;
+        state.owner = None;
+    }
+
+    #[derive(Clone, Copy)]
+    struct RdpInputFocusState {
+        owner: HWND,
+        hwnd: HWND,
+        foreground: HWND,
+        active: HWND,
+        focus: HWND,
+        foreground_set: bool,
+    }
+
+    impl RdpInputFocusState {
+        fn has_rdp_focus(&self) -> bool {
+            let active_matches = self.active == self.hwnd || self.active == self.owner;
+            let focus_matches =
+                self.focus == self.hwnd || unsafe { IsChild(self.hwnd, self.focus).as_bool() };
+            active_matches && focus_matches
+        }
+
+        fn targets_rdp(&self) -> bool {
+            let foreground_matches = self.foreground == self.hwnd || self.foreground == self.owner;
+            foreground_matches && self.has_rdp_focus()
+        }
+
+        fn as_json(&self) -> serde_json::Value {
+            json!({
+                "owner": hwnd_value(self.owner),
+                "hwnd": hwnd_value(self.hwnd),
+                "foreground": hwnd_value(self.foreground),
+                "active": hwnd_value(self.active),
+                "focus": hwnd_value(self.focus),
+                "foregroundSet": self.foreground_set,
+                "hasRdpFocus": self.has_rdp_focus(),
+                "targetsRdp": self.targets_rdp(),
+            })
+        }
+    }
+
+    fn hwnd_value(hwnd: HWND) -> usize {
+        hwnd.0 as usize
+    }
+
+    fn focus_rdp_control(owner: HWND, hwnd: HWND) -> RdpInputFocusState {
+        focus_rdp_window(owner, hwnd, hwnd)
+    }
+
+    fn focus_rdp_window(owner: HWND, hwnd: HWND, focus: HWND) -> RdpInputFocusState {
+        // The ActiveX host is an owned WS_EX_NOACTIVATE popup. Explicitly activate
+        // that popup before using IMsRdpClientNonScriptable::SendKeys; focusing only
+        // the owner leaves the control UI-inactive and SendKeys returns E_FAIL.
+        let state = unsafe {
+            let foreground_set = SetForegroundWindow(hwnd).as_bool();
+            let _ = SetActiveWindow(hwnd);
+            let _ = SetFocus(Some(focus));
+            RdpInputFocusState {
+                owner,
+                hwnd,
+                foreground: GetForegroundWindow(),
+                active: GetActiveWindow(),
+                focus: GetFocus(),
+                foreground_set,
+            }
+        };
+        rdp_debug("input.focus", &state.as_json());
+        state
+    }
+
     fn send_ctrl_alt_end_via_windows_input(owner: HWND, hwnd: HWND) -> Result<(), String> {
-        focus_rdp_control(owner, hwnd);
+        let focus = focus_rdp_control(owner, hwnd);
+        if !focus.targets_rdp() {
+            return Err(format!(
+                "refusing to send Ctrl+Alt+End because the RDP control is not focused: {}",
+                focus.as_json()
+            ));
+        }
         let mut inputs = [
             keyboard_input(VK_CONTROL_KEY, false),
             keyboard_input(VK_ALT_KEY, false),
@@ -2155,6 +2290,7 @@ mod platform {
         if sent == inputs.len() as u32 {
             Ok(())
         } else {
+            let last_error = unsafe { GetLastError().0 };
             // Release the modifiers if Windows accepted only a partial sequence.
             inputs = [
                 keyboard_input(VK_END_KEY, true),
@@ -2166,24 +2302,27 @@ mod platform {
             ];
             let _ = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
             Err(format!(
-                "failed to send Ctrl+Alt+End to RDP control: Windows accepted {sent} of {} inputs",
-                inputs.len()
+                "failed to send Ctrl+Alt+End to RDP control: Windows accepted {sent} of {} inputs (GetLastError={last_error})",
+                inputs.len(),
             ))
         }
     }
 
     fn keyboard_input(vk: usize, up: bool) -> INPUT {
+        let mut flags = KEYBD_EVENT_FLAGS(0);
+        if is_extended_key(vk) {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        if up {
+            flags |= KEYEVENTF_KEYUP;
+        }
         INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: VIRTUAL_KEY(vk as u16),
                     wScan: 0,
-                    dwFlags: if up {
-                        KEYEVENTF_KEYUP
-                    } else {
-                        KEYBD_EVENT_FLAGS(0)
-                    },
+                    dwFlags: flags,
                     time: 0,
                     dwExtraInfo: 0,
                 },
@@ -2232,27 +2371,6 @@ mod platform {
             .collect()
     }
 
-    fn rdp_virtual_key_for_name(value: &str) -> Result<usize, String> {
-        match normalize_remote_key_name(value).as_str() {
-            "enter" | "return" => Ok(VK_RETURN_KEY),
-            "tab" => Ok(VK_TAB_KEY),
-            "escape" | "esc" => Ok(VK_ESCAPE_KEY),
-            "backspace" => Ok(VK_BACKSPACE_KEY),
-            "delete" | "del" => Ok(VK_DELETE_KEY),
-            "arrowup" | "up" => Ok(VK_UP_KEY),
-            "arrowdown" | "down" => Ok(VK_DOWN_KEY),
-            "arrowleft" | "left" => Ok(VK_LEFT_KEY),
-            "arrowright" | "right" => Ok(VK_RIGHT_KEY),
-            "home" => Ok(VK_HOME_KEY),
-            "end" => Ok(VK_END_KEY),
-            "pageup" | "pgup" => Ok(VK_PAGE_UP_KEY),
-            "pagedown" | "pgdn" => Ok(VK_PAGE_DOWN_KEY),
-            "space" => Ok(VK_SPACE_KEY),
-            "win" | "windows" | "lwin" | "metaleft" => Ok(VK_LWIN_KEY),
-            _ => Err(format!("unsupported RDP key press: {value}")),
-        }
-    }
-
     fn rdp_mouse_messages_for_button(value: &str) -> Result<(u32, u32, usize), String> {
         match normalize_remote_key_name(value).as_str() {
             "left" => Ok((WM_LBUTTONDOWN_MSG, WM_LBUTTONUP_MSG, MK_LBUTTON_WPARAM)),
@@ -2278,6 +2396,11 @@ mod platform {
     }
 
     fn send_key_chord(dispatch: &IDispatch, key_events: &[KeyEvent]) -> Result<(), String> {
+        let expanded = expand_key_chord_events(key_events);
+        send_key_events(dispatch, &expanded)
+    }
+
+    fn expand_key_chord_events(key_events: &[KeyEvent]) -> Vec<KeyEvent> {
         let mut expanded = Vec::with_capacity(key_events.len() * 2);
         for event in key_events {
             if event.up {
@@ -2289,7 +2412,103 @@ mod platform {
                 expanded.push(KeyEvent::up(event.vk));
             }
         }
-        send_key_events(dispatch, &expanded)
+        expanded
+    }
+
+    fn send_scancode_to_focused_rdp_window(
+        owner: HWND,
+        hwnd: HWND,
+        scancode: u16,
+        down: bool,
+    ) -> Result<(), String> {
+        let focus = focus_rdp_control(owner, hwnd);
+        if !focus.has_rdp_focus() {
+            return Err(format!(
+                "refusing to post keyboard input because the RDP control is not focused: {}",
+                focus.as_json()
+            ));
+        }
+
+        let (scan_code, extended) = split_set1_scancode(scancode)?;
+        let map_code = if extended {
+            0xe000 | scan_code as u32
+        } else {
+            scan_code as u32
+        };
+        let virtual_key = unsafe { MapVirtualKeyW(map_code, MAPVK_VSC_TO_VK_EX) };
+        if virtual_key == 0 {
+            return Err(format!(
+                "Windows could not map Set-1 scancode 0x{scancode:04x} to a virtual key"
+            ));
+        }
+        let target = focus.focus;
+        let message = if down { WM_KEYDOWN_MSG } else { WM_KEYUP_MSG };
+        let key_data = rdp_scancode_lparam(scancode, !down)?;
+        unsafe {
+            PostMessageW(
+                Some(target),
+                message,
+                WPARAM(virtual_key as usize),
+                LPARAM(key_data as isize),
+            )
+            .map_err(|error| {
+                format!(
+                    "failed to post scancode 0x{scancode:04x} to the focused RDP input window: {error}"
+                )
+            })?;
+        }
+        rdp_debug(
+            "input.window_message.posted",
+            &json!({
+                "hwnd": hwnd_value(hwnd),
+                "target": hwnd_value(target),
+                "scancode": scancode,
+                "down": down,
+                "virtualKey": virtual_key,
+            }),
+        );
+        Ok(())
+    }
+
+    fn send_scancode_event(dispatch: &IDispatch, scancode: u16, down: bool) -> Result<(), String> {
+        let mut key_up = [if down { VARIANT_FALSE } else { VARIANT_TRUE }];
+        let mut key_data = [rdp_scancode_lparam(scancode, !down)?];
+        let nonscriptable = dispatch
+            .cast::<IMsRdpClientNonScriptable>()
+            .map_err(|error| format!("RDP ActiveX control does not expose SendKeys: {error}"))?;
+        unsafe {
+            (nonscriptable.vtable().send_keys)(
+                Interface::as_raw(&nonscriptable),
+                1,
+                key_up.as_mut_ptr(),
+                key_data.as_mut_ptr(),
+            )
+            .ok()
+            .map_err(|error| format!("failed to send scancode to RDP ActiveX control: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn split_set1_scancode(scancode: u16) -> Result<(u16, bool), String> {
+        let prefix = scancode & 0xff00;
+        let scan_code = scancode & 0x00ff;
+        if scan_code == 0 || (prefix != 0 && prefix != 0xe000) {
+            return Err(format!("unsupported Set-1 RDP scancode: 0x{scancode:04x}"));
+        }
+        Ok((scan_code, prefix == 0xe000))
+    }
+
+    fn rdp_scancode_lparam(scancode: u16, up: bool) -> Result<i32, String> {
+        let (scan_code, extended) = split_set1_scancode(scancode)?;
+        let mut value = 1 | ((scan_code as i32) << 16);
+        if extended {
+            value |= 1 << 24;
+        }
+        if up {
+            value |= 1 << 30;
+            value |= 1u32.wrapping_shl(31) as i32;
+        }
+        Ok(value)
     }
 
     fn send_key_events(dispatch: &IDispatch, key_events: &[KeyEvent]) -> Result<(), String> {
@@ -3098,6 +3317,36 @@ mod platform {
         use super::*;
 
         #[test]
+        fn mstscax_nonscriptable_vtable_offsets_match_the_windows_type_library() {
+            assert_eq!(
+                std::mem::offset_of!(IMsRdpClientNonScriptable3Vtbl, put_redirect_dynamic_drives),
+                200
+            );
+            assert_eq!(
+                std::mem::offset_of!(IMsRdpClientNonScriptable5Vtbl, put_use_multimon),
+                424
+            );
+        }
+
+        #[test]
+        fn prefers_valid_webview_scale_and_falls_back_to_host_scale() {
+            assert_eq!(rdp_request_scale_factor(Some(1.5), 1.0), 1.5);
+            assert_eq!(rdp_request_scale_factor(Some(f64::NAN), 1.25), 1.25);
+            assert_eq!(rdp_request_scale_factor(Some(0.1), 2.0), 2.0);
+            assert_eq!(rdp_request_scale_factor(None, 1.75), 1.75);
+        }
+
+        #[test]
+        fn focus_hook_reacts_only_to_button_down_messages() {
+            assert!(is_rdp_overlay_click_message(WM_LBUTTONDOWN));
+            assert!(is_rdp_overlay_click_message(WM_RBUTTONDOWN));
+            assert!(is_rdp_overlay_click_message(WM_MBUTTONDOWN));
+            assert!(is_rdp_overlay_click_message(WM_XBUTTONDOWN));
+            assert!(!is_rdp_overlay_click_message(WM_LBUTTONUP_MSG));
+            assert!(!is_rdp_overlay_click_message(0x0200));
+        }
+
+        #[test]
         fn splits_domain_qualified_windows_users() {
             assert_eq!(
                 split_windows_user("DOMAIN\\admin"),
@@ -3154,7 +3403,10 @@ mod platform {
                 .iter()
                 .map(|input| {
                     let key = unsafe { input.Anonymous.ki };
-                    (key.wVk.0, key.dwFlags == KEYEVENTF_KEYUP)
+                    (
+                        key.wVk.0,
+                        (key.dwFlags.0 & KEYEVENTF_KEYUP.0) == KEYEVENTF_KEYUP.0,
+                    )
                 })
                 .collect();
 
@@ -3212,6 +3464,67 @@ mod platform {
             assert_eq!(desktop_height_for(240), RDP_MIN_DESKTOP_HEIGHT);
             assert_eq!(desktop_width_for(1200), 1200);
             assert_eq!(desktop_height_for(900), 900);
+        }
+
+        #[test]
+        fn preserves_raw_kkterm_scancode_and_key_direction() {
+            let down = SendRdpKeyPressRequest::from_kkterm_key(
+                crate::kkterm_rdp::types::KktermRdpKeyRequest {
+                    tab_id: "tab-1".to_string(),
+                    scancode: 0xe05b,
+                    down: true,
+                },
+            );
+            let up = SendRdpKeyPressRequest::from_kkterm_key(
+                crate::kkterm_rdp::types::KktermRdpKeyRequest {
+                    tab_id: "tab-1".to_string(),
+                    scancode: 0xe05b,
+                    down: false,
+                },
+            );
+
+            assert_eq!(down.scancode, 0xe05b);
+            assert!(down.down);
+            assert_eq!(up.scancode, 0xe05b);
+            assert!(!up.down);
+        }
+
+        #[test]
+        fn builds_active_x_lparams_from_set1_scancodes() {
+            assert_eq!(
+                rdp_scancode_lparam(0x003b, false).unwrap() as u32,
+                0x003b0001
+            );
+            assert_eq!(
+                rdp_scancode_lparam(0x003b, true).unwrap() as u32,
+                0xc03b0001
+            );
+            assert_eq!(
+                rdp_scancode_lparam(0xe053, false).unwrap() as u32,
+                0x01530001
+            );
+            assert_eq!(
+                rdp_scancode_lparam(0xe053, true).unwrap() as u32,
+                0xc1530001
+            );
+            assert_eq!(
+                rdp_scancode_lparam(0xe05b, false).unwrap() as u32,
+                0x015b0001
+            );
+            assert_eq!(
+                rdp_scancode_lparam(0x001c, false).unwrap() as u32,
+                0x001c0001
+            );
+            assert_eq!(
+                rdp_scancode_lparam(0xe01c, false).unwrap() as u32,
+                0x011c0001
+            );
+        }
+
+        #[test]
+        fn rejects_zero_and_unknown_set1_scancode_prefixes() {
+            assert!(split_set1_scancode(0).is_err());
+            assert!(split_set1_scancode(0xe11d).is_err());
         }
 
         #[test]
@@ -3381,6 +3694,7 @@ mod platform {
         pub y: f64,
         pub width: f64,
         pub height: f64,
+        pub scale_factor: Option<f64>,
         pub options: Option<RdpSessionOptions>,
     }
 
@@ -3390,6 +3704,7 @@ mod platform {
         pub color_depth: u16,
         pub redirect_clipboard: bool,
         pub redirect_drives: bool,
+        pub use_multimon: bool,
         pub bitmap_cache: bool,
         pub performance_profile: String,
         #[serde(default)]
@@ -3421,6 +3736,7 @@ mod platform {
         pub y: f64,
         pub width: f64,
         pub height: f64,
+        pub scale_factor: Option<f64>,
         #[serde(default)]
         pub force: bool,
     }
@@ -3434,6 +3750,7 @@ mod platform {
         pub y: f64,
         pub width: f64,
         pub height: f64,
+        pub scale_factor: Option<f64>,
     }
 
     #[derive(Deserialize)]
@@ -3444,6 +3761,7 @@ mod platform {
         pub y: f64,
         pub width: f64,
         pub height: f64,
+        pub scale_factor: Option<f64>,
     }
 
     #[derive(Serialize)]

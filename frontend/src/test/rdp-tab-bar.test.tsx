@@ -15,7 +15,11 @@ const baseControls: SessionControls = {
   presets: [{ label: 'Auto', value: 'adaptive' }],
   macClipboardStrategy: 'session-file-url',
   hasClipboardFolder: true,
+  fullscreen: false,
+  driveRedirectionEnabled: false,
   onApplyResolution: vi.fn(),
+  onToggleFullscreen: vi.fn(),
+  onToggleDriveRedirection: vi.fn(),
   onToggleClipboardStrategy: vi.fn(),
   onOpenClipboardFolder: vi.fn(),
   onSendClipboardText: vi.fn(),
@@ -27,6 +31,36 @@ const baseControls: SessionControls = {
 describe('RdpTabBar session controls', () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it.each([
+    ['cloud', 'routeCloudAccelerated'],
+    ['lan_direct', 'routeLanDirect'],
+    ['local_direct', 'routeLocalDirect'],
+    ['cloud_fallback', 'routeCloudFallback'],
+  ] as const)('shows the actual %s connection route', (routeLabel, expectedLabel) => {
+    render(
+      <RdpTabBar
+        tabs={[{
+          id: 'tab-route',
+          serverId: 'server-route',
+          name: 'RDP server',
+          host: '203.0.113.10:3389',
+          status: 'connected',
+          errorMsg: '',
+          routeLabel,
+        }]}
+        activeTabId="tab-route"
+        viewMode="tab"
+        sidebarOpen
+        onToggleSidebar={vi.fn()}
+        onSelectTab={vi.fn()}
+        onCloseTab={vi.fn()}
+        onViewModeChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(expectedLabel)).toBeInTheDocument();
   });
 
   it('hides native clipboard management controls when the KKTerm engine only supports text injection', () => {
@@ -184,6 +218,108 @@ describe('RdpTabBar session controls', () => {
 
     expect(onSendWinKey).not.toHaveBeenCalled();
     expect(onSendCtrlAltDel).not.toHaveBeenCalled();
+  });
+
+  it('exposes true fullscreen and local scaling session controls', () => {
+    const onApplyResolution = vi.fn();
+    const onToggleFullscreen = vi.fn();
+    render(
+      <RdpTabBar
+        tabs={[{
+          id: 'tab-1',
+          serverId: 'server-1',
+          name: '64.20.10.254',
+          host: '64.20.10.254',
+          status: 'connected',
+          errorMsg: '',
+        }]}
+        activeTabId="tab-1"
+        viewMode="tab"
+        sidebarOpen
+        onToggleSidebar={vi.fn()}
+        onSelectTab={vi.fn()}
+        onCloseTab={vi.fn()}
+        onViewModeChange={vi.fn()}
+        sessionControls={{
+          ...baseControls,
+          presets: [
+            { label: 'Auto', value: 'adaptive' },
+            { label: 'rdpLocalScaling', value: 'smartSizing' },
+          ],
+          onApplyResolution,
+          onToggleFullscreen,
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText('RDP session controls'));
+    fireEvent.click(screen.getByText('rdpFullscreen'));
+    expect(onToggleFullscreen).toHaveBeenCalledOnce();
+
+    fireEvent.click(screen.getByLabelText('RDP session controls'));
+    fireEvent.click(screen.getByText('rdpResolution'));
+    fireEvent.click(screen.getByText('rdpLocalScaling'));
+    expect(onApplyResolution).toHaveBeenCalledWith('smartSizing');
+  });
+
+  it('shows the exit-fullscreen command while fullscreen is active', () => {
+    render(
+      <RdpTabBar
+        tabs={[{
+          id: 'tab-1',
+          serverId: 'server-1',
+          name: '64.20.10.254',
+          host: '64.20.10.254',
+          status: 'connected',
+          errorMsg: '',
+        }]}
+        activeTabId="tab-1"
+        viewMode="tab"
+        sidebarOpen
+        onToggleSidebar={vi.fn()}
+        onSelectTab={vi.fn()}
+        onCloseTab={vi.fn()}
+        onViewModeChange={vi.fn()}
+        sessionControls={{ ...baseControls, fullscreen: true }}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText('RDP session controls'));
+    expect(screen.getByText('rdpExitFullscreen')).toBeInTheDocument();
+  });
+
+  it('requires an explicit switch before enabling Windows drive redirection', () => {
+    const onToggleDriveRedirection = vi.fn();
+    render(
+      <RdpTabBar
+        tabs={[{
+          id: 'tab-1',
+          serverId: 'server-1',
+          name: '64.20.10.254',
+          host: '64.20.10.254',
+          status: 'connected',
+          errorMsg: '',
+        }]}
+        activeTabId="tab-1"
+        viewMode="tab"
+        sidebarOpen
+        onToggleSidebar={vi.fn()}
+        onSelectTab={vi.fn()}
+        onCloseTab={vi.fn()}
+        onViewModeChange={vi.fn()}
+        sessionControls={{
+          ...baseControls,
+          showDriveRedirection: true,
+          onToggleDriveRedirection,
+        }}
+      />,
+    );
+
+    fireEvent.click(screen.getByLabelText('RDP session controls'));
+    const driveRedirectionSwitch = screen.getByRole('switch', { name: 'rdpDriveRedirection' });
+    expect(driveRedirectionSwitch).not.toBeChecked();
+    fireEvent.click(driveRedirectionSwitch);
+    expect(onToggleDriveRedirection).toHaveBeenCalledWith(true);
   });
 
   it('reports the tab context menu rect for native overlay clipping', () => {

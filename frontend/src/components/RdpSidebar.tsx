@@ -54,6 +54,7 @@ export function RdpSidebar({
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [editingGroupName, setEditingGroupName] = useState('');
   const [groupDragInsertIdx, setGroupDragInsertIdx] = useState<number | null>(null);
+  const [activeDrag, setActiveDrag] = useState<Pick<DragState, 'type' | 'id'> | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const groupRefs = useRef<Map<string, HTMLElement>>(new Map());
 
@@ -108,6 +109,7 @@ export function RdpSidebar({
       if (!d.active && Math.abs(e.clientY - d.startY) < 5) return;
       d.active = true;
       setDragging(true);
+      setActiveDrag({ type: d.type, id: d.id });
       setGhostName(d.name);
       setGhostPos({ x: e.clientX + 12, y: e.clientY - 8 });
 
@@ -152,6 +154,7 @@ export function RdpSidebar({
       }
       dragRef.current = null;
       setDragging(false);
+      setActiveDrag(null);
       setHoverGroupId(null);
       setGroupDragInsertIdx(null);
     };
@@ -216,7 +219,7 @@ export function RdpSidebar({
         }).map((group, gi) => {
           const groupServers = filteredServers.filter(s => s.groupId === group.id);
           const isOver = hoverGroupId === group.id && dragging;
-          const isDraggedGroup = dragging && dragRef.current?.type === 'group' && dragRef.current?.id === group.id;
+          const isDraggedGroup = dragging && activeDrag?.type === 'group' && activeDrag.id === group.id;
           return (
             <div key={group.id}>
             <div
@@ -302,7 +305,7 @@ export function RdpSidebar({
               ))}
             </div>
             {/* Group drag insertion indicator */}
-            {groupDragInsertIdx === gi + 1 && dragging && dragRef.current?.type === 'group' && (
+            {groupDragInsertIdx === gi + 1 && dragging && activeDrag?.type === 'group' && (
               <div className="mx-2 my-0.5 h-0.5 rounded-full bg-cyan-500 shadow-[0_0_6px_rgba(6,182,212,0.5)] transition-all" />
             )}
             </div>
@@ -373,7 +376,7 @@ export function RdpSidebar({
           className="fixed z-[100] pointer-events-none bg-card/90 backdrop-blur border border-cyan-500/40 rounded-md px-2.5 py-1 text-xs text-cyan-300 shadow-lg shadow-cyan-500/10 flex items-center gap-1.5"
           style={{ left: ghostPos.x, top: ghostPos.y }}
         >
-          {dragRef.current?.type === 'group' ? <FolderOpen className="h-3 w-3" /> : <Monitor className="h-3 w-3" />} {ghostName}
+          {activeDrag?.type === 'group' ? <FolderOpen className="h-3 w-3" /> : <Monitor className="h-3 w-3" />} {ghostName}
         </div>
       )}
     </div>

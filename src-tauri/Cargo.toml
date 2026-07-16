@@ -1,6 +1,6 @@
 [package]
 name = "nextdesk"
-version = "1.0.123"
+version = "1.0.124"
 edition = "2021"
 
 [features]
@@ -14,13 +14,14 @@ tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-serde_yaml = "0.9"
-reqwest = { version = "0.12", features = ["json", "socks"] }
+reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 base64 = "0.22"
+sha2 = "0.10"
+rand = "0.8"
 url = "2"
+time = { version = "0.3", features = ["formatting", "parsing"] }
 sys-locale = "0.3"
-urlencoding = "2"
 dirs = "6"
 log = "0.4"
 env_logger = "0.11"
@@ -29,14 +30,12 @@ futures-util = "0.3"
 der = { version = "0.7", features = ["alloc"] }
 tokio-native-tls = "0.3"
 native-tls = "0.2"
-tokio-socks = "0.5"
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-dialog = "2.6.0"
 tauri-plugin-fs = "2.4.5"
 tauri-plugin-process = "2"
 tauri-plugin-updater = "2"
-aggligator = "0.9"
-maxminddb = "0.24"
+tauri-plugin-deep-link = "2"
 cpal = "0.17"
 png = "0.17"
 pollster = "0.4"
@@ -48,7 +47,7 @@ lz4_flex = "0.11"
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 tokio-util = "0.7"
 tracing = { version = "0.1", features = ["log"] }
-ironrdp = { version = "0.15", features = ["connector", "session", "graphics", "pdu", "input"] }
+ironrdp = { version = "0.16", features = ["connector", "session", "graphics", "pdu", "input"] }
 ironrdp-core = "0.2"
 ironrdp-tokio = "0.9"
 tokio-rustls = "0.26"

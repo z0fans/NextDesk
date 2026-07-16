@@ -113,13 +113,11 @@ pub fn native_frame_transport_from_profile(profile: Option<&str>) -> NativeFrame
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeRdpRoute {
     Direct,
-    Socks5 { port: u16 },
 }
 
 fn native_rdp_route_label(route: NativeRdpRoute) -> String {
     match route {
         NativeRdpRoute::Direct => "direct".to_string(),
-        NativeRdpRoute::Socks5 { port } => format!("socks5:{port}"),
     }
 }
 
@@ -1341,10 +1339,6 @@ fn compression_type_for_route(
 
     match route {
         NativeRdpRoute::Direct => None,
-        // Public RDP traffic goes through a local SOCKS route and is usually
-        // bandwidth/latency-bound. RDP 6.1 bulk compression lets Windows reduce
-        // FastPath/ShareData payloads before they reach the local renderer.
-        NativeRdpRoute::Socks5 { .. } => Some(client_info::CompressionType::Rdp61),
     }
 }
 
@@ -1392,14 +1386,6 @@ fn performance_flags_for_route(
             client_info::PerformanceFlags::ENABLE_FONT_SMOOTHING
                 | client_info::PerformanceFlags::ENABLE_DESKTOP_COMPOSITION
         }
-        NativeRdpRoute::Socks5 { .. } => {
-            client_info::PerformanceFlags::ENABLE_FONT_SMOOTHING
-                | client_info::PerformanceFlags::DISABLE_WALLPAPER
-                | client_info::PerformanceFlags::DISABLE_FULLWINDOWDRAG
-                | client_info::PerformanceFlags::DISABLE_MENUANIMATIONS
-                | client_info::PerformanceFlags::DISABLE_THEMING
-                | client_info::PerformanceFlags::DISABLE_CURSOR_SHADOW
-        }
     }
 }
 
@@ -1416,7 +1402,6 @@ pub fn spawn_session(
     tab_id: String,
     host: String,
     port: u16,
-    socks_port: u16,
     username: String,
     password: String,
     domain: Option<String>,
@@ -1446,7 +1431,6 @@ pub fn spawn_session(
                 tab_id_inner,
                 host,
                 port,
-                socks_port,
                 username,
                 password,
                 domain,
@@ -1507,7 +1491,6 @@ async fn run_session(
     tab_id: String,
     host: String,
     port: u16,
-    socks_port: u16,
     username: String,
     password: String,
     domain: Option<String>,
@@ -1518,7 +1501,7 @@ async fn run_session(
     frame_ws_port: u16,
     frame_transport: NativeFrameTransport,
 ) -> Result<GracefulDisconnectReason, String> {
-    let route = choose_native_rdp_route(&host, socks_port);
+    let route = NativeRdpRoute::Direct;
     let render_mode = native_render_mode_for_route(route, width, height);
     let route_label = native_rdp_route_label(route);
     log::info!(
@@ -1545,7 +1528,8 @@ async fn run_session(
     let gfx_frame_seen = Arc::new(AtomicBool::new(false));
     let gfx_error: SharedGfxError = Arc::new(Mutex::new(None));
 
-    // Connect through the NextDesk acceleration core for public targets.
+    // The shared resolver has already selected either the requested target or
+    // a cloud relay endpoint. Both are reached with a direct TCP connection.
     let (connection_result, framed) = connect_tcp(
         &host,
         port,
@@ -1601,7 +1585,7 @@ async fn run_session(
 
 // ── TCP Accelerated Connection ───────────────────────────────
 
-/// Connect to RDP server via SOCKS5 acceleration for public targets, then TLS.
+/// Connect directly to the resolved RDP target, then upgrade to TLS.
 ///
 /// Flow: TCP connect → X.224 negotiate → TLS upgrade → NLA/CredSSP → channel join
 async fn connect_tcp(
@@ -1618,7 +1602,7 @@ async fn connect_tcp(
     render_mode: NativeRenderMode,
     app_handle: tauri::AppHandle,
 ) -> ConnectorResult<(ConnectionResult, UpgradedFramed)> {
-    let stream = connect_rdp_transport(host, port, route).await?;
+    let stream = connect_rdp_transport(host, port).await?;
 
     stream
         .set_nodelay(true)
@@ -1720,70 +1704,12 @@ async fn connect_tcp(
     Ok((connection_result, upgraded_framed))
 }
 
-async fn connect_rdp_transport(
-    host: &str,
-    port: u16,
-    route: NativeRdpRoute,
-) -> ConnectorResult<TcpStream> {
+async fn connect_rdp_transport(host: &str, port: u16) -> ConnectorResult<TcpStream> {
     let dest = format!("{host}:{port}");
-    match route {
-        NativeRdpRoute::Direct => {
-            log::info!("[rdp-native] Direct TCP -> {dest}");
-            TcpStream::connect(&dest)
-                .await
-                .map_err(|e| connector::custom_err!("TCP connect direct", e))
-        }
-        NativeRdpRoute::Socks5 { port: route_port } => {
-            let socks_addr = format!("127.0.0.1:{route_port}");
-            log::info!("[rdp-native] SOCKS5:{route_port} -> {dest}");
-            tokio_socks::tcp::Socks5Stream::connect(socks_addr.as_str(), (host, port))
-                .await
-                .map(|stream| stream.into_inner())
-                .map_err(|e| connector::custom_err!("TCP connect SOCKS5", e))
-        }
-    }
-}
-
-fn choose_native_rdp_route(host: &str, socks_port: u16) -> NativeRdpRoute {
-    if is_private_or_reserved_ip(host) {
-        NativeRdpRoute::Direct
-    } else {
-        NativeRdpRoute::Socks5 { port: socks_port }
-    }
-}
-
-fn is_private_or_reserved_ip(host: &str) -> bool {
-    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
-        return false;
-    };
-
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            let o = v4.octets();
-            o[0] == 0
-                || o[0] == 10
-                || (o[0] == 100 && (o[1] & 0xC0) == 64)
-                || o[0] == 127
-                || (o[0] == 169 && o[1] == 254)
-                || (o[0] == 172 && (o[1] & 0xF0) == 16)
-                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
-                || (o[0] == 192 && o[1] == 0 && o[2] == 2)
-                || (o[0] == 192 && o[1] == 168)
-                || (o[0] == 192 && o[1] == 88 && o[2] == 99)
-                || (o[0] == 198 && (o[1] & 0xFE) == 18)
-                || (o[0] == 198 && o[1] == 51 && o[2] == 100)
-                || (o[0] == 203 && o[1] == 0 && o[2] == 113)
-                || o[0] >= 224
-        }
-        std::net::IpAddr::V6(v6) => {
-            let s = v6.segments();
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (s[0] & 0xFE00) == 0xFC00
-                || (s[0] & 0xFFC0) == 0xFE80
-                || (s[0] & 0xFF00) == 0xFF00
-        }
-    }
+    log::info!("[rdp-native] Direct TCP -> {dest}");
+    TcpStream::connect(&dest)
+        .await
+        .map_err(|e| connector::custom_err!("TCP connect direct", e))
 }
 
 fn build_dynamic_virtual_channels(
@@ -2314,30 +2240,6 @@ mod tests {
     use ironrdp::pdu::rdp::client_info;
 
     #[test]
-    fn native_rdp_routes_public_targets_through_socks() {
-        assert_eq!(
-            choose_native_rdp_route("rdp.example.com", 17897),
-            NativeRdpRoute::Socks5 { port: 17897 }
-        );
-        assert_eq!(
-            choose_native_rdp_route("rdp.example.com", 17897),
-            NativeRdpRoute::Socks5 { port: 17897 }
-        );
-    }
-
-    #[test]
-    fn native_rdp_routes_private_targets_directly() {
-        assert_eq!(
-            choose_native_rdp_route("192.168.3.10", 17897),
-            NativeRdpRoute::Direct
-        );
-        assert_eq!(
-            choose_native_rdp_route("127.0.0.1", 17897),
-            NativeRdpRoute::Direct
-        );
-    }
-
-    #[test]
     fn native_rdp_requests_rich_visual_effects() {
         let config =
             connect_config_for_route("user", "pass", None, 1280, 720, NativeRdpRoute::Direct);
@@ -2358,49 +2260,13 @@ mod tests {
     }
 
     #[test]
-    fn native_rdp_requests_bulk_compression_for_socks_routes_only() {
+    fn native_rdp_direct_route_disables_bulk_compression() {
         assert_eq!(compression_type_for_route(NativeRdpRoute::Direct), None);
-        assert_eq!(
-            compression_type_for_route(NativeRdpRoute::Socks5 { port: 17897 }),
-            Some(client_info::CompressionType::Rdp61)
-        );
-
-        let config = connect_config_for_route(
-            "user",
-            "pass",
-            None,
-            1280,
-            720,
-            NativeRdpRoute::Socks5 { port: 17897 },
-        );
-        assert_eq!(
-            config.compression_type,
-            Some(client_info::CompressionType::Rdp61)
-        );
     }
 
     #[test]
-    fn native_rdp_recreates_bulk_decompressor_for_socks_reactivation() {
+    fn native_rdp_direct_route_needs_no_bulk_decompressor() {
         assert!(bulk_decompressor_for_route(NativeRdpRoute::Direct).is_none());
-        assert!(bulk_decompressor_for_route(NativeRdpRoute::Socks5 { port: 17897 }).is_some());
-    }
-
-    #[test]
-    fn native_rdp_uses_low_bandwidth_visual_flags_for_socks_routes() {
-        let direct_flags = performance_flags_for_route(NativeRdpRoute::Direct);
-        let socks_flags = performance_flags_for_route(NativeRdpRoute::Socks5 { port: 17897 });
-
-        assert!(!direct_flags.contains(client_info::PerformanceFlags::DISABLE_FULLWINDOWDRAG));
-        assert!(!direct_flags.contains(client_info::PerformanceFlags::DISABLE_MENUANIMATIONS));
-        assert!(direct_flags.contains(client_info::PerformanceFlags::ENABLE_DESKTOP_COMPOSITION));
-
-        assert!(socks_flags.contains(client_info::PerformanceFlags::ENABLE_FONT_SMOOTHING));
-        assert!(socks_flags.contains(client_info::PerformanceFlags::DISABLE_WALLPAPER));
-        assert!(socks_flags.contains(client_info::PerformanceFlags::DISABLE_FULLWINDOWDRAG));
-        assert!(socks_flags.contains(client_info::PerformanceFlags::DISABLE_MENUANIMATIONS));
-        assert!(socks_flags.contains(client_info::PerformanceFlags::DISABLE_THEMING));
-        assert!(socks_flags.contains(client_info::PerformanceFlags::DISABLE_CURSOR_SHADOW));
-        assert!(!socks_flags.contains(client_info::PerformanceFlags::ENABLE_DESKTOP_COMPOSITION));
     }
 
     #[test]
@@ -2505,37 +2371,18 @@ mod tests {
     }
 
     #[test]
-    fn high_resolution_socks_route_keeps_bitmap_unless_gfx_env_enabled() {
-        assert_eq!(
-            native_render_mode_for_route_with_env(
-                NativeRdpRoute::Socks5 { port: 17897 },
-                1536,
-                1003,
-                None,
-            ),
-            NativeRenderMode::Bitmap
-        );
-        assert_eq!(
-            native_render_mode_for_route_with_env(
-                NativeRdpRoute::Socks5 { port: 17897 },
-                1536,
-                1003,
-                Some("auto"),
-            ),
-            NativeRenderMode::GfxH264Auto
-        );
-        assert_eq!(
-            native_render_mode_for_route_with_env(
-                NativeRdpRoute::Socks5 { port: 17897 },
-                1536,
-                1003,
-                Some("h264"),
-            ),
-            NativeRenderMode::GfxH264Force
-        );
+    fn high_resolution_direct_route_keeps_bitmap_unless_gfx_env_enabled() {
         assert_eq!(
             native_render_mode_for_route_with_env(NativeRdpRoute::Direct, 1536, 1003, None),
             NativeRenderMode::Bitmap
+        );
+        assert_eq!(
+            native_render_mode_for_route_with_env(NativeRdpRoute::Direct, 1536, 1003, Some("auto"),),
+            NativeRenderMode::GfxH264Auto
+        );
+        assert_eq!(
+            native_render_mode_for_route_with_env(NativeRdpRoute::Direct, 1536, 1003, Some("h264"),),
+            NativeRenderMode::GfxH264Force
         );
     }
 

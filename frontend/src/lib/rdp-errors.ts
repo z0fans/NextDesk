@@ -35,6 +35,23 @@ export function friendlyRdpError(raw: string, t: (key: TranslationKey) => string
   if (!r.trim()) {
     return t('rdpErrUnknown');
   }
+  if (
+    r.includes('cloud_authorization_expired')
+    || (r.includes('cloud') && (r.includes('401') || r.includes('403') || r.includes('unauthorized')))
+  ) {
+    return t('rdpErrCloudAuth');
+  }
+  if (r.includes('cloud_prepare_unsupported')) {
+    return t('rdpErrCloudGatewayOutdated');
+  }
+  if (
+    r.includes('cloud_all_candidates_failed')
+    || r.includes('cloud_no_candidates')
+    || r.includes('candidate_apply_timeout')
+    || r.includes('not_enough_candidates')
+  ) {
+    return t('rdpErrCloudRelayUnavailable');
+  }
   if (r.includes('status_logon_failure') || r.includes('0xc000006d')) {
     return t('rdpErrLoginFailed');
   }
@@ -71,6 +88,9 @@ export function friendlyRdpError(raw: string, t: (key: TranslationKey) => string
   if (r.includes('socks') || r.includes('proxy') || r.includes('internal clash api')) {
     return t('rdpErrProxy');
   }
+  if (r.includes('read frame by hint') || r.includes('not enough bytes') || r.includes('read frame')) {
+    return t('rdpErrNoResponse');
+  }
   if (r.includes('renderer')) {
     return t('rdpErrDisplayStartup');
   }
@@ -79,9 +99,6 @@ export function friendlyRdpError(raw: string, t: (key: TranslationKey) => string
   }
   if (r.includes('ironrdp')) {
     return t('rdpErrUnknown');
-  }
-  if (r.includes('read frame by hint') || r.includes('read frame')) {
-    return t('rdpErrNoResponse');
   }
   if (r.includes('rdcleanpath')) {
     return t('rdpErrWsClosed');

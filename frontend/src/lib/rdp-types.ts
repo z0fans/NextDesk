@@ -1,3 +1,5 @@
+import type { ConnectionRoute } from '@/api';
+
 export type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error' | 'reconnecting';
 
 export interface ServerEntry {
@@ -27,6 +29,7 @@ export interface SessionTab {
   host: string;
   status: ConnectionState;
   errorMsg: string;
+  routeLabel?: ConnectionRoute;
   thumbnailUrl?: string;
 }
 

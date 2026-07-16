@@ -1,13 +1,12 @@
-name: Windows Verify Artifact
+name: Windows RDP Verify Artifact
 
 on:
   push:
     branches:
-      - codex/verify-node-delay-windows
+      - codex/verify-rdp-windows
   workflow_dispatch:
 
 env:
-  MIHOMO_VERSION: v1.19.27
   HAS_TAURI_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
   VITE_NEXTDESK_RDP_ENGINE: kkterm-copy
   VITE_NEXTDESK_KKTERM_KEYBOARD_MODE: remote-scancode
@@ -32,24 +31,23 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install dependencies
-        run: npm install && cd frontend && npm install
+      - name: Install locked dependencies
+        run: npm ci && npm --prefix frontend ci
 
-      - name: Download Windows mihomo and geodata
+      - name: Run frontend quality gate
         shell: bash
-        run: bash scripts/download-deps.sh x86_64-pc-windows-msvc
-
-      - name: Verify bundled Windows engines
-        shell: pwsh
         run: |
-          Get-ChildItem .backend\bin\nextdesk-core*.exe | Select-Object Name,Length
-          if (!(Test-Path .backend\bin\nextdesk-core-amd64.exe)) { throw "missing amd64 core" }
-          if (!(Test-Path .backend\bin\nextdesk-core-arm64.exe)) { throw "missing arm64 core" }
-          if (!(Test-Path .backend\bin\nextdesk-core.exe)) { throw "missing legacy core" }
+          npm --prefix frontend run lint
+          npm --prefix frontend test -- --run
+          npm --prefix frontend run build
 
       - name: Sanitize signing key
         if: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
@@ -75,10 +73,8 @@ jobs:
         shell: bash
         working-directory: src-tauri
         run: |
-          cargo test exited_internal_engine_is_not_reported_running -- --nocapture
-          cargo test node_delay_test_starts_engine_when_proxy_api_is_unavailable -- --nocapture
-          cargo test windows_arm64_hosts_prefer_arm64_engine -- --nocapture
-          cargo test windows_amd64_hosts_prefer_amd64_engine -- --nocapture
+          cargo fmt --all -- --check
+          cargo test --locked --lib --features kkterm-rdp -- --nocapture
 
       - name: Build Windows verification package
         shell: pwsh
@@ -93,7 +89,7 @@ jobs:
       - name: Upload Windows verification artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nextdesk-windows-verify-1.0.117
+          name: nextdesk-windows-verify-${{ github.run_number }}-${{ github.sha }}
           path: |
             src-tauri/target/release/bundle/nsis/**
             src-tauri/target/release/bundle/msi/**

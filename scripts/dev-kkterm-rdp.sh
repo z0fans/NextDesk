@@ -3,9 +3,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TAURI_DIR="$ROOT_DIR/src-tauri"
+KKTERM_TOML="$TAURI_DIR/Cargo.kkterm.toml"
+KKTERM_LOCK="$TAURI_DIR/Cargo.kkterm.lock"
 
-if [[ ! -f "$TAURI_DIR/Cargo.kkterm.toml" ]]; then
-  echo "Missing $TAURI_DIR/Cargo.kkterm.toml" >&2
+if [[ ! -f "$KKTERM_TOML" ]]; then
+  echo "Missing $KKTERM_TOML" >&2
   exit 1
 fi
 
@@ -18,6 +20,9 @@ restore_manifest() {
     return
   fi
   restored=1
+  if [[ -f "$TAURI_DIR/Cargo.lock" ]]; then
+    cp "$TAURI_DIR/Cargo.lock" "$KKTERM_LOCK"
+  fi
   cp "$backup_toml" "$TAURI_DIR/Cargo.toml"
   cp "$backup_lock" "$TAURI_DIR/Cargo.lock"
   rm -f "$backup_toml" "$backup_lock"
@@ -29,7 +34,10 @@ trap restore_manifest EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-cp "$TAURI_DIR/Cargo.kkterm.toml" "$TAURI_DIR/Cargo.toml"
+cp "$KKTERM_TOML" "$TAURI_DIR/Cargo.toml"
+if [[ -f "$KKTERM_LOCK" ]]; then
+  cp "$KKTERM_LOCK" "$TAURI_DIR/Cargo.lock"
+fi
 
 export VITE_NEXTDESK_RDP_ENGINE="${VITE_NEXTDESK_RDP_ENGINE:-kkterm-copy}"
 export VITE_NEXTDESK_KKTERM_KEYBOARD_MODE="${VITE_NEXTDESK_KKTERM_KEYBOARD_MODE:-remote-scancode}"

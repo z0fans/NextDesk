@@ -18,14 +18,58 @@ on:
           - windows
 
 env:
-  MIHOMO_VERSION: v1.19.27
   HAS_TAURI_SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
   VITE_NEXTDESK_RDP_ENGINE: kkterm-copy
   VITE_NEXTDESK_KKTERM_KEYBOARD_MODE: remote-scancode
   RUSTFLAGS: --cfg nextdesk_kkterm_rdp
 
 jobs:
+  quality-gate:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout patched IronRDP
+        shell: bash
+        run: |
+          git clone --no-tags https://github.com/Devolutions/IronRDP.git ../IronRDP
+          git -C ../IronRDP checkout bf694c8a239d4cf53e7dd8edbe26f2aeb07bcf26
+          git -C ../IronRDP apply "$PWD/patches/ironrdp-nextdesk.patch"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install locked dependencies
+        run: npm ci && npm --prefix frontend ci
+
+      - name: Frontend quality gate
+        run: |
+          npm --prefix frontend run lint
+          npm --prefix frontend test -- --run
+          npm --prefix frontend run build
+
+      - name: Rust quality gate
+        working-directory: src-tauri
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --lib --features kkterm-rdp -- --nocapture
+
+      - name: Patch hygiene
+        run: git diff --check
+
   build-macos:
+    needs: quality-gate
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos' }}
     runs-on: macos-latest
     permissions:
@@ -44,17 +88,18 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: Install dependencies
-        run: npm install && cd frontend && npm install
-
-      - name: Download mihomo & geodata
-        run: bash scripts/download-deps.sh universal-apple-darwin
+      - name: Install locked dependencies
+        run: npm ci && npm --prefix frontend ci
 
       - name: Sanitize signing key
         if: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
@@ -90,6 +135,7 @@ jobs:
           includeUpdaterJson: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
 
   build-macos-intel:
+    needs: quality-gate
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.platform == 'macos-intel' }}
     runs-on: macos-13
     permissions:
@@ -108,17 +154,18 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin
 
-      - name: Install dependencies
-        run: npm install && cd frontend && npm install
-
-      - name: Download mihomo & geodata
-        run: bash scripts/download-deps.sh x86_64-apple-darwin
+      - name: Install locked dependencies
+        run: npm ci && npm --prefix frontend ci
 
       - name: Sanitize signing key
         if: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
@@ -154,10 +201,11 @@ jobs:
           includeUpdaterJson: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
 
   build-windows:
-    needs: build-macos
+    needs: [quality-gate, build-macos]
     if: >-
       ${{
         always()
+        && needs.quality-gate.result == 'success'
         && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows')
         && ((github.event_name == 'workflow_dispatch' && inputs.platform == 'windows') || needs.build-macos.result == 'success')
       }}
@@ -178,16 +226,21 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install dependencies
-        run: npm install && cd frontend && npm install
+      - name: Install locked dependencies
+        run: npm ci && npm --prefix frontend ci
 
-      - name: Download mihomo & geodata
-        shell: bash
-        run: bash scripts/download-deps.sh x86_64-pc-windows-msvc
+      - name: Run Windows Rust regression tests
+        shell: pwsh
+        working-directory: src-tauri
+        run: cargo test --locked --lib --features kkterm-rdp -- --nocapture
 
       - name: Sanitize signing key
         if: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
