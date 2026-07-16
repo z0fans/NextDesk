@@ -1,6 +1,7 @@
 #[cfg(target_os = "windows")]
 mod platform {
     use std::{
+        cell::RefCell,
         collections::HashMap,
         ffi::c_void,
         mem::ManuallyDrop,
@@ -2111,9 +2112,13 @@ mod platform {
         owner: Option<HWND>,
     }
 
-    fn rdp_overlay_focus_hook() -> &'static Mutex<RdpOverlayFocusHook> {
-        static HOOK: OnceLock<Mutex<RdpOverlayFocusHook>> = OnceLock::new();
-        HOOK.get_or_init(|| Mutex::new(RdpOverlayFocusHook::default()))
+    thread_local! {
+        // The low-level mouse hook is installed from Tauri's main thread and
+        // Windows invokes its callback on that same thread. Keeping the raw
+        // HHOOK/HWND values thread-local preserves that affinity without
+        // claiming that the pointer-backed handle wrappers are Send.
+        static RDP_OVERLAY_FOCUS_HOOK: RefCell<RdpOverlayFocusHook> =
+            RefCell::new(RdpOverlayFocusHook::default());
     }
 
     fn is_rdp_overlay_click_message(message: u32) -> bool {
@@ -2136,10 +2141,8 @@ mod platform {
             } else {
                 None
             };
-            let focus_target = {
-                let state = rdp_overlay_focus_hook()
-                    .lock()
-                    .expect("RDP overlay focus hook mutex poisoned");
+            let focus_target = RDP_OVERLAY_FOCUS_HOOK.with(|state| {
+                let state = state.borrow();
                 match (state.overlay, state.owner, target) {
                     (Some(overlay), Some(owner), Some(target))
                         if target == overlay || unsafe { IsChild(overlay, target).as_bool() } =>
@@ -2148,7 +2151,7 @@ mod platform {
                     }
                     _ => None,
                 }
-            };
+            });
             if let Some((owner, overlay, focus)) = focus_target {
                 focus_rdp_window(owner, overlay, focus);
             }
@@ -2157,51 +2160,51 @@ mod platform {
     }
 
     fn set_rdp_overlay_focus_targets(overlay: Option<HWND>, owner: Option<HWND>) {
-        let mut state = rdp_overlay_focus_hook()
-            .lock()
-            .expect("RDP overlay focus hook mutex poisoned");
-        state.overlay = overlay;
-        state.owner = owner;
-        if overlay.is_some() && state.hook.is_none() {
-            let module = unsafe { GetModuleHandleW(PCWSTR::null()) }
-                .ok()
-                .map(|handle| HINSTANCE(handle.0));
-            match unsafe {
-                SetWindowsHookExW(WH_MOUSE_LL, Some(rdp_overlay_focus_hook_proc), module, 0)
-            } {
-                Ok(hook) => state.hook = Some(hook),
-                Err(error) => rdp_debug(
-                    "focus_hook.install_error",
-                    &json!({ "error": error.to_string() }),
-                ),
+        RDP_OVERLAY_FOCUS_HOOK.with(|state| {
+            let mut state = state.borrow_mut();
+            state.overlay = overlay;
+            state.owner = owner;
+            if overlay.is_some() && state.hook.is_none() {
+                let module = unsafe { GetModuleHandleW(PCWSTR::null()) }
+                    .ok()
+                    .map(|handle| HINSTANCE(handle.0));
+                match unsafe {
+                    SetWindowsHookExW(WH_MOUSE_LL, Some(rdp_overlay_focus_hook_proc), module, 0)
+                } {
+                    Ok(hook) => state.hook = Some(hook),
+                    Err(error) => rdp_debug(
+                        "focus_hook.install_error",
+                        &json!({ "error": error.to_string() }),
+                    ),
+                }
             }
-        }
+        });
     }
 
     fn clear_rdp_overlay_focus_targets(overlay: HWND) {
-        let mut state = rdp_overlay_focus_hook()
-            .lock()
-            .expect("RDP overlay focus hook mutex poisoned");
-        if state.overlay == Some(overlay) {
-            state.overlay = None;
-            state.owner = None;
-        }
+        RDP_OVERLAY_FOCUS_HOOK.with(|state| {
+            let mut state = state.borrow_mut();
+            if state.overlay == Some(overlay) {
+                state.overlay = None;
+                state.owner = None;
+            }
+        });
     }
 
     fn uninstall_rdp_overlay_focus_hook() {
-        let mut state = rdp_overlay_focus_hook()
-            .lock()
-            .expect("RDP overlay focus hook mutex poisoned");
-        if let Some(hook) = state.hook.take() {
-            if let Err(error) = unsafe { UnhookWindowsHookEx(hook) } {
-                rdp_debug(
-                    "focus_hook.uninstall_error",
-                    &json!({ "error": error.to_string() }),
-                );
+        RDP_OVERLAY_FOCUS_HOOK.with(|state| {
+            let mut state = state.borrow_mut();
+            if let Some(hook) = state.hook.take() {
+                if let Err(error) = unsafe { UnhookWindowsHookEx(hook) } {
+                    rdp_debug(
+                        "focus_hook.uninstall_error",
+                        &json!({ "error": error.to_string() }),
+                    );
+                }
             }
-        }
-        state.overlay = None;
-        state.owner = None;
+            state.overlay = None;
+            state.owner = None;
+        });
     }
 
     #[derive(Clone, Copy)]
