@@ -1561,6 +1561,58 @@ export function RdpManager({
     scheduleKktermViewBoundsSync('state');
   }, [store.activeTabId, store.viewMode, store.activeTab?.status, isRdpViewVisible, scheduleKktermViewBoundsSync]);
 
+  // Hide the Windows ActiveX control's own white disconnect page and let the
+  // NextDesk overlay explain that the remote session was replaced/disconnected.
+  useEffect(() => {
+    if (!USE_KKTERM_COPY_WINDOWS) return;
+    const timer = window.setInterval(() => {
+      const tabId = activeTabIdRef.current;
+      const tab = tabsRef.current.find(item => item.id === tabId);
+      if (!tabId || tab?.status !== 'connected' || !kktermTabsRef.current.has(tabId)) return;
+
+      void kktermRdpStatus({ tabId }).then(async status => {
+        if (status.connectionState !== 0 || userDisconnectedRef.current.has(tabId)) return;
+
+        userDisconnectedRef.current.add(tabId);
+        kktermViewLastBoundsByTabRef.current.delete(tabId);
+        try {
+          await kktermRdpSetBounds({
+            tabId,
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            scaleFactor: window.devicePixelRatio || 1,
+            visible: false,
+          });
+        } catch (error) {
+          rdpLog.warn('rdp', 'kkterm-rdp disconnected surface hide failed', {
+            tabId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        await kktermRdpDisconnect({ tabId }).catch(() => undefined);
+        kktermTabsRef.current.delete(tabId);
+        kktermViewLastBoundsByTabRef.current.delete(tabId);
+        stopFpsCounter(tabId);
+        store.updateTabStatus(tabId, 'error', t('rdpErrAnotherUser'));
+        setRdpStats(prev => ({ ...prev, status: 'error' }));
+        rdpLog.warn('rdp', 'kkterm-rdp native session ended without auto-reconnect', {
+          tabId,
+          connectionState: status.connectionState,
+          reason: 'remote_session_replaced_or_disconnected',
+        });
+      }).catch(error => {
+        rdpLog.debug('rdp', 'kkterm-rdp status poll skipped', {
+          tabId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }, 1500);
+
+    return () => window.clearInterval(timer);
+  }, [store, stopFpsCounter, t]);
+
   useEffect(() => {
     if (!USE_NATIVE_RDP) return;
     const tabId = isRdpViewVisible && store.viewMode === 'tab' ? store.activeTabId : null;
@@ -5026,7 +5078,10 @@ export function RdpManager({
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
-                    <Button variant="outline" size="sm" onClick={() => connectSession(activeTab.id)}>{t('rdpRetry')}</Button>
+                    <Button variant="outline" size="sm" onClick={() => {
+                      userDisconnectedRef.current.delete(activeTab.id);
+                      connectSession(activeTab.id);
+                    }}>{t('rdpRetry')}</Button>
                     <Button variant="outline" size="sm" onClick={() => { setEditServerId(activeTab.serverId); setShowNewConn(true); }}>{t('rdpEdit')}</Button>
                   </div>
                 </div>
