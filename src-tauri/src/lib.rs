@@ -406,6 +406,21 @@ fn handle_cloud_deep_link_urls(app: AppHandle, urls: Vec<String>) {
     }
 }
 
+fn cloud_auth_urls_from_args(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|arg| is_cloud_auth_callback(arg))
+        .cloned()
+        .collect()
+}
+
+fn focus_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 async fn write_cloud_callback_response(
     stream: &mut tokio::net::TcpStream,
     status: &str,
@@ -1306,6 +1321,13 @@ pub fn run() {
     *app_state.cloud_authorization_base_url.lock().unwrap() = saved.cloud_authorization_base_url;
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            focus_main_window(app);
+            let urls = cloud_auth_urls_from_args(&args);
+            if !urls.is_empty() {
+                handle_cloud_deep_link_urls(app.clone(), urls);
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1491,7 +1513,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::cloud_authorization_base_url_from_state;
+    use super::{cloud_auth_urls_from_args, cloud_authorization_base_url_from_state};
     use crate::state::AppState;
 
     #[test]
@@ -1513,6 +1535,20 @@ mod tests {
         assert_eq!(
             cloud_authorization_base_url_from_state(&app_state).unwrap(),
             "https://oauth.mxolab.com"
+        );
+    }
+
+    #[test]
+    fn second_instance_forwards_only_cloud_auth_callbacks() {
+        let args = vec![
+            "C:\\Program Files\\NextDesk\\nextdesk-core.exe".to_string(),
+            "nextdesk://auth/complete".to_string(),
+            "nextdesk://auth/callback?code=abc&state=xyz".to_string(),
+        ];
+
+        assert_eq!(
+            cloud_auth_urls_from_args(&args),
+            vec!["nextdesk://auth/callback?code=abc&state=xyz"]
         );
     }
 }
