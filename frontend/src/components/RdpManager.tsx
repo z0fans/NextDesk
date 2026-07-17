@@ -24,6 +24,7 @@ import {
 import type { SessionStore } from '@/lib/useSessionStore';
 import { Monitor } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { canRecoverKktermWindowsResize } from '@/rdp/kkterm/resize-recovery';
 import { cn } from '@/lib/utils';
 import { useTranslation } from '@/i18n/useTranslation';
 import { codeToScancode } from '@/lib/scancodeMap';
@@ -707,6 +708,7 @@ export function RdpManager({
   const kktermViewLastBoundsByTabRef = useRef<Map<string, string>>(new Map());
   const kktermOverlayClipRectsRef = useRef<Map<string, KktermRdpClipRect>>(new Map());
   const kktermPostConnectSettleTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>[]>>(new Map());
+  const kktermResizeRecoveryAtRef = useRef<Map<string, number>>(new Map());
   const isRdpViewVisibleRef = useRef(isRdpViewVisible);
   const activeTabIdRef = useRef<string | null>(null);
   const tabsRef = useRef(store.tabs);
@@ -3586,6 +3588,30 @@ export function RdpManager({
       desiredSizeRef.current = null;
       const bounds = buildKktermVisibleBounds(tabId);
       if (!bounds) return;
+      const recoverWithFinalSize = (failure: 'not-synchronized' | 'error', detail?: unknown) => {
+        const now = Date.now();
+        const lastRecoveryAt = kktermResizeRecoveryAtRef.current.get(tabId);
+        if (!canRecoverKktermWindowsResize(now, lastRecoveryAt)) {
+          rdpLog.warn('display', `adaptive resize (${reason}, kkterm-windows) recovery throttled`, {
+            tabId,
+            width: w,
+            height: h,
+            failure,
+          });
+          return;
+        }
+        const currentTab = tabsRef.current.find(item => item.id === tabId);
+        if (currentTab?.status !== 'connected' || !kktermTabsRef.current.has(tabId)) return;
+        kktermResizeRecoveryAtRef.current.set(tabId, now);
+        rdpLog.warn('display', `adaptive resize (${reason}, kkterm-windows) → reconnect fallback`, {
+          tabId,
+          width: w,
+          height: h,
+          failure,
+          detail,
+        });
+        reconnectWithSize(tabId, w, h);
+      };
       scheduleKktermViewBoundsSync(`adaptive resize ${reason}`);
       const startedAt = performance.now();
       rdpLog.info('display', `adaptive resize (${reason}, kkterm-windows) → debounced display sync: ${w} x ${h}`, {
@@ -3603,8 +3629,12 @@ export function RdpManager({
             elapsedMs,
             connectionState: display.connectionState,
           });
+          recoverWithFinalSize('not-synchronized', {
+            connectionState: display.connectionState,
+          });
           return;
         }
+        kktermResizeRecoveryAtRef.current.delete(tabId);
         lastSizeRef.current = {
           w: display.desktopWidth || w,
           h: display.desktopHeight || h,
@@ -3625,6 +3655,10 @@ export function RdpManager({
           elapsedMs: Math.round(performance.now() - startedAt),
           error: error instanceof Error ? error.message : String(error),
         });
+        recoverWithFinalSize(
+          'error',
+          error instanceof Error ? error.message : String(error),
+        );
       });
       return;
     }
