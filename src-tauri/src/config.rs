@@ -20,6 +20,8 @@ pub struct SavedConfig {
     #[serde(default)]
     pub cloud_device_id: String,
     #[serde(default)]
+    pub cloud_installation_id: String,
+    #[serde(default)]
     pub cloud_device_expires_at: String,
     #[serde(default)]
     pub cloud_account_display: String,

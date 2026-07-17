@@ -31,6 +31,13 @@ fn random_hex(bytes: usize) -> String {
     out.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn ensure_installation_id(saved: &mut config::SavedConfig) -> String {
+    if saved.cloud_installation_id.trim().is_empty() {
+        saved.cloud_installation_id = format!("inst_{}", random_hex(24));
+    }
+    saved.cloud_installation_id.clone()
+}
+
 fn pending_path() -> std::path::PathBuf {
     config::get_user_config_dir().join("cloud_auth_pending.json")
 }
@@ -111,6 +118,10 @@ pub async fn handle_callback(callback_url: String) -> Result<CloudAccountStatus,
         return Err("callback state mismatch".to_string());
     }
 
+    let mut saved = config::load_saved_config();
+    let installation_id = ensure_installation_id(&mut saved);
+    config::save_config(&saved);
+
     let token = cloud_gateway::exchange_code(
         &pending.panel_url,
         &code,
@@ -119,11 +130,11 @@ pub async fn handle_callback(callback_url: String) -> Result<CloudAccountStatus,
         "NextDesk",
         std::env::consts::OS,
         env!("CARGO_PKG_VERSION"),
+        &installation_id,
     )
     .await?;
 
     store_device_token(&token.device_id, &token.device_token)?;
-    let mut saved = config::load_saved_config();
     saved.dashboard_url = pending.panel_url;
     saved.cloud_authorization_base_url = saved.dashboard_url.clone();
     saved.cloud_device_id = token.device_id;
@@ -148,7 +159,8 @@ pub async fn handle_callback(callback_url: String) -> Result<CloudAccountStatus,
 
 #[cfg(test)]
 mod tests {
-    use super::build_authorize_url;
+    use super::{build_authorize_url, ensure_installation_id};
+    use crate::config::SavedConfig;
     use url::Url;
 
     #[test]
@@ -170,6 +182,17 @@ mod tests {
             .query_pairs()
             .any(|(key, value)| key == "redirect_uri"
                 && value == "http://127.0.0.1:43123/cloud/auth/callback"));
+    }
+
+    #[test]
+    fn installation_id_is_created_once_and_survives_reauthorization() {
+        let mut saved = SavedConfig::default();
+        let first = ensure_installation_id(&mut saved);
+        let second = ensure_installation_id(&mut saved);
+
+        assert!(first.starts_with("inst_"));
+        assert_eq!(first, second);
+        assert_eq!(saved.cloud_installation_id, first);
     }
 }
 

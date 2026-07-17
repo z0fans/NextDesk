@@ -174,20 +174,19 @@ pub async fn exchange_code(
     device_name: &str,
     platform: &str,
     app_version: &str,
+    installation_id: &str,
 ) -> Result<TokenResponse, String> {
     let response = client()?
         .post(format!("{}/api/v1/connect/token", base(panel_url)))
-        .json(&serde_json::json!({
-            "grant_type": "authorization_code",
-            "code": code,
-            "code_verifier": verifier,
-            "redirect_uri": redirect_uri,
-            "device": {
-                "name": device_name,
-                "platform": platform,
-                "app_version": app_version
-            }
-        }))
+        .json(&token_request_body(
+            code,
+            verifier,
+            redirect_uri,
+            device_name,
+            platform,
+            app_version,
+            installation_id,
+        ))
         .send()
         .await
         .map_err(|e| format!("cloud token request failed: {e}"))?;
@@ -214,9 +213,32 @@ pub async fn exchange_code(
         .map_err(|e| format!("cloud token parse failed: {e}"))
 }
 
+fn token_request_body(
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+    device_name: &str,
+    platform: &str,
+    app_version: &str,
+    installation_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "grant_type": "authorization_code",
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": redirect_uri,
+        "device": {
+            "name": device_name,
+            "platform": platform,
+            "app_version": app_version,
+            "installation_id": installation_id
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::token_rejection;
+    use super::{token_rejection, token_request_body};
     use reqwest::StatusCode;
 
     #[test]
@@ -237,6 +259,21 @@ mod tests {
 
         assert_eq!(client_error, "cloud_auth_rate_limited");
         assert!(server_code.is_empty());
+    }
+
+    #[test]
+    fn token_request_includes_stable_installation_id() {
+        let body = token_request_body(
+            "code-1",
+            "verifier-1",
+            "nextdesk://auth/callback",
+            "NextDesk",
+            "windows",
+            "1.0.126",
+            "inst_1234567890abcdef",
+        );
+
+        assert_eq!(body["device"]["installation_id"], "inst_1234567890abcdef");
     }
 }
 
