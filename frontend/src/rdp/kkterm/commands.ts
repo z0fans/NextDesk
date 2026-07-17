@@ -97,6 +97,10 @@ export function kktermRdpSetBounds(request: KktermRdpBoundsRequest) {
   return invoke<void>('kkterm_rdp_set_bounds', { request });
 }
 
+export function kktermRdpFollowHostWindow() {
+  return invoke<void>('kkterm_rdp_follow_host_window');
+}
+
 export function kktermRdpStatus(request: KktermRdpSimpleRequest) {
   return invoke<KktermRdpStatusResponse>('kkterm_rdp_status', { request });
 }

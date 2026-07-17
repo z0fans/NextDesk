@@ -1060,6 +1060,12 @@ fn kkterm_rdp_set_bounds(
 
 #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
 #[tauri::command]
+fn kkterm_rdp_follow_host_window(app: tauri::AppHandle) -> Result<(), String> {
+    kkterm_rdp_windows_manager().follow_host_window(app)
+}
+
+#[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
+#[tauri::command]
 fn kkterm_rdp_status(
     app: tauri::AppHandle,
     request: kkterm_rdp::types::KktermRdpSimpleRequest,
@@ -1091,6 +1097,16 @@ fn kkterm_rdp_sync_display_size(
 fn kkterm_rdp_set_bounds(
     _request: kkterm_rdp::types::KktermRdpBoundsRequest,
 ) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "kkterm-rdp",
+    nextdesk_kkterm_rdp,
+    not(target_os = "windows")
+))]
+#[tauri::command]
+fn kkterm_rdp_follow_host_window() -> Result<(), String> {
     Ok(())
 }
 
@@ -1475,6 +1491,8 @@ pub fn run() {
             kkterm_rdp_start,
             #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp))]
             kkterm_rdp_set_bounds,
+            #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp))]
+            kkterm_rdp_follow_host_window,
             #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]
             kkterm_rdp_status,
             #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp, target_os = "windows"))]

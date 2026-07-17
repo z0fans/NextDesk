@@ -3,6 +3,7 @@ import {
   kktermRdpCtrlAltDelete,
   kktermRdpDisconnect,
   kktermRdpForceClipboardCheck,
+  kktermRdpFollowHostWindow,
   kktermRdpKey,
   kktermRdpPointer,
   kktermRdpSetActiveClipboardSession,
@@ -64,6 +65,7 @@ describe('kkterm RDP direct commands', () => {
     await kktermRdpCtrlAltDelete({ tabId: 'tab-public' });
     await kktermRdpSetActiveClipboardSession('tab-public');
     await kktermRdpForceClipboardCheck({ tabId: 'tab-public' });
+    await kktermRdpFollowHostWindow();
     await kktermRdpSetBounds({
       tabId: 'tab-public',
       x: 1,
@@ -108,6 +110,7 @@ describe('kkterm RDP direct commands', () => {
     expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_force_clipboard_check', {
       request: { tabId: 'tab-public' },
     });
+    expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_follow_host_window');
     expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_set_bounds', {
       request: {
         tabId: 'tab-public',

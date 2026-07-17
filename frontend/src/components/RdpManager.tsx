@@ -12,6 +12,7 @@ import {
   kktermRdpCtrlAltDelete,
   kktermRdpDisconnect,
   kktermRdpForceClipboardCheck,
+  kktermRdpFollowHostWindow,
   kktermRdpKey,
   kktermRdpSetBounds,
   kktermRdpSetActiveClipboardSession,
@@ -21,6 +22,7 @@ import {
   kktermRdpText,
   type KktermRdpBoundsRequest,
 } from '@/rdp/kkterm/commands';
+import { createKktermHostMoveFollower } from '@/rdp/kkterm/hostMoveFollower';
 import type { SessionStore } from '@/lib/useSessionStore';
 import { Monitor } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -1411,7 +1413,6 @@ export function RdpManager({
     const continuousLayoutChange =
       reason === 'observer'
       || reason === 'window resize'
-      || reason === 'window moved'
       || reason === 'tauri window resized';
     if (!continuousLayoutChange) {
       if (kktermViewBoundsThrottleTimerRef.current) {
@@ -1814,7 +1815,15 @@ export function RdpManager({
         });
     };
     const appWindow = getCurrentWindow();
-    registerWindowListener(appWindow.onMoved(() => forceBoundsSync('window moved')));
+    const hostMoveFollower = createKktermHostMoveFollower(
+      kktermRdpFollowHostWindow,
+      error => {
+        rdpLog.debug('rdp', 'kkterm-rdp ActiveX host move follow failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    );
+    registerWindowListener(appWindow.onMoved(hostMoveFollower.request));
     registerWindowListener(appWindow.onResized(() => forceBoundsSync('tauri window resized')));
     registerWindowListener(appWindow.onScaleChanged(() => {
       forceBoundsSync('window scale changed');
@@ -1851,6 +1860,7 @@ export function RdpManager({
 
     return () => {
       active = false;
+      hostMoveFollower.dispose();
       tauriUnlisteners.forEach(unlisten => unlisten());
       obs.disconnect();
       window.removeEventListener('resize', onResize);

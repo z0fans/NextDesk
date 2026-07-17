@@ -50,9 +50,9 @@ mod platform {
                     GetWindowRect, IsChild, PostMessageW, SendMessageW, SetForegroundWindow,
                     SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx,
                     WindowFromPoint, HC_ACTION, HHOOK, HMENU, MSLLHOOKSTRUCT, SWP_NOACTIVATE,
-                    SWP_NOZORDER, SW_SHOWNOACTIVATE, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
-                    WM_RBUTTONDOWN, WM_XBUTTONDOWN, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-                    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+                    SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WH_MOUSE_LL, WM_LBUTTONDOWN,
+                    WM_MBUTTONDOWN, WM_RBUTTONDOWN, WM_XBUTTONDOWN, WS_CLIPCHILDREN,
+                    WS_CLIPSIBLINGS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
                 },
             },
         },
@@ -523,7 +523,17 @@ mod platform {
         device_scale_factor: i32,
         dynamic_resize_failures: u32,
         resolution_mode: RemoteResolutionMode,
+        viewport_bounds: RdpViewportBounds,
         visible: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    struct RdpViewportBounds {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        scale_factor: f64,
     }
 
     // These values are always created, used, and destroyed through closures
@@ -537,6 +547,23 @@ mod platform {
         requested
             .filter(|scale| scale.is_finite() && *scale >= 0.25 && *scale <= 8.0)
             .unwrap_or(host_scale_factor)
+    }
+
+    fn update_viewport_bounds(
+        session: &mut RdpSession,
+        scale_factor: f64,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) {
+        session.viewport_bounds = RdpViewportBounds {
+            x,
+            y,
+            width,
+            height,
+            scale_factor,
+        };
     }
 
     impl RdpSessionManager {
@@ -576,6 +603,14 @@ mod platform {
                 let session = sessions
                     .get_mut(&request.session_id)
                     .ok_or_else(|| format!("RDP session '{}' was not found", request.session_id))?;
+                update_viewport_bounds(
+                    session,
+                    scale_factor,
+                    request.x,
+                    request.y,
+                    request.width,
+                    request.height,
+                );
                 show_and_resize_rdp(
                     session,
                     scale_factor,
@@ -616,6 +651,14 @@ mod platform {
                     let session = sessions.get_mut(&request.session_id).ok_or_else(|| {
                         format!("RDP session '{}' was not found", request.session_id)
                     })?;
+                    update_viewport_bounds(
+                        session,
+                        scale_factor,
+                        request.x,
+                        request.y,
+                        request.width,
+                        request.height,
+                    );
                     let connection_state =
                         get_property_i32(&session.dispatch, "Connected").unwrap_or(-1);
                     let rect = show_rdp_for_session(
@@ -674,6 +717,14 @@ mod platform {
                     let session = sessions.get_mut(&request.session_id).ok_or_else(|| {
                         format!("RDP session '{}' was not found", request.session_id)
                     })?;
+                    update_viewport_bounds(
+                        session,
+                        scale_factor,
+                        request.x,
+                        request.y,
+                        request.width,
+                        request.height,
+                    );
                     let connection_state =
                         get_property_i32(&session.dispatch, "Connected").unwrap_or(-1);
                     let rect = stage_rdp(
@@ -711,6 +762,17 @@ mod platform {
                     );
                     Ok(())
                 }
+            })
+        }
+
+        pub fn follow_host_window(&self, app: AppHandle) -> Result<(), String> {
+            let sessions = Arc::clone(&self.sessions);
+            run_on_main_thread_quiet("follow_rdp_host_window", app, move |_app| {
+                let sessions = lock_sessions(&sessions)?;
+                for session in sessions.values().filter(|session| session.visible) {
+                    follow_rdp_host_window(session)?;
+                }
+                Ok(())
             })
         }
 
@@ -1441,6 +1503,13 @@ mod platform {
                 device_scale_factor: display_settings.device_scale_factor,
                 dynamic_resize_failures: 0,
                 resolution_mode,
+                viewport_bounds: RdpViewportBounds {
+                    x: request.x,
+                    y: request.y,
+                    width: request.width,
+                    height: request.height,
+                    scale_factor,
+                },
                 visible: false,
             },
         );
@@ -2872,6 +2941,31 @@ mod platform {
         Ok(())
     }
 
+    fn follow_rdp_host_window(session: &RdpSession) -> Result<(), String> {
+        let bounds = session.viewport_bounds;
+        let rect = scaled_rect(
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
+            bounds.scale_factor,
+        );
+        let origin = client_to_screen_point(session.owner, rect.0, rect.1)?;
+        unsafe {
+            SetWindowPos(
+                session.hwnd,
+                None,
+                origin.0,
+                origin.1,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+            )
+            .map_err(|error| format!("failed to follow RDP host window: {error}"))?;
+        }
+        Ok(())
+    }
+
     fn apply_rdp_clip_region(
         hwnd: HWND,
         owner: HWND,
@@ -3157,6 +3251,31 @@ mod platform {
         F: FnOnce(AppHandle) -> Result<T, String> + Send + 'static,
         T: Send + 'static,
     {
+        run_on_main_thread_with_trace(operation, app, true, f)
+    }
+
+    fn run_on_main_thread_quiet<F, T>(
+        operation: &'static str,
+        app: AppHandle,
+        f: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce(AppHandle) -> Result<T, String> + Send + 'static,
+        T: Send + 'static,
+    {
+        run_on_main_thread_with_trace(operation, app, false, f)
+    }
+
+    fn run_on_main_thread_with_trace<F, T>(
+        operation: &'static str,
+        app: AppHandle,
+        trace_success: bool,
+        f: F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce(AppHandle) -> Result<T, String> + Send + 'static,
+        T: Send + 'static,
+    {
         let app_for_closure = app.clone();
         let (sender, receiver) = mpsc::channel();
         app.run_on_main_thread(move || {
@@ -3164,7 +3283,7 @@ mod platform {
             let result = f(app_for_closure);
             let elapsed = started.elapsed();
             match &result {
-                Ok(_) => rdp_debug(
+                Ok(_) if trace_success => rdp_debug(
                     "main_thread.operation.ok",
                     &json!({
                         "operation": operation,
@@ -3179,6 +3298,7 @@ mod platform {
                         "error": error,
                     }),
                 ),
+                Ok(_) => {}
             }
             if elapsed >= RDP_MAIN_THREAD_WARN_AFTER {
                 eprintln!(
@@ -3844,6 +3964,10 @@ mod platform {
             _app: AppHandle,
             _request: SetRdpVisibilityRequest,
         ) -> Result<(), String> {
+            Ok(())
+        }
+
+        pub fn follow_host_window(&self, _app: AppHandle) -> Result<(), String> {
             Ok(())
         }
 
