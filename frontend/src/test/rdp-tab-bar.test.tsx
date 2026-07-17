@@ -34,12 +34,12 @@ describe('RdpTabBar session controls', () => {
   });
 
   it.each([
-    ['cloud', 'routeCloudAccelerated'],
-    ['lan_direct', 'routeLanDirect'],
-    ['local_direct', 'routeLocalDirect'],
-    ['cloud_fallback', 'routeCloudFallback'],
-  ] as const)('shows the actual %s connection route', (routeLabel, expectedLabel) => {
-    render(
+    ['cloud', 'routeShortAccelerated', 'routeCloudAccelerated', 'lucide-cloud-lightning'],
+    ['lan_direct', 'routeShortLan', 'routeLanDirect', 'lucide-network'],
+    ['local_direct', 'routeShortDirect', 'routeLocalDirect', 'lucide-cable'],
+    ['cloud_fallback', 'routeShortDirect', 'routeCloudFallback', 'lucide-cloud-off'],
+  ] as const)('shows the compact %s connection route', (routeLabel, expectedLabel, fullLabel, iconClassName) => {
+    const { container } = render(
       <RdpTabBar
         tabs={[{
           id: 'tab-route',
@@ -61,6 +61,8 @@ describe('RdpTabBar session controls', () => {
     );
 
     expect(screen.getByText(expectedLabel)).toBeInTheDocument();
+    expect(screen.getByTitle(fullLabel)).toBeInTheDocument();
+    expect(container.querySelector(`.${iconClassName}`)).toBeInTheDocument();
   });
 
   it('hides native clipboard management controls when the KKTerm engine only supports text injection', () => {

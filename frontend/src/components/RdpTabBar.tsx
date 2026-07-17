@@ -1,5 +1,5 @@
 import { useRef, useCallback, useEffect, useLayoutEffect, useState } from 'react';
-import { X, LayoutGrid, LayoutList, RefreshCw, MoreHorizontal, ChevronDown, FolderOpen, Monitor, ClipboardCopy, PanelLeftOpen, Keyboard, ShieldAlert, Maximize2, Minimize2 } from 'lucide-react';
+import { X, LayoutGrid, LayoutList, RefreshCw, MoreHorizontal, ChevronDown, FolderOpen, Monitor, ClipboardCopy, PanelLeftOpen, Keyboard, ShieldAlert, Maximize2, Minimize2, Network, Cable, CloudLightning, CloudOff, type LucideIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import { cn } from '@/lib/utils';
@@ -72,6 +72,38 @@ const ROUTE_TRANSLATION_KEYS = {
   local_direct: 'routeLocalDirect',
   cloud_fallback: 'routeCloudFallback',
 } as const;
+
+const ROUTE_DISPLAY: Record<keyof typeof ROUTE_TRANSLATION_KEYS, {
+  icon: LucideIcon;
+  shortLabelKey: 'routeShortAccelerated' | 'routeShortLan' | 'routeShortDirect';
+  iconClassName: string;
+  labelClassName: string;
+}> = {
+  cloud: {
+    icon: CloudLightning,
+    shortLabelKey: 'routeShortAccelerated',
+    iconClassName: 'bg-indigo-50 text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-300',
+    labelClassName: 'bg-indigo-50 text-indigo-700 dark:bg-indigo-500/15 dark:text-indigo-300',
+  },
+  lan_direct: {
+    icon: Network,
+    shortLabelKey: 'routeShortLan',
+    iconClassName: 'bg-emerald-50 text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-300',
+    labelClassName: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300',
+  },
+  local_direct: {
+    icon: Cable,
+    shortLabelKey: 'routeShortDirect',
+    iconClassName: 'bg-green-50 text-green-600 dark:bg-green-500/15 dark:text-green-300',
+    labelClassName: 'bg-green-50 text-green-700 dark:bg-green-500/15 dark:text-green-300',
+  },
+  cloud_fallback: {
+    icon: CloudOff,
+    shortLabelKey: 'routeShortDirect',
+    iconClassName: 'bg-amber-50 text-amber-600 dark:bg-amber-500/15 dark:text-amber-300',
+    labelClassName: 'bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300',
+  },
+};
 
 const DRAG_THRESHOLD = 4; // px before activating drag
 
@@ -239,7 +271,12 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
         </Button>
       )}
       <div className="flex items-center gap-0.5 flex-1 min-w-0 overflow-x-auto overflow-y-clip">
-        {tabs.map((tab, idx) => (
+        {tabs.map((tab, idx) => {
+          const route = tab.routeLabel ? ROUTE_DISPLAY[tab.routeLabel] : null;
+          const RouteIcon = route?.icon;
+          const fullRouteLabel = tab.routeLabel ? t(ROUTE_TRANSLATION_KEYS[tab.routeLabel]) : null;
+
+          return (
           <div
             key={tab.id}
             ref={(el) => { if (el) tabRefs.current.set(idx, el); else tabRefs.current.delete(idx); }}
@@ -261,7 +298,7 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
               ? { transform: `translateX(${dragOffsetX}px)`, zIndex: 50, position: 'relative' as const }
               : undefined}
             className={cn(
-              "flex items-center shrink-0 max-w-[180px] rounded-md group transition-none select-none",
+              "flex items-center shrink-0 max-w-[220px] rounded-md group transition-none select-none",
               tab.id === activeTabId
                 ? "bg-accent text-foreground"
                 : "text-muted-foreground hover:bg-accent/50 hover:text-foreground",
@@ -279,13 +316,21 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
               }}
             >
               <span className={cn("h-1.5 w-1.5 rounded-full shrink-0", STATUS_COLOR[tab.status])} title={tab.status} />
-              <span className="truncate">{tab.name}</span>
-              {tab.routeLabel && (
+              {route && RouteIcon && fullRouteLabel && (
                 <span
-                  className="max-w-[92px] truncate text-[10px] font-normal text-muted-foreground"
-                  title={t(ROUTE_TRANSLATION_KEYS[tab.routeLabel])}
+                  className={cn('grid h-[22px] w-[22px] shrink-0 place-items-center rounded-[7px]', route.iconClassName)}
+                  title={fullRouteLabel}
+                  aria-label={fullRouteLabel}
                 >
-                  {t(ROUTE_TRANSLATION_KEYS[tab.routeLabel])}
+                  <RouteIcon className="h-3.5 w-3.5" strokeWidth={2} />
+                </span>
+              )}
+              <span className="truncate">{tab.name}</span>
+              {route && (
+                <span
+                  className={cn('shrink-0 rounded-full px-1.5 py-0.5 text-[9px] font-semibold leading-none', route.labelClassName)}
+                >
+                  {t(route.shortLabelKey)}
                 </span>
               )}
             </button>
@@ -298,7 +343,8 @@ export function RdpTabBar({ tabs, activeTabId, viewMode, sidebarOpen, onToggleSi
               <X className="h-3 w-3" />
             </button>
           </div>
-        ))}
+          );
+        })}
       </div>
 
       {/* Right-click context menu */}

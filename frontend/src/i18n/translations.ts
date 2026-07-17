@@ -124,6 +124,9 @@ export const translations = {
     routeLanDirect: 'LAN Direct',
     routeLocalDirect: 'Local Direct',
     routeCloudFallback: 'Cloud Unavailable, Direct',
+    routeShortAccelerated: 'Accel',
+    routeShortLan: 'LAN',
+    routeShortDirect: 'Direct',
     rdpCloseTab: 'Close',
     // RDP Sidebar
     rdpServers: 'Servers',
@@ -383,6 +386,9 @@ export const translations = {
     routeLanDirect: '局域网直连',
     routeLocalDirect: '本地直连',
     routeCloudFallback: '云端不可用，已直连',
+    routeShortAccelerated: '加速',
+    routeShortLan: '局域网',
+    routeShortDirect: '直连',
     rdpCloseTab: '关闭',
     // RDP 侧边栏
     rdpServers: '服务器',
