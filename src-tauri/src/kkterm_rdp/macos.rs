@@ -971,6 +971,24 @@ fn error_chain(error: &dyn std::error::Error) -> String {
     message
 }
 
+/// Preserve the server's graceful-disconnect description as a stable token for
+/// the frontend while retaining the original IronRDP detail for diagnostics.
+fn graceful_disconnect_error(reason: &ironrdp::session::GracefulDisconnectReason) -> String {
+    use ironrdp::session::GracefulDisconnectReason;
+
+    match reason {
+        GracefulDisconnectReason::UserInitiated => {
+            "remote_user_initiated_disconnect: user initiated disconnect".to_string()
+        }
+        GracefulDisconnectReason::ServerInitiated => {
+            "remote_server_initiated_disconnect: server initiated disconnect".to_string()
+        }
+        GracefulDisconnectReason::Other(description) => {
+            format!("remote_disconnect: {description}")
+        }
+    }
+}
+
 fn tls_error_kind(error: &std::io::Error) -> String {
     format!("{:?}", error.kind())
 }
@@ -1042,6 +1060,17 @@ async fn rdp_connect(
 
 fn is_tls_handshake_error(error: &str) -> bool {
     error.starts_with("TLS handshake failed:") || error.starts_with("RDP TLS handshake timed out")
+}
+
+fn connect_begin_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("read frame by hint") && lower.contains("not enough bytes") {
+        return format!(
+            "rdp_negotiation_closed: server closed the RDP connection before authentication; {error}"
+        );
+    }
+
+    error.to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1199,7 +1228,7 @@ async fn rdp_connect_attempt(
     {
         Ok(Ok(should_upgrade)) => should_upgrade,
         Ok(Err(error)) => {
-            let error = error_chain(&error);
+            let error = connect_begin_error(&error_chain(&error));
             rdp_debug(
                 "ironrdp.connect_begin.error",
                 &json!({
@@ -1306,7 +1335,7 @@ async fn rdp_connect_attempt(
             return Err(format!("RDP connect_finalize failed: {error}"));
         }
         Err(_) => {
-            let error = "server did not complete RDP finalization";
+            let error = "credential_check_timeout: server did not complete RDP login finalization";
             rdp_debug(
                 "ironrdp.connect_finalize.timeout",
                 &json!({
@@ -1677,14 +1706,21 @@ fn spawn_rdp_event_loop(
                                         let event = cursor_event(&session_id, &pointer);
                                         emit_rdp_event(&app, event);
                                     }
-                                    ActiveStageOutput::Terminate(_reason) => {
-                                        eprintln!("[rdp {session_id}] server initiated disconnect");
+                                    ActiveStageOutput::Terminate(reason) => {
+                                        let diagnostic = graceful_disconnect_error(&reason);
+                                        eprintln!("[rdp {session_id}] {diagnostic}");
                                         rdp_debug(
                                             "ironrdp.server_disconnect",
                                             &json!({
                                                 "sessionId": session_id,
+                                                "reason": reason.to_string(),
+                                                "diagnostic": diagnostic,
                                             }),
                                         );
+                                        emit_rdp_event(&app, RdpCanvasEvent::Error {
+                                            session_id: session_id.clone(),
+                                            message: diagnostic,
+                                        });
                                         should_break = true;
                                         break;
                                     }
@@ -1978,6 +2014,35 @@ mod tests {
             "RDP connect_begin failed: rejected"
         ));
         assert!(!is_tls_handshake_error("CredSSP authentication failed"));
+    }
+
+    #[test]
+    fn labels_server_close_during_rdp_negotiation_before_authentication() {
+        let error = connect_begin_error(
+            "[read frame by hint @ connector/src/lib.rs:416] custom error: not enough bytes",
+        );
+
+        assert!(error.starts_with(
+            "rdp_negotiation_closed: server closed the RDP connection before authentication"
+        ));
+        assert!(error.contains("read frame by hint"));
+    }
+
+    #[test]
+    fn preserves_graceful_disconnect_details_for_the_frontend() {
+        use ironrdp::session::GracefulDisconnectReason;
+
+        assert_eq!(
+            graceful_disconnect_error(&GracefulDisconnectReason::ServerInitiated),
+            "remote_server_initiated_disconnect: server initiated disconnect"
+        );
+        assert_eq!(
+            graceful_disconnect_error(&GracefulDisconnectReason::Other(
+                "Another user connected to the server, forcing the disconnection of the current connection"
+                    .to_string(),
+            )),
+            "remote_disconnect: Another user connected to the server, forcing the disconnection of the current connection"
+        );
     }
 
     #[test]

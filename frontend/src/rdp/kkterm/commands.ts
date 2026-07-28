@@ -78,6 +78,7 @@ export type KktermRdpStatusResponse = {
   sessionId: string;
   connectionState: number;
   connected: boolean;
+  extendedDisconnectReason?: number | null;
 };
 
 export type KktermRdpDisplaySyncResponse = {
@@ -87,6 +88,7 @@ export type KktermRdpDisplaySyncResponse = {
   displaySynced: boolean;
   desktopWidth: number;
   desktopHeight: number;
+  extendedDisconnectReason?: number | null;
 };
 
 export function kktermRdpStart(request: KktermRdpStartRequest) {

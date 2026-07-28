@@ -573,6 +573,7 @@ async fn resolve_connection_target_inner(
                     &token,
                     &prepare_id,
                     "not_enough_candidates",
+                    &[],
                 )
                 .await;
                 return Err("cloud_no_candidates".to_string());
@@ -604,6 +605,7 @@ async fn resolve_connection_target_inner(
                         &token,
                         &prepare_id,
                         "all_candidates_failed",
+                        &results,
                     )
                     .await;
                     return Err("cloud_all_candidates_failed".to_string());

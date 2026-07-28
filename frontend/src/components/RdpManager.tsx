@@ -37,7 +37,13 @@ import { rdpLog } from '@/lib/rdp-logger';
 import { api } from '@/api';
 import { useNativeRdp, connectFrameWebSocket, type NativeBitmapFrameInfo, type NativeGfxH264Frame } from '@/hooks/useNativeRdp';
 import { drawDecodedH264FrameToOverlay } from '@/lib/h264-overlay';
-import { friendlyRdpError, isNonRecoverableRdpError } from '@/lib/rdp-errors';
+import {
+  activeXExtendedDisconnectError,
+  friendlyRdpError,
+  isNonRecoverableRdpError,
+  reconnectingRdpError,
+  reconnectFailedRdpError,
+} from '@/lib/rdp-errors';
 import { captureConnectedTabThumbnails } from '@/lib/rdp-thumbnails';
 import type { ViewMode } from '@/lib/rdp-types';
 import {
@@ -186,6 +192,7 @@ async function waitForKktermWindowsDisplay(
         attempt,
         connectionState: display.connectionState,
         connected: display.connected,
+        extendedDisconnectReason: display.extendedDisconnectReason,
         displaySynced: display.displaySynced,
         desktopWidth: display.desktopWidth,
         desktopHeight: display.desktopHeight,
@@ -195,6 +202,10 @@ async function waitForKktermWindowsDisplay(
           width: display.desktopWidth || fallbackWidth,
           height: display.desktopHeight || fallbackHeight,
         };
+      }
+      const disconnectError = activeXExtendedDisconnectError(display.extendedDisconnectReason);
+      if (display.connectionState === 0 && disconnectError) {
+        throw new Error(disconnectError);
       }
       if (attempt === 60 && display.displaySynced) {
         rdpLog.warn('rdp', 'kkterm-rdp ActiveX display revealed while still establishing', {
@@ -219,12 +230,20 @@ async function waitForKktermWindowsDisplay(
           attempt,
           connectionState: status.connectionState,
           connected: status.connected,
+          extendedDisconnectReason: status.extendedDisconnectReason,
         });
         if (status.connected) {
           return { width: fallbackWidth, height: fallbackHeight };
         }
+        const disconnectError = activeXExtendedDisconnectError(status.extendedDisconnectReason);
+        if (status.connectionState === 0 && disconnectError) {
+          throw new Error(disconnectError);
+        }
       } catch (statusError) {
         lastError = statusError instanceof Error ? statusError.message : String(statusError);
+      }
+      if (isNonRecoverableRdpError(lastError)) {
+        throw new Error(lastError);
       }
     }
     await waitMs(500);
@@ -919,9 +938,11 @@ export function RdpManager({
         tabId,
         reason,
       });
-      store.updateTabStatus(tabId, 'error', t('rdpReconnectFailed', {
-        max: String(MAX_RECONNECT_ATTEMPTS),
-      }));
+      store.updateTabStatus(
+        tabId,
+        'error',
+        reconnectFailedRdpError(reason, MAX_RECONNECT_ATTEMPTS, t),
+      );
       return;
     }
     reconnectCountRef.current.set(tabId, count);
@@ -930,10 +951,11 @@ export function RdpManager({
       tabId,
       reason,
     });
-    store.updateTabStatus(tabId, 'reconnecting', t('rdpReconnectingCount', {
-      count: String(count),
-      max: String(MAX_RECONNECT_ATTEMPTS),
-    }));
+    store.updateTabStatus(
+      tabId,
+      'reconnecting',
+      reconnectingRdpError(reason, count, MAX_RECONNECT_ATTEMPTS, t),
+    );
 
     const timer = setTimeout(() => {
       reconnectTimerRef.current.delete(tabId);
@@ -1574,6 +1596,8 @@ export function RdpManager({
       void kktermRdpStatus({ tabId }).then(async status => {
         if (status.connectionState !== 0 || userDisconnectedRef.current.has(tabId)) return;
 
+        const disconnectError = activeXExtendedDisconnectError(status.extendedDisconnectReason);
+
         userDisconnectedRef.current.add(tabId);
         kktermViewLastBoundsByTabRef.current.delete(tabId);
         try {
@@ -1596,12 +1620,19 @@ export function RdpManager({
         kktermTabsRef.current.delete(tabId);
         kktermViewLastBoundsByTabRef.current.delete(tabId);
         stopFpsCounter(tabId);
-        store.updateTabStatus(tabId, 'error', t('rdpErrAnotherUser'));
+        store.updateTabStatus(
+          tabId,
+          'error',
+          disconnectError
+            ? friendlyRdpError(disconnectError, t)
+            : t('rdpErrWsClosed'),
+        );
         setRdpStats(prev => ({ ...prev, status: 'error' }));
         rdpLog.warn('rdp', 'kkterm-rdp native session ended without auto-reconnect', {
           tabId,
           connectionState: status.connectionState,
-          reason: 'remote_session_replaced_or_disconnected',
+          extendedDisconnectReason: status.extendedDisconnectReason,
+          reason: disconnectError ?? 'remote_session_disconnected_without_reason',
         });
       }).catch(error => {
         rdpLog.debug('rdp', 'kkterm-rdp status poll skipped', {

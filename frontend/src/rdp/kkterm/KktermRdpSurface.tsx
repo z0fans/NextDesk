@@ -21,7 +21,10 @@ import './styles.css';
 const LEFT_WINDOWS_SCANCODE = 0xe05b;
 const LEFT_CONTROL_SCANCODE = 0x1d;
 const KKTERM_KEYBOARD_MODE_STORAGE_KEY = 'nextdesk_kkterm_keyboard_mode';
-const KKTERM_CONNECT_FEEDBACK_TIMEOUT_MS = 45_000;
+// The native command already has bounded TCP, negotiation, TLS, and login
+// finalization timeouts. Keep this outer watchdog long enough for the native
+// layer to return its more specific authentication or transport reason first.
+const KKTERM_CONNECT_FEEDBACK_TIMEOUT_MS = 90_000;
 const KKTERM_START_RETRY_DELAYS_MS = [800, 1_600, 2_800, 5_000] as const;
 const CLOUD_BINDING_KEEPALIVE_INTERVAL_MS = 25_000;
 
@@ -102,21 +105,24 @@ function sleepMs(ms: number): Promise<void> {
 
 function isRetryableKktermStartupError(message: string): boolean {
   const lower = message.toLowerCase();
+  if (
+    lower.includes('credential_check_timeout')
+    || lower.includes('connect_finalize')
+    || lower.includes('status_logon_failure')
+    || lower.includes('logon_failure')
+    || lower.includes('account_disabled')
+    || lower.includes('account_locked')
+    || lower.includes('account_expired')
+    || lower.includes('password_expired')
+    || lower.includes('access_denied')
+  ) {
+    return false;
+  }
   return (
     lower.includes('429')
     || lower.includes('too many requests')
     || lower.includes('cloud prepare')
     || lower.includes('cloud_route_not_ready')
-    || lower.includes('not enough bytes')
-    || lower.includes('close_notify')
-    || lower.includes('peer closed')
-    || lower.includes('connection refused')
-    || lower.includes('connection reset')
-    || lower.includes('disconnected before')
-    || lower.includes('timed out')
-    || lower.includes('timeout')
-    || lower.includes('tls')
-    || lower.includes('ssl')
   );
 }
 
@@ -207,12 +213,27 @@ export function KktermRdpSurface({
     inputRef.current?.focus({ preventScroll: true });
   };
 
+  const resetImeComposition = () => {
+    composingRef.current = false;
+    if (inputRef.current) {
+      inputRef.current.value = '';
+    }
+  };
+
   const focusKeyboardTargetSoon = () => {
     if (typeof window === 'undefined') return;
     window.setTimeout(() => {
       if (!activeRef.current) return;
       focusKeyboardTarget();
     }, 0);
+  };
+
+  const recoverKeyboardTargetSoon = () => {
+    // WebKit does not always emit `compositionend` when an IME session is
+    // interrupted by blur, tab switching, or a native RDP reconnect. Clear the
+    // stale composition flag before returning keyboard focus to the RDP input.
+    resetImeComposition();
+    focusKeyboardTargetSoon();
   };
 
   useEffect(() => {
@@ -225,6 +246,7 @@ export function KktermRdpSurface({
 
   useEffect(() => {
     activeRef.current = active;
+    resetImeComposition();
     if (active) {
       focusKeyboardTargetSoon();
     }
@@ -232,10 +254,10 @@ export function KktermRdpSurface({
 
   useEffect(() => {
     if (!active) return;
-    const refocus = () => focusKeyboardTargetSoon();
+    const refocus = () => recoverKeyboardTargetSoon();
     const refocusWhenVisible = () => {
       if (!document.hidden) {
-        focusKeyboardTargetSoon();
+        recoverKeyboardTargetSoon();
       }
     };
     window.addEventListener('focus', refocus);
@@ -254,6 +276,7 @@ export function KktermRdpSurface({
     let disposed = false;
     let connectFinished = false;
     let timedOut = false;
+    let terminalErrorReported = false;
     let unlisten: (() => void) | undefined;
     const sessionId = createRdpSessionId(tabId);
     const desktopWidth = desktopSize?.width && desktopSize.width > 0
@@ -275,7 +298,7 @@ export function KktermRdpSurface({
       timedOut = true;
       callbacksRef.current.onError(
         tabId,
-        'RDP connection timed out before the remote server responded',
+        'RDP connection timed out before the native client returned a diagnostic result',
       );
       void kktermRdpDisconnect({ tabId }).catch(() => undefined);
     };
@@ -316,6 +339,7 @@ export function KktermRdpSurface({
     const failWithMessage = (message: string) => {
       if (disposed || connectFinished || timedOut) return;
       connectFinished = true;
+      terminalErrorReported = true;
       clearConnectTimeout();
       callbacksRef.current.onError(tabId, message);
     };
@@ -339,7 +363,7 @@ export function KktermRdpSurface({
             callbacksRef.current.onRouteSelected?.(tabId, response.routeLabel);
           }
           startCloudKeepalive();
-          focusKeyboardTargetSoon();
+          recoverKeyboardTargetSoon();
           return;
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -414,7 +438,7 @@ export function KktermRdpSurface({
           connectFinished = true;
           clearConnectTimeout();
           startCloudKeepalive();
-          focusKeyboardTargetSoon();
+          recoverKeyboardTargetSoon();
           callbacksRef.current.onConnected(tabId);
           break;
         case 'error':
@@ -422,10 +446,17 @@ export function KktermRdpSurface({
             break;
           }
           connectFinished = true;
+          terminalErrorReported = true;
           clearConnectTimeout();
           callbacksRef.current.onError(tabId, payload.message);
           break;
         case 'disconnected':
+          // The native loop emits a final lifecycle `disconnected` event after
+          // an `error`. Preserve the actionable error instead of replacing it
+          // with a generic disconnect/reconnect status in the parent chrome.
+          if (terminalErrorReported) {
+            break;
+          }
           if (retryEarlyStartupEvent('RDP disconnected before the remote desktop became ready')) {
             break;
           }
@@ -439,7 +470,7 @@ export function KktermRdpSurface({
             connectFinished = true;
             clearConnectTimeout();
             startCloudKeepalive();
-            focusKeyboardTargetSoon();
+            recoverKeyboardTargetSoon();
           }
           draw(payload);
       }
@@ -449,9 +480,13 @@ export function KktermRdpSurface({
         return;
       }
       unlisten = dispose;
+      // Register the native event listener before starting the session. Besides
+      // avoiding missed early errors, this prevents React StrictMode's probe
+      // mount from launching an orphaned duplicate native connection.
+      void startSession();
+    }).catch(error => {
+      failWithMessage(error instanceof Error ? error.message : String(error));
     });
-
-    void startSession();
 
     return () => {
       disposed = true;
@@ -658,6 +693,11 @@ export function KktermRdpSurface({
     }
     pressedRemoteScancodesRef.current.clear();
     suppressedShortcutKeyupsRef.current.clear();
+  };
+
+  const onKeyboardBlur = () => {
+    resetImeComposition();
+    releaseAllRemoteKeys();
   };
 
   const setCanvasRef = (node: HTMLCanvasElement | null) => {
@@ -886,7 +926,7 @@ export function KktermRdpSurface({
           onWheel={onWheel}
           onKeyDown={onCanvasKeyDown}
           onKeyUp={onCanvasKeyUp}
-          onBlur={releaseAllRemoteKeys}
+          onBlur={onKeyboardBlur}
           onContextMenu={event => event.preventDefault()}
         />
         <input
@@ -907,7 +947,7 @@ export function KktermRdpSurface({
           onCompositionStart={onCompositionStart}
           onCompositionUpdate={onCompositionStart}
           onCompositionEnd={onCompositionEnd}
-          onBlur={releaseAllRemoteKeys}
+          onBlur={onKeyboardBlur}
         />
       </div>
     </div>

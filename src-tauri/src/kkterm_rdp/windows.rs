@@ -1,5 +1,6 @@
 #[cfg(target_os = "windows")]
 mod platform {
+    use super::super::focus_policy::should_activate_rdp_overlay;
     use std::{
         cell::RefCell,
         collections::HashMap,
@@ -416,6 +417,7 @@ mod platform {
         session_id: String,
         connection_state: i32,
         connected: bool,
+        extended_disconnect_reason: Option<i32>,
     }
 
     #[derive(Deserialize)]
@@ -467,6 +469,7 @@ mod platform {
         session_id: String,
         connection_state: i32,
         connected: bool,
+        extended_disconnect_reason: Option<i32>,
         display_synced: bool,
         desktop_width: i32,
         desktop_height: i32,
@@ -819,6 +822,9 @@ mod platform {
                 );
                 let connection_state = get_property_i32(&session.dispatch, "Connected")?;
                 let connected = is_rdp_connected_state(connection_state);
+                let extended_disconnect_reason = (connection_state == 0)
+                    .then(|| get_property_i32(&session.dispatch, "ExtendedDisconnectReason").ok())
+                    .flatten();
                 let displayable = is_rdp_displayable_state(connection_state);
                 let display_sync_attempted = tracks_pane_size && displayable;
                 let display_sync_completed = display_sync_attempted
@@ -873,6 +879,7 @@ mod platform {
                     session_id: request.session_id,
                     connection_state,
                     connected,
+                    extended_disconnect_reason,
                     display_synced,
                     desktop_width: session.desktop_width,
                     desktop_height: session.desktop_height,
@@ -919,10 +926,14 @@ mod platform {
                     .get(&request.session_id)
                     .ok_or_else(|| format!("RDP session '{}' was not found", request.session_id))?;
                 let connection_state = get_property_i32(&session.dispatch, "Connected")?;
+                let extended_disconnect_reason = (connection_state == 0)
+                    .then(|| get_property_i32(&session.dispatch, "ExtendedDisconnectReason").ok())
+                    .flatten();
                 Ok(RdpSessionStatus {
                     session_id: request.session_id,
                     connection_state,
                     connected: is_rdp_connected_state(connection_state),
+                    extended_disconnect_reason,
                 })
             })
         }
@@ -2203,20 +2214,28 @@ mod platform {
         lparam: LPARAM,
     ) -> LRESULT {
         if code == HC_ACTION as i32 && is_rdp_overlay_click_message(wparam.0 as u32) {
-            let target = if lparam.0 != 0 {
+            let click = if lparam.0 != 0 {
                 let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
                 let target = unsafe { WindowFromPoint(info.pt) };
-                (!target.0.is_null()).then_some(target)
+                (!target.0.is_null()).then_some((info.pt, target))
             } else {
                 None
             };
             let focus_target = RDP_OVERLAY_FOCUS_HOOK.with(|state| {
                 let state = state.borrow();
-                match (state.overlay, state.owner, target) {
-                    (Some(overlay), Some(owner), Some(target))
-                        if target == overlay || unsafe { IsChild(overlay, target).as_bool() } =>
-                    {
-                        Some((owner, overlay, target))
+                match (state.overlay, state.owner, click) {
+                    (Some(overlay), Some(owner), Some((point, target))) => {
+                        let click_targets_rdp =
+                            target == overlay || unsafe { IsChild(overlay, target).as_bool() };
+                        let foreground = unsafe { GetForegroundWindow() };
+                        let foreground_is_rdp = foreground == overlay || foreground == owner;
+                        let foreground_covers_click = window_rect_contains(foreground, point);
+                        should_activate_rdp_overlay(
+                            click_targets_rdp,
+                            foreground_is_rdp,
+                            foreground_covers_click,
+                        )
+                        .then_some((owner, overlay, target))
                     }
                     _ => None,
                 }
@@ -2226,6 +2245,18 @@ mod platform {
             }
         }
         unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+
+    fn window_rect_contains(hwnd: HWND, point: POINT) -> bool {
+        if hwnd.0.is_null() {
+            return false;
+        }
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok()
+            && point.x >= rect.left
+            && point.x < rect.right
+            && point.y >= rect.top
+            && point.y < rect.bottom
     }
 
     fn set_rdp_overlay_focus_targets(overlay: Option<HWND>, owner: Option<HWND>) {
@@ -3849,6 +3880,7 @@ mod platform {
         session_id: String,
         connection_state: i32,
         connected: bool,
+        extended_disconnect_reason: Option<i32>,
     }
 
     #[derive(Deserialize)]
@@ -3893,6 +3925,7 @@ mod platform {
         session_id: String,
         connection_state: i32,
         connected: bool,
+        extended_disconnect_reason: Option<i32>,
         display_synced: bool,
         desktop_width: i32,
         desktop_height: i32,
@@ -3980,6 +4013,7 @@ mod platform {
                 session_id: request.session_id,
                 connection_state: 0,
                 connected: false,
+                extended_disconnect_reason: None,
                 display_synced: false,
                 desktop_width: 0,
                 desktop_height: 0,
@@ -4003,6 +4037,7 @@ mod platform {
                 session_id: request.session_id,
                 connection_state: 0,
                 connected: is_rdp_connected_state(0),
+                extended_disconnect_reason: None,
             })
         }
 

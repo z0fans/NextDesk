@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { StrictMode } from 'react';
 import { KktermRdpSurface } from '@/rdp/kkterm/KktermRdpSurface';
 import type { ServerEntry } from '@/lib/rdp-types';
 
@@ -107,6 +108,30 @@ describe('KktermRdpSurface', () => {
     });
   });
 
+  it('starts one native RDP session under React StrictMode', async () => {
+    render(
+      <StrictMode>
+        <KktermRdpSurface
+          tabId="tab-public"
+          server={server}
+          active={true}
+          desktopSize={{ width: 1600, height: 900 }}
+          cadSignal={0}
+          winSignal={0}
+          textSignal={null}
+          onConnected={vi.fn()}
+          onDisconnected={vi.fn()}
+          onError={vi.fn()}
+        />
+      </StrictMode>,
+    );
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_start', expect.anything());
+    });
+    expect(invokeMock.mock.calls.filter(([name]) => name === 'kkterm_rdp_start')).toHaveLength(1);
+  });
+
   it('delegates connection feedback to the parent RDP chrome', () => {
     render(
       <KktermRdpSurface
@@ -152,16 +177,138 @@ describe('KktermRdpSurface', () => {
     );
 
     await act(async () => {
-      vi.advanceTimersByTime(45_000);
+      vi.advanceTimersByTime(90_000);
     });
 
     expect(onError).toHaveBeenCalledWith(
       'tab-public',
-      'RDP connection timed out before the remote server responded',
+      'RDP connection timed out before the native client returned a diagnostic result',
     );
     expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_disconnect', {
       request: { tabId: 'tab-public' },
     });
+  });
+
+  it('preserves a late native authentication error instead of replacing it with the generic watchdog timeout', async () => {
+    vi.useFakeTimers();
+    const onError = vi.fn();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'kkterm_rdp_start') {
+        return new Promise((_, reject) => {
+          window.setTimeout(() => {
+            reject(new Error('RDP connect failed: CredSSP: STATUS_LOGON_FAILURE'));
+          }, 50_000);
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1600, height: 900 }}
+        cadSignal={0}
+        winSignal={0}
+        textSignal={null}
+        onConnected={vi.fn()}
+        onDisconnected={vi.fn()}
+        onError={onError}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(45_000);
+      await Promise.resolve();
+    });
+    expect(onError).not.toHaveBeenCalled();
+
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith(
+      'tab-public',
+      'RDP connect failed: CredSSP: STATUS_LOGON_FAILURE',
+    );
+  });
+
+  it('surfaces an RDP login-finalization timeout instead of retrying it as a cloud startup failure', async () => {
+    const onError = vi.fn();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'kkterm_rdp_start') {
+        return Promise.reject(new Error(
+          'RDP connect failed: credential_check_timeout: server did not complete RDP login finalization',
+        ));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1600, height: 900 }}
+        cadSignal={0}
+        winSignal={0}
+        textSignal={null}
+        onConnected={vi.fn()}
+        onDisconnected={vi.fn()}
+        onError={onError}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(onError).toHaveBeenCalledWith(
+        'tab-public',
+        'RDP connect failed: credential_check_timeout: server did not complete RDP login finalization',
+      );
+    });
+    expect(invokeMock.mock.calls.filter(([name]) => name === 'kkterm_rdp_start')).toHaveLength(1);
+  });
+
+  it('surfaces a definitive TCP transport failure immediately instead of silently retrying it', async () => {
+    const onError = vi.fn();
+    invokeMock.mockImplementation((command: string) => {
+      if (command === 'kkterm_rdp_start') {
+        return Promise.reject(new Error(
+          'RDP connect failed: TCP connect to 203.0.113.10:3389 via direct failed: Connection refused',
+        ));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1600, height: 900 }}
+        cadSignal={0}
+        winSignal={0}
+        textSignal={null}
+        onConnected={vi.fn()}
+        onDisconnected={vi.fn()}
+        onError={onError}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(onError).toHaveBeenCalledWith(
+        'tab-public',
+        'RDP connect failed: TCP connect to 203.0.113.10:3389 via direct failed: Connection refused',
+      );
+    });
+    expect(invokeMock.mock.calls.filter(([name]) => name === 'kkterm_rdp_start')).toHaveLength(1);
   });
 
   it('retries transient cloud startup failures before surfacing an error', async () => {
@@ -513,6 +660,47 @@ describe('KktermRdpSurface', () => {
 
     await new Promise(resolve => setTimeout(resolve, 0));
     expect(invokeMock).not.toHaveBeenCalledWith('kkterm_rdp_key', expect.anything());
+  });
+
+  it('resumes printable scancodes after macOS IME composition is interrupted by blur', async () => {
+    render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1280, height: 800 }}
+        cadSignal={0}
+        winSignal={0}
+        textSignal={null}
+        onConnected={vi.fn()}
+        onDisconnected={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+
+    const display = await screen.findByLabelText('RDP display');
+    fireEvent.compositionStart(display);
+    fireEvent.blur(display);
+    fireEvent.focus(display);
+    invokeMock.mockClear();
+
+    fireEvent.keyDown(display, {
+      code: 'KeyA',
+      key: 'a',
+    });
+    fireEvent.keyUp(display, {
+      code: 'KeyA',
+      key: 'a',
+    });
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_key', {
+        request: { tabId: 'tab-public', scancode: 0x1e, down: true },
+      });
+      expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_key', {
+        request: { tabId: 'tab-public', scancode: 0x1e, down: false },
+      });
+    });
   });
 
   it('anchors the macOS IME target inside the visible RDP surface', async () => {
@@ -1177,6 +1365,55 @@ describe('KktermRdpSurface', () => {
         request: { tabId: 'tab-public', scancode: 0x1e, down: false },
       });
     });
+  });
+
+  it('does not let a trailing disconnected event overwrite a specific native RDP error', async () => {
+    const canvasEventHandlers: Array<(event: { payload: unknown }) => void> = [];
+    listenMock.mockImplementation((_eventName: string, handler: (event: { payload: unknown }) => void) => {
+      canvasEventHandlers.push(handler);
+      return Promise.resolve(() => undefined);
+    });
+    const onError = vi.fn();
+    const onDisconnected = vi.fn();
+
+    render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1280, height: 800 }}
+        cadSignal={0}
+        winSignal={0}
+        textSignal={null}
+        onConnected={vi.fn()}
+        onDisconnected={onDisconnected}
+        onError={onError}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(canvasEventHandlers.length).toBe(1);
+    });
+    const [emitCanvasEvent] = canvasEventHandlers;
+
+    act(() => {
+      emitCanvasEvent({
+        payload: {
+          kind: 'error',
+          sessionId: 'rdp-tab-public',
+          message: 'RDP connect failed: CredSSP: STATUS_LOGON_FAILURE',
+        },
+      });
+      emitCanvasEvent({
+        payload: {
+          kind: 'disconnected',
+          sessionId: 'rdp-tab-public',
+        },
+      });
+    });
+
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onDisconnected).not.toHaveBeenCalled();
   });
 
   it('applies KKTerm cursor bitmap events to the canvas cursor', async () => {

@@ -58,8 +58,6 @@ pub struct CloudBindingResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudPrepareCandidate {
     pub binding_id: String,
-    pub agent_id: String,
-    pub region: Option<String>,
     pub endpoint: CloudEndpoint,
     pub expires_at: String,
 }
@@ -238,7 +236,8 @@ fn token_request_body(
 
 #[cfg(test)]
 mod tests {
-    use super::{token_rejection, token_request_body};
+    use super::{abort_payload, token_rejection, token_request_body, CloudPrepareResponse};
+    use crate::cloud_probe::CloudProbeResult;
     use reqwest::StatusCode;
 
     #[test]
@@ -274,6 +273,57 @@ mod tests {
         );
 
         assert_eq!(body["device"]["installation_id"], "inst_1234567890abcdef");
+    }
+
+    #[test]
+    fn abort_payload_keeps_probe_results_for_diagnostics() {
+        let payload = abort_payload(
+            "prep_test",
+            "all_candidates_failed",
+            &[CloudProbeResult {
+                binding_id: "bnd_test".to_string(),
+                ok: false,
+                tcp_connect_ms: Some(701),
+                x224_ms: None,
+                tls_ms: None,
+                total_ms: 2500,
+                error: Some("probe_timeout".to_string()),
+                score_ms: 2500,
+                winner_eligible: false,
+            }],
+        );
+
+        assert_eq!(payload["prepare_id"], "prep_test");
+        assert_eq!(payload["reason"], "all_candidates_failed");
+        assert_eq!(payload["results"][0]["binding_id"], "bnd_test");
+        assert_eq!(payload["results"][0]["error"], "probe_timeout");
+        assert!(payload["results"][0].get("score_ms").is_none());
+        assert!(payload["results"][0].get("winner_eligible").is_none());
+    }
+
+    #[test]
+    fn prepare_candidate_does_not_depend_on_internal_agent_metadata() {
+        let prepared: CloudPrepareResponse = serde_json::from_value(serde_json::json!({
+            "prepare_id": "prep_test",
+            "mode": "candidates",
+            "candidates": [{
+                "binding_id": "bnd_test",
+                "agent_id": "agt_should_stay_private",
+                "region": "HKG",
+                "endpoint": {
+                    "host": "relay.example.com",
+                    "port": 443,
+                    "protocols": ["tcp"]
+                },
+                "expires_at": "2026-07-23T00:00:00Z"
+            }]
+        }))
+        .expect("prepare response should ignore internal Agent metadata");
+
+        let public_candidate = serde_json::to_value(&prepared.candidates[0]).unwrap();
+        assert_eq!(public_candidate["binding_id"], "bnd_test");
+        assert!(public_candidate.get("agent_id").is_none());
+        assert!(public_candidate.get("region").is_none());
     }
 }
 
@@ -405,7 +455,26 @@ pub async fn commit(
         .map_err(|e| format!("cloud commit parse failed: {e}"))
 }
 
-pub async fn abort(panel_url: &str, device_id: &str, token: &str, prepare_id: &str, reason: &str) {
+fn abort_payload(
+    prepare_id: &str,
+    reason: &str,
+    results: &[crate::cloud_probe::CloudProbeResult],
+) -> serde_json::Value {
+    serde_json::json!({
+        "prepare_id": prepare_id,
+        "reason": reason,
+        "results": results,
+    })
+}
+
+pub async fn abort(
+    panel_url: &str,
+    device_id: &str,
+    token: &str,
+    prepare_id: &str,
+    reason: &str,
+    results: &[crate::cloud_probe::CloudProbeResult],
+) {
     let Ok(client) = client() else {
         return;
     };
@@ -413,10 +482,7 @@ pub async fn abort(panel_url: &str, device_id: &str, token: &str, prepare_id: &s
         .post(format!("{}/api/v1/connect/abort", base(panel_url)))
         .bearer_auth(token)
         .header("X-Device-Id", device_id)
-        .json(&serde_json::json!({
-            "prepare_id": prepare_id,
-            "reason": reason
-        }))
+        .json(&abort_payload(prepare_id, reason, results))
         .send()
         .await;
 }
