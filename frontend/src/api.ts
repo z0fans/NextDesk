@@ -1,5 +1,17 @@
-import { invoke } from '@tauri-apps/api/core';
+import { Channel, invoke } from '@tauri-apps/api/core';
 import type { DiagnosticLogEntry } from '@/lib/diagnostic-logs';
+import type {
+  SshEvent,
+  SshHostKeyTrustRequest,
+  SshStartRequest,
+  SshStartResponse,
+} from '@/ssh/types';
+
+function sshOutputBytes(payload: ArrayBuffer | Uint8Array | number[]): Uint8Array {
+  if (payload instanceof Uint8Array) return payload;
+  if (payload instanceof ArrayBuffer) return new Uint8Array(payload);
+  return Uint8Array.from(payload);
+}
 
 export interface CloudAccountStatus {
   enabled: boolean;
@@ -29,6 +41,7 @@ export type ConnectionRoute = 'cloud' | 'lan_direct' | 'local_direct' | 'cloud_f
 export interface NativeRdpConnectResponse {
   wsPort: number;
   routeLabel: ConnectionRoute;
+  routeLeaseId: number;
 }
 
 export const api = {
@@ -100,11 +113,53 @@ export const api = {
   rdpNativeWheel: (tabId: string, x: number, y: number, delta: number, isHorizontal: boolean) =>
     invoke<void>('rdp_native_wheel', { tabId, x, y, delta, isHorizontal }),
 
-  rdpNativeDisconnect: (tabId: string) =>
-    invoke<void>('rdp_native_disconnect', { tabId }),
+  rdpNativeDisconnect: (tabId: string, routeLeaseId?: number) =>
+    invoke<void>('rdp_native_disconnect', { tabId, routeLeaseId }),
 
   rdpNativeResize: (tabId: string, width: number, height: number) =>
     invoke<void>('rdp_native_resize', { tabId, width, height }),
+
+  // ── SSH Sessions ─────────────────────────────────────
+  sshSessionStart: (
+    request: SshStartRequest,
+    onOutput: (data: Uint8Array) => void,
+    onEvent: (event: SshEvent) => void,
+  ) => {
+    const outputChannel = new Channel<ArrayBuffer | Uint8Array | number[]>();
+    outputChannel.onmessage = (payload) => onOutput(sshOutputBytes(payload));
+    const eventChannel = new Channel<SshEvent>();
+    eventChannel.onmessage = onEvent;
+    return invoke<SshStartResponse>('ssh_session_start', {
+      request,
+      onOutput: outputChannel,
+      onEvent: eventChannel,
+    });
+  },
+  sshSessionInput: (sessionId: string, data: Uint8Array) =>
+    invoke<void>('ssh_session_input', { sessionId, data: Array.from(data) }),
+  sshSessionResize: (
+    sessionId: string,
+    cols: number,
+    rows: number,
+    pixelWidth: number,
+    pixelHeight: number,
+  ) => invoke<void>('ssh_session_resize', {
+    sessionId,
+    cols,
+    rows,
+    pixelWidth,
+    pixelHeight,
+  }),
+  sshSessionClose: (sessionId: string) =>
+    invoke<void>('ssh_session_close', { sessionId }),
+  sshCredentialStore: (reference: string, secret: string) =>
+    invoke<void>('ssh_credential_store', { reference, secret }),
+  sshCredentialDelete: (reference: string) =>
+    invoke<void>('ssh_credential_delete', { reference }),
+  sshCredentialExists: (reference: string) =>
+    invoke<boolean>('ssh_credential_exists', { reference }),
+  sshTrustHostKey: (request: SshHostKeyTrustRequest) =>
+    invoke<void>('ssh_trust_host_key', { request }),
 
   // ── Diagnostic Logs ──────────────────────────────────
   logShowInFinder: () => invoke<void>('log_show_in_finder'),

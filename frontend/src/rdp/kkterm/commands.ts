@@ -25,6 +25,7 @@ export type KktermRdpStartResponse = {
   tabId: string;
   sessionId?: string;
   routeLabel: ConnectionRoute;
+  routeLeaseId: number;
 };
 
 export type KktermRdpClipRect = {
@@ -66,6 +67,7 @@ export type KktermRdpTextRequest = {
 
 export type KktermRdpSimpleRequest = {
   tabId: string;
+  routeLeaseId?: number;
 };
 
 export type CloudBindingKeepaliveRequest = {

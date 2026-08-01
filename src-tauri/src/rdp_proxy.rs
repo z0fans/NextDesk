@@ -13,6 +13,27 @@ use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 type SharedRdpProxyPort = Arc<Mutex<u16>>;
 type SharedRdpProxyError = Arc<Mutex<Option<String>>>;
 
+struct RdpRouteReleaseGuard {
+    app: AppHandle,
+    session_id: Option<String>,
+    lease_id: Option<u64>,
+}
+
+impl Drop for RdpRouteReleaseGuard {
+    fn drop(&mut self) {
+        let (Some(session_id), Some(lease_id)) = (self.session_id.as_deref(), self.lease_id) else {
+            return;
+        };
+        let state = self.app.state::<crate::state::AppState>();
+        crate::connection_resolver::release_session_route_if_current(
+            state.inner(),
+            crate::connection_resolver::ServiceKind::Rdp,
+            session_id,
+            lease_id,
+        );
+    }
+}
+
 /// Start the WS-to-TCP RDCleanPath proxy.
 pub async fn start_proxy(
     app_handle: AppHandle,
@@ -194,6 +215,11 @@ async fn handle_inner(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let mut route_release = RdpRouteReleaseGuard {
+        app: app_handle.clone(),
+        session_id: session_id.clone(),
+        lease_id: None,
+    };
     let resolved = crate::connection_resolver::resolve_connection_target(
         app_state.inner(),
         dest_host.to_string(),
@@ -202,6 +228,7 @@ async fn handle_inner(
         session_id,
     )
     .await?;
+    route_release.lease_id = Some(resolved.route_lease_id);
     let resolved_dest = format!("{}:{}", resolved.host, resolved.port);
     log::info!(
         "[rdp_proxy] route target={dest_host}:{dest_port} resolved={resolved_dest} label={} binding={:?}",

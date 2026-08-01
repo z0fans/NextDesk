@@ -15,6 +15,7 @@ import {
   PanelLeftClose,
   PanelLeft,
   Monitor,
+  TerminalSquare,
   FolderOpen,
   ArrowRight,
   Plus,
@@ -35,6 +36,7 @@ import { LanguageProvider } from '@/i18n/LanguageProvider';
 import { useTranslation } from '@/i18n/useTranslation';
 import { LanguageToggle } from '@/components/LanguageToggle';
 import { RdpManager } from '@/components/RdpManager';
+import { SshWorkspace } from '@/ssh/SshWorkspace';
 import { AccountPage } from '@/components/AccountPage';
 import { LogViewer } from '@/components/LogViewer';
 import { useSessionStore } from '@/lib/useSessionStore';
@@ -43,7 +45,7 @@ function AppContent() {
   const { t } = useTranslation();
   const sessionStore = useSessionStore();
   const { folderSharingEnabled, setFolderSharingEnabled } = sessionStore;
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'account' | 'logs' | 'settings' | 'rdp'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'account' | 'logs' | 'settings' | 'rdp' | 'ssh'>('dashboard');
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [updateStatus, setUpdateStatus] = useState<'idle' | 'downloading' | 'installing' | 'error'>('idle');
@@ -310,6 +312,25 @@ function AppContent() {
 
           <Button
             variant="ghost"
+            onClick={() => {
+              setActiveTab('ssh');
+              setSidebarCollapsed(true);
+            }}
+            className={cn(
+              "w-full h-11 text-sm font-medium transition-all mb-1",
+              sidebarCollapsed ? "justify-center px-0" : "justify-start gap-3",
+              activeTab === 'ssh'
+                ? "bg-cyan-500/10 text-cyan-400 hover:bg-cyan-500/15 hover:text-cyan-300"
+                : "text-muted-foreground hover:text-sidebar-foreground hover:bg-sidebar-accent"
+            )}
+            title={sidebarCollapsed ? t('ssh') : undefined}
+          >
+            <TerminalSquare className={cn("h-4 w-4 shrink-0", activeTab === 'ssh' ? "text-cyan-500" : "text-muted-foreground")} />
+            {!sidebarCollapsed && t('ssh')}
+          </Button>
+
+          <Button
+            variant="ghost"
             onClick={() => setActiveTab('account')}
             className={cn(
               "w-full h-11 text-sm font-medium transition-all mb-1",
@@ -399,13 +420,13 @@ function AppContent() {
         sidebarCollapsed ? "md:ml-16" : "md:ml-48"
       )}>
         <div className={cn(
-          activeTab === 'rdp'
+          activeTab === 'rdp' || activeTab === 'ssh'
             ? "h-full flex flex-col"
             : "h-full overflow-y-auto scrollbar-none max-w-6xl mx-auto px-6 py-8 md:px-10 md:py-10 space-y-8"
         )}>
           
-          {/* Header — hidden for RDP (has its own chrome) */}
-          {activeTab !== 'rdp' && (
+          {/* Header — hidden for remote workspaces (they have their own chrome) */}
+          {activeTab !== 'rdp' && activeTab !== 'ssh' && (
           <div className="flex items-center justify-between">
             <div>
               <h1 className="text-3xl font-bold text-foreground tracking-tight mb-1">
@@ -608,6 +629,14 @@ function AppContent() {
               isRdpViewVisible={activeTab === 'rdp'}
               onMainSidebarCollapse={() => setSidebarCollapsed(true)}
               store={sessionStore}
+            />
+          </div>
+
+          {/* SSH View — always mounted, hidden via CSS to preserve terminal sessions */}
+          <div className={cn("flex-1 overflow-hidden", activeTab !== 'ssh' && "hidden")}>
+            <SshWorkspace
+              isVisible={activeTab === 'ssh'}
+              onMainSidebarCollapse={() => setSidebarCollapsed(true)}
             />
           </div>
 

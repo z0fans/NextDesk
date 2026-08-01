@@ -42,6 +42,7 @@ pub struct KktermRdpStartResponse {
     pub tab_id: String,
     pub session_id: String,
     pub route_label: String,
+    pub route_lease_id: u64,
 }
 
 #[derive(Clone, Deserialize)]
@@ -97,6 +98,8 @@ pub struct KktermRdpTextRequest {
 #[serde(rename_all = "camelCase")]
 pub struct KktermRdpSimpleRequest {
     pub tab_id: String,
+    #[serde(default)]
+    pub route_lease_id: Option<u64>,
 }
 
 pub fn session_id_from_tab_id(tab_id: &str) -> String {

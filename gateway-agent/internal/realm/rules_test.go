@@ -48,6 +48,36 @@ func TestApplyWritesIndependentTcpUdpInstance(t *testing.T) {
 	}
 }
 
+func TestApplyWritesSshTcpOnlyInstance(t *testing.T) {
+	profile := testProfile(t)
+	rule := Rule{
+		BindingID:  "bnd_ssh",
+		ListenPort: 42022,
+		TargetHost: "203.0.113.22",
+		TargetPort: 22,
+		Protocols:  []string{"tcp"},
+		ExpiresAt:  time.Now().Add(time.Minute).UTC().Format(time.RFC3339),
+	}
+	if err := Apply(profile, rule); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(profile.InstancesDir, rule.BindingID, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg configFile
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Network.NoTCP || cfg.Network.UseUDP {
+		t.Fatalf("SSH binding must be TCP-only: %+v", cfg.Network)
+	}
+	if len(cfg.Endpoints) != 1 || cfg.Endpoints[0].Remote != "203.0.113.22:22" {
+		t.Fatalf("unexpected SSH endpoint: %+v", cfg.Endpoints)
+	}
+}
+
 func TestApplyKeepsBindingsInSeparateInstances(t *testing.T) {
 	profile := testProfile(t)
 	expiresAt := time.Now().Add(time.Minute).UTC().Format(time.RFC3339)

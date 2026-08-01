@@ -770,6 +770,7 @@ export function RdpManager({
 
   // Ref to track which tabs are connected via native backend
   const nativeTabsRef = useRef<Set<string>>(new Set());
+  const nativeRouteLeaseIdsRef = useRef<Map<string, number>>(new Map());
   const cloudKeepaliveTimersRef = useRef<Map<string, ReturnType<typeof window.setInterval>>>(new Map());
 
   const stopCloudKeepalive = useCallback((tabId: string) => {
@@ -806,6 +807,7 @@ export function RdpManager({
     cloudKeepaliveTimersRef.current.clear();
   }, []);
   const kktermTabsRef = useRef<Set<string>>(new Set());
+  const kktermRouteLeaseIdsRef = useRef<Map<string, number>>(new Map());
   const attemptIdsRef = useRef<Map<string, string>>(new Map());
   const nativeFrameCleanupByTabRef = useRef<Map<string, () => void>>(new Map());
 
@@ -1126,9 +1128,13 @@ export function RdpManager({
       }
       nativeFrameCleanupByTabRef.current.clear();
       for (const tabId of kktermTabsRef.current) {
-        kktermRdpDisconnect({ tabId }).catch(() => {});
+        kktermRdpDisconnect({
+          tabId,
+          routeLeaseId: kktermRouteLeaseIdsRef.current.get(tabId),
+        }).catch(() => {});
       }
       kktermTabsRef.current.clear();
+      kktermRouteLeaseIdsRef.current.clear();
       kktermViewLastBoundsByTabRef.current.clear();
       kktermOverlayClipRectsRef.current.clear();
       kktermPostConnectSettleTimersRef.current.forEach(timers => {
@@ -1616,8 +1622,12 @@ export function RdpManager({
             error: error instanceof Error ? error.message : String(error),
           });
         }
-        await kktermRdpDisconnect({ tabId }).catch(() => undefined);
+        await kktermRdpDisconnect({
+          tabId,
+          routeLeaseId: kktermRouteLeaseIdsRef.current.get(tabId),
+        }).catch(() => undefined);
         kktermTabsRef.current.delete(tabId);
+        kktermRouteLeaseIdsRef.current.delete(tabId);
         kktermViewLastBoundsByTabRef.current.delete(tabId);
         stopFpsCounter(tabId);
         store.updateTabStatus(
@@ -2144,6 +2154,7 @@ export function RdpManager({
           useMultimon: USE_KKTERM_COPY_WINDOWS && multiMonitorEnabledRef.current,
           reuseCloudBinding,
         });
+        kktermRouteLeaseIdsRef.current.set(tabId, startResponse.routeLeaseId);
         store.updateTabRoute(tabId, startResponse.routeLabel);
         rdpLog.info('route', 'route.selected', { tabId, routeLabel: startResponse.routeLabel });
 
@@ -2252,7 +2263,8 @@ export function RdpManager({
           renderProfile: RDP_ENGINE_MODE,
           reuseCloudBinding,
         });
-        const { wsPort, routeLabel } = connectResponse;
+        const { wsPort, routeLabel, routeLeaseId } = connectResponse;
+        nativeRouteLeaseIdsRef.current.set(tabId, routeLeaseId);
         startCloudKeepalive(tabId, server.host, server.port);
         store.updateTabRoute(tabId, routeLabel);
         rdpLog.info('rdp', 'native.connect.ok', { attemptId, tabId, wsPort, routeLabel });
@@ -3484,12 +3496,17 @@ export function RdpManager({
     stopCloudKeepalive(tabId);
     // Disconnect native session if any
     if (nativeTabsRef.current.has(tabId)) {
-      api.rdpNativeDisconnect(tabId).catch(() => {});
+      api.rdpNativeDisconnect(tabId, nativeRouteLeaseIdsRef.current.get(tabId)).catch(() => {});
       nativeTabsRef.current.delete(tabId);
+      nativeRouteLeaseIdsRef.current.delete(tabId);
     }
     if (kktermTabsRef.current.has(tabId)) {
-      kktermRdpDisconnect({ tabId }).catch(() => {});
+      kktermRdpDisconnect({
+        tabId,
+        routeLeaseId: kktermRouteLeaseIdsRef.current.get(tabId),
+      }).catch(() => {});
       kktermTabsRef.current.delete(tabId);
+      kktermRouteLeaseIdsRef.current.delete(tabId);
       kktermViewLastBoundsByTabRef.current.delete(tabId);
     }
     setKktermRdpLaunch(prev => {
@@ -3558,6 +3575,7 @@ export function RdpManager({
     } else {
       desiredSizeRef.current = null; // adaptive = use wrapper size
     }
+    let nextKktermDesktopSize: { width: number; height: number } | undefined;
     if (USE_KKTERM_COPY_MACOS) {
       const size = w && h
         ? { width: Math.round(w), height: Math.round(h) }
@@ -3565,29 +3583,31 @@ export function RdpManager({
             const current = getCanvasSize();
             return { width: Math.round(current.w), height: Math.round(current.h) };
           })();
-      setKktermRdpLaunch(prev => ({
-        ...prev,
-        [tabId]: {
-          nonce: (prev[tabId]?.nonce ?? 0) + 1,
-          desktopSize: {
-            width: Math.max(320, size.width),
-            height: Math.max(240, size.height),
-          },
-          reuseCloudBinding: false,
-        },
-      }));
+      nextKktermDesktopSize = {
+        width: Math.max(320, size.width),
+        height: Math.max(240, size.height),
+      };
     }
     // Mark as user-initiated so session end handler won't trigger yellow reconnect UI
     userDisconnectedRef.current.add(tabId);
     stopCloudKeepalive(tabId);
-    // Disconnect native session if any
+    const disconnects: Promise<unknown>[] = [];
+    // Finish the old engine before a replacement can claim the same tab route.
     if (nativeTabsRef.current.has(tabId)) {
-      api.rdpNativeDisconnect(tabId).catch(() => {});
+      disconnects.push(api.rdpNativeDisconnect(
+        tabId,
+        nativeRouteLeaseIdsRef.current.get(tabId),
+      ));
       nativeTabsRef.current.delete(tabId);
+      nativeRouteLeaseIdsRef.current.delete(tabId);
     }
     if (kktermTabsRef.current.has(tabId)) {
-      kktermRdpDisconnect({ tabId }).catch(() => {});
+      disconnects.push(kktermRdpDisconnect({
+        tabId,
+        routeLeaseId: kktermRouteLeaseIdsRef.current.get(tabId),
+      }));
       kktermTabsRef.current.delete(tabId);
+      kktermRouteLeaseIdsRef.current.delete(tabId);
       kktermViewLastBoundsByTabRef.current.delete(tabId);
     }
     cleanupNativeFrameStream(tabId);
@@ -3610,10 +3630,22 @@ export function RdpManager({
     keepCursorVisibleUntilRef.current.delete(tabId);
     // Use reconnecting so connectSession can pass its duplicate-connection guard.
     store.updateTabStatus(tabId, 'reconnecting');
-    setTimeout(() => {
-      userDisconnectedRef.current.delete(tabId);
-      connectSessionRef.current?.(tabId);
-    }, 500);
+    void Promise.allSettled(disconnects).then(() => {
+      if (nextKktermDesktopSize) {
+        setKktermRdpLaunch(prev => ({
+          ...prev,
+          [tabId]: {
+            nonce: (prev[tabId]?.nonce ?? 0) + 1,
+            desktopSize: nextKktermDesktopSize,
+            reuseCloudBinding: false,
+          },
+        }));
+      }
+      window.setTimeout(() => {
+        userDisconnectedRef.current.delete(tabId);
+        connectSessionRef.current?.(tabId);
+      }, 500);
+    });
   }, [store, cleanupH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, getCanvasSize, stopCloudKeepalive, stopFpsCounter]);
 
   const performAdaptiveResize = useCallback((reason: string) => {
@@ -5065,7 +5097,10 @@ export function RdpManager({
                         onConnected={markKktermTabConnected}
                         onDisconnected={handleKktermDisconnected}
                         onError={handleKktermError}
-                        onRouteSelected={store.updateTabRoute}
+                        onRouteSelected={(tabId, routeLabel, routeLeaseId) => {
+                          kktermRouteLeaseIdsRef.current.set(tabId, routeLeaseId);
+                          store.updateTabRoute(tabId, routeLabel);
+                        }}
                         onCanvasRef={handleKktermCanvasRef}
                       />
                     );

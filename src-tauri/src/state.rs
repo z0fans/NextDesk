@@ -58,6 +58,7 @@ impl ActiveCloudBinding {
             binding_id: Some(self.binding_id.clone()),
             route_label: "cloud".to_string(),
             force_direct: true,
+            route_lease_id: 0,
         }
     }
 }
@@ -79,6 +80,8 @@ pub struct AppState {
     pub cloud_authorization_base_url: Arc<Mutex<String>>,
     pub cloud_active_bindings: Arc<Mutex<HashMap<String, ActiveCloudBinding>>>,
     pub cloud_resolve_inflight: Arc<Mutex<HashMap<String, CloudResolveSender>>>,
+    pub active_route_leases: Arc<Mutex<HashMap<String, crate::connection_resolver::RouteLease>>>,
+    pub ssh_sessions: Arc<Mutex<crate::ssh::manager::SshSessionManager>>,
     pub audio_manager: Arc<Mutex<crate::rdp_audio::AudioManager>>,
     #[cfg(feature = "nextdesk-native-rdp")]
     pub native_sessions: Arc<Mutex<crate::rdp_session::SessionManager>>,
@@ -98,6 +101,8 @@ impl Default for AppState {
             cloud_authorization_base_url: Arc::new(Mutex::new(String::new())),
             cloud_active_bindings: Arc::new(Mutex::new(HashMap::new())),
             cloud_resolve_inflight: Arc::new(Mutex::new(HashMap::new())),
+            active_route_leases: Arc::new(Mutex::new(HashMap::new())),
+            ssh_sessions: Arc::new(Mutex::new(crate::ssh::manager::SshSessionManager::default())),
             audio_manager: Arc::new(Mutex::new(crate::rdp_audio::AudioManager::default())),
             #[cfg(feature = "nextdesk-native-rdp")]
             native_sessions: Arc::new(Mutex::new(crate::rdp_session::SessionManager::default())),
