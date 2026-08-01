@@ -1,8 +1,16 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
+import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import type { DiagnosticLogEntry } from '@/lib/diagnostic-logs';
 import type {
   SshEvent,
   SshHostKeyTrustRequest,
+  SftpListResponse,
+  SftpOpenResponse,
+  SftpCreateDirectoryRequest,
+  SftpRemoveRequest,
+  SftpRenameRequest,
+  SftpTransferProgress,
+  SftpTransferRequest,
   SshStartRequest,
   SshStartResponse,
 } from '@/ssh/types';
@@ -160,6 +168,40 @@ export const api = {
     invoke<boolean>('ssh_credential_exists', { reference }),
   sshTrustHostKey: (request: SshHostKeyTrustRequest) =>
     invoke<void>('ssh_trust_host_key', { request }),
+  sshSftpOpen: (sessionId: string) =>
+    invoke<SftpOpenResponse>('ssh_sftp_open', { sessionId }),
+  sshSftpList: (sessionId: string, path: string) =>
+    invoke<SftpListResponse>('ssh_sftp_list', { sessionId, path }),
+  sshSftpUpload: (
+    request: SftpTransferRequest,
+    onProgress: (progress: SftpTransferProgress) => void,
+  ) => {
+    const progressChannel = new Channel<SftpTransferProgress>();
+    progressChannel.onmessage = onProgress;
+    return invoke<void>('ssh_sftp_upload', { request, onProgress: progressChannel });
+  },
+  sshSftpDownload: (
+    request: SftpTransferRequest,
+    onProgress: (progress: SftpTransferProgress) => void,
+  ) => {
+    const progressChannel = new Channel<SftpTransferProgress>();
+    progressChannel.onmessage = onProgress;
+    return invoke<void>('ssh_sftp_download', { request, onProgress: progressChannel });
+  },
+  sshSftpCancel: (sessionId: string, transferId: string) =>
+    invoke<void>('ssh_sftp_cancel', { sessionId, transferId }),
+  sshSftpCreateDirectory: (request: SftpCreateDirectoryRequest) =>
+    invoke<void>('ssh_sftp_create_directory', { request }),
+  sshSftpRename: (request: SftpRenameRequest) =>
+    invoke<void>('ssh_sftp_rename', { request }),
+  sshSftpRemove: (request: SftpRemoveRequest) =>
+    invoke<void>('ssh_sftp_remove', { request }),
+  sshSftpChooseUploadPath: async () => {
+    const selection = await openDialog({ multiple: false, directory: false });
+    return Array.isArray(selection) ? (selection[0] ?? null) : selection;
+  },
+  sshSftpChooseDownloadPath: (defaultPath: string) =>
+    saveDialog({ defaultPath }),
 
   // ── Diagnostic Logs ──────────────────────────────────
   logShowInFinder: () => invoke<void>('log_show_in_finder'),

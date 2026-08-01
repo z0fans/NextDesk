@@ -57,6 +57,7 @@ rustls = { version = "0.23", features = ["ring"] }
 # 0.57+. Keep the SSH transport on the ring-only compatible line until the
 # shared crypto graph can be upgraded without vendoring IronRDP.
 russh = { version = "=0.56.0", default-features = false, features = ["ring"] }
+russh-sftp = "=2.3.0"
 keyring-core = "1.0.0"
 
 [lints.rust]

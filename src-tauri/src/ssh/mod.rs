@@ -1,6 +1,7 @@
 mod host_keys;
 pub(crate) mod manager;
 mod session;
+mod sftp;
 mod types;
 
 use crate::connection_resolver::{self, ConnectionIntent, ServiceKind};
@@ -10,7 +11,12 @@ use manager::{SshControl, SshSessionHandle};
 use russh::keys::ssh_key::PublicKey;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, State};
-use types::{SshEvent, SshHostKeyTrustRequest, SshStartRequest, SshStartResponse};
+use types::{
+    validate_sftp_session_id, SftpCreateDirectoryRequest, SftpListRequest, SftpListResponse,
+    SftpOpenResponse, SftpRemoveRequest, SftpRenameRequest, SftpTransferDirection,
+    SftpTransferEvent, SftpTransferRequest, SshEvent, SshHostKeyTrustRequest, SshStartRequest,
+    SshStartResponse,
+};
 
 #[tauri::command]
 pub async fn ssh_session_start(
@@ -174,4 +180,217 @@ pub fn ssh_trust_host_key(request: SshHostKeyTrustRequest) -> Result<(), String>
         &public_key,
         &host_keys::known_hosts_path(),
     )
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_open(
+    session_id: String,
+    app_state: State<'_, AppState>,
+) -> Result<SftpOpenResponse, String> {
+    validate_sftp_session_id(&session_id)?;
+    let sender = app_state
+        .ssh_sessions
+        .lock()
+        .unwrap()
+        .control_sender(&session_id)?;
+    let (reply, result) = tokio::sync::oneshot::channel();
+    sender
+        .send(SshControl::Sftp(sftp::SftpControl::Open { reply }))
+        .await
+        .map_err(|_| "ssh_session_closed".to_string())?;
+    result
+        .await
+        .map_err(|_| "sftp_session_closed".to_string())?
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_list(
+    session_id: String,
+    path: String,
+    app_state: State<'_, AppState>,
+) -> Result<SftpListResponse, String> {
+    let request = SftpListRequest { session_id, path };
+    request.validate()?;
+    let sender = app_state
+        .ssh_sessions
+        .lock()
+        .unwrap()
+        .control_sender(&request.session_id)?;
+    let (reply, result) = tokio::sync::oneshot::channel();
+    sender
+        .send(SshControl::Sftp(sftp::SftpControl::List { request, reply }))
+        .await
+        .map_err(|_| "ssh_session_closed".to_string())?;
+    result
+        .await
+        .map_err(|_| "sftp_session_closed".to_string())?
+}
+
+async fn send_sftp_transfer(
+    request: SftpTransferRequest,
+    on_progress: Channel<SftpTransferEvent>,
+    direction: SftpTransferDirection,
+    app_state: &AppState,
+) -> Result<(), String> {
+    request.validate()?;
+    let sender = app_state
+        .ssh_sessions
+        .lock()
+        .unwrap()
+        .control_sender(&request.session_id)?;
+    let (reply, result) = tokio::sync::oneshot::channel();
+    let control = match direction {
+        SftpTransferDirection::Upload => sftp::SftpControl::Upload {
+            request,
+            on_progress,
+            reply,
+        },
+        SftpTransferDirection::Download => sftp::SftpControl::Download {
+            request,
+            on_progress,
+            reply,
+        },
+    };
+    sender
+        .send(SshControl::Sftp(control))
+        .await
+        .map_err(|_| "ssh_session_closed".to_string())?;
+    result
+        .await
+        .map_err(|_| "sftp_session_closed".to_string())?
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_upload(
+    request: SftpTransferRequest,
+    on_progress: Channel<SftpTransferEvent>,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    send_sftp_transfer(
+        request,
+        on_progress,
+        SftpTransferDirection::Upload,
+        app_state.inner(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_download(
+    request: SftpTransferRequest,
+    on_progress: Channel<SftpTransferEvent>,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    send_sftp_transfer(
+        request,
+        on_progress,
+        SftpTransferDirection::Download,
+        app_state.inner(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_cancel(
+    session_id: String,
+    transfer_id: String,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    validate_sftp_session_id(&session_id)?;
+    if transfer_id.is_empty()
+        || transfer_id.len() > 128
+        || !transfer_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+    {
+        return Err("sftp_transfer_id_invalid".to_string());
+    }
+    let sender = app_state
+        .ssh_sessions
+        .lock()
+        .unwrap()
+        .control_sender(&session_id)?;
+    let (reply, result) = tokio::sync::oneshot::channel();
+    sender
+        .send(SshControl::Sftp(sftp::SftpControl::Cancel {
+            transfer_id,
+            reply,
+        }))
+        .await
+        .map_err(|_| "ssh_session_closed".to_string())?;
+    result
+        .await
+        .map_err(|_| "sftp_session_closed".to_string())?
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_create_directory(
+    request: SftpCreateDirectoryRequest,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    request.validate()?;
+    let sender = app_state
+        .ssh_sessions
+        .lock()
+        .unwrap()
+        .control_sender(&request.session_id)?;
+    let (reply, result) = tokio::sync::oneshot::channel();
+    sender
+        .send(SshControl::Sftp(sftp::SftpControl::CreateDirectory {
+            request,
+            reply,
+        }))
+        .await
+        .map_err(|_| "ssh_session_closed".to_string())?;
+    result
+        .await
+        .map_err(|_| "sftp_session_closed".to_string())?
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_rename(
+    request: SftpRenameRequest,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    request.validate()?;
+    let sender = app_state
+        .ssh_sessions
+        .lock()
+        .unwrap()
+        .control_sender(&request.session_id)?;
+    let (reply, result) = tokio::sync::oneshot::channel();
+    sender
+        .send(SshControl::Sftp(sftp::SftpControl::Rename {
+            request,
+            reply,
+        }))
+        .await
+        .map_err(|_| "ssh_session_closed".to_string())?;
+    result
+        .await
+        .map_err(|_| "sftp_session_closed".to_string())?
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_remove(
+    request: SftpRemoveRequest,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    request.validate()?;
+    let sender = app_state
+        .ssh_sessions
+        .lock()
+        .unwrap()
+        .control_sender(&request.session_id)?;
+    let (reply, result) = tokio::sync::oneshot::channel();
+    sender
+        .send(SshControl::Sftp(sftp::SftpControl::Remove {
+            request,
+            reply,
+        }))
+        .await
+        .map_err(|_| "ssh_session_closed".to_string())?;
+    result
+        .await
+        .map_err(|_| "sftp_session_closed".to_string())?
 }

@@ -1,5 +1,6 @@
 use super::host_keys::{self, HostKeyStatus};
 use super::manager::SshControl;
+use super::sftp::SftpRuntime;
 use super::types::{SshAuthMethod, SshEvent, SshHostKeyPreview, SshStartRequest};
 use crate::connection_resolver::{self, RouteLease, ServiceKind};
 use crate::state::AppState;
@@ -28,7 +29,7 @@ struct HostKeyCapture {
     server_key_seen: AtomicBool,
 }
 
-struct NextDeskSshClient {
+pub(super) struct NextDeskSshClient {
     identity_host: String,
     identity_port: u16,
     capture: Arc<HostKeyCapture>,
@@ -358,6 +359,7 @@ async fn run_session_inner(
     ));
 
     let mut route_tick = tokio::time::interval(ROUTE_KEEPALIVE_INTERVAL);
+    let mut sftp_runtime = SftpRuntime::default();
     route_tick.tick().await;
     loop {
         tokio::select! {
@@ -398,6 +400,9 @@ async fn run_session_inner(
                             SessionFailure::Message(format!("ssh_resize_failed:{error}"))
                         })?;
                     }
+                    Some(SshControl::Sftp(control)) => {
+                        sftp_runtime.handle(control, &ssh).await;
+                    }
                     Some(SshControl::Close) | None => break,
                 }
             }
@@ -416,6 +421,7 @@ async fn run_session_inner(
         }
     }
 
+    sftp_runtime.shutdown().await;
     let _ = write_half.eof().await;
     let _ = write_half.close().await;
     let _ = ssh

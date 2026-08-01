@@ -53,6 +53,12 @@ vi.mock('@/ssh/ssh-api', () => ({
   sshApi: credentialApi,
 }));
 
+vi.mock('@/ssh/SftpPanel', () => ({
+  SftpPanel: ({ sessionId, visible }: { sessionId: string; visible: boolean }) => (
+    <div data-testid={`sftp-${sessionId}`} data-visible={String(visible)} />
+  ),
+}));
+
 import { SshWorkspace } from '@/ssh/SshWorkspace';
 
 describe('SSH workspace', () => {
@@ -114,6 +120,30 @@ describe('SSH workspace', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Alpha' }));
     expect(alpha).toHaveAttribute('data-visible', 'true');
     expect(beta).toHaveAttribute('data-visible', 'false');
+  });
+
+  it('opens the SFTP browser only after the SSH session is connected', () => {
+    render(<SshWorkspace isVisible />);
+    fireEvent.click(screen.getByRole('button', { name: 'sshConnect Alpha' }));
+    const session = terminalProps.get('alpha');
+    const filesButton = screen.getByRole('button', { name: 'sftpOpenFiles' });
+    expect(filesButton).toBeDisabled();
+
+    act(() => {
+      session?.onEvent({
+        kind: 'state',
+        sessionId: session.sessionId,
+        state: 'connected',
+      });
+    });
+    expect(filesButton).toBeEnabled();
+    fireEvent.click(filesButton);
+
+    expect(screen.getByTestId(`sftp-${session?.sessionId}`)).toHaveAttribute('data-visible', 'true');
+    fireEvent.click(screen.getByRole('button', { name: 'sftpCloseFiles' }));
+    expect(screen.getByTestId(`sftp-${session?.sessionId}`)).toHaveAttribute('data-visible', 'false');
+    fireEvent.click(screen.getByRole('button', { name: 'sftpOpenFiles' }));
+    expect(screen.getByTestId(`sftp-${session?.sessionId}`)).toHaveAttribute('data-visible', 'true');
   });
 
   it('edits a saved connection from the right-click menu without opening a session', () => {

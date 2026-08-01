@@ -64,3 +64,66 @@ export interface SshHostKeyTrustRequest {
   port: number;
   publicKey: string;
 }
+
+export type SftpEntryKind = 'directory' | 'file' | 'symlink' | 'other';
+
+export interface SftpEntry {
+  name: string;
+  path: string;
+  kind: SftpEntryKind;
+  size: number;
+  modified?: number;
+  permissions?: number;
+  owner?: string;
+  group?: string;
+}
+
+export interface SftpOpenResponse {
+  path: string;
+}
+
+export interface SftpListResponse {
+  path: string;
+  entries: SftpEntry[];
+}
+
+export type SftpTransferDirection = 'upload' | 'download';
+export type SftpTransferState = 'queued' | 'running' | 'completed' | 'cancelled' | 'failed';
+
+export interface SftpTransferRequest {
+  sessionId: string;
+  transferId: string;
+  localPath: string;
+  remotePath: string;
+  overwrite: boolean;
+}
+
+export interface SftpTransferProgress {
+  transferId: string;
+  direction: SftpTransferDirection;
+  state: SftpTransferState;
+  transferredBytes: number;
+  totalBytes: number;
+  message?: string;
+}
+
+export interface SftpCreateDirectoryRequest {
+  sessionId: string;
+  operationId: string;
+  path: string;
+}
+
+export interface SftpRenameRequest {
+  sessionId: string;
+  operationId: string;
+  fromPath: string;
+  toPath: string;
+  overwrite: boolean;
+}
+
+export interface SftpRemoveRequest {
+  sessionId: string;
+  operationId: string;
+  path: string;
+  recursive: boolean;
+}

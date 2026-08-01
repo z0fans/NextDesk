@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use super::sftp::SftpControl;
+
 pub enum SshControl {
     Input(Vec<u8>),
     Resize {
@@ -10,6 +12,7 @@ pub enum SshControl {
         pixel_width: u16,
         pixel_height: u16,
     },
+    Sftp(SftpControl),
     Close,
 }
 

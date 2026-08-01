@@ -1,6 +1,7 @@
 import { useCallback, useMemo, useState } from 'react';
 import {
   AlertTriangle,
+  FolderTree,
   KeyRound,
   Pencil,
   Play,
@@ -20,6 +21,7 @@ import type { TranslationKey } from '@/i18n/translations';
 import { loadSshConnections, saveSshConnections } from './connection-store';
 import { NewSshConnectionDialog } from './NewSshConnectionDialog';
 import { sshApi } from './ssh-api';
+import { SftpPanel } from './SftpPanel';
 import { TerminalSurface } from './TerminalSurface';
 import type { SshConnection, SshEvent, SshHostKeyPreview } from './types';
 
@@ -36,6 +38,8 @@ interface SshSessionTab {
   message?: string;
   pendingHostKey?: SshHostKeyPreview;
   retryToken: number;
+  sftpOpen: boolean;
+  sftpMounted: boolean;
 }
 
 function newSessionId(connectionId: string): string {
@@ -143,6 +147,8 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
         connection,
         state: 'resolving_route',
         retryToken: 0,
+        sftpOpen: false,
+        sftpMounted: false,
       },
     ]);
     setActiveSessionId(sessionId);
@@ -432,6 +438,28 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
               </Badge>
             </div>
             <div className="flex shrink-0 items-center gap-2">
+              <Button
+                type="button"
+                size="sm"
+                variant={activeSession.sftpOpen ? 'secondary' : 'outline'}
+                className="h-7"
+                disabled={activeSession.state !== 'connected'}
+                onClick={() => {
+                  setSessions((current) => current.map((session) => (
+                    session.id === activeSession.id
+                      ? {
+                          ...session,
+                          sftpOpen: !session.sftpOpen,
+                          sftpMounted: true,
+                        }
+                      : session
+                  )));
+                }}
+                aria-label={activeSession.sftpOpen ? t('sftpCloseFiles') : t('sftpOpenFiles')}
+              >
+                <FolderTree className="h-3.5 w-3.5" />
+                {t('sftpFiles')}
+              </Button>
               <span className={cn(
                 'font-medium',
                 activeSession.state === 'connected'
@@ -479,15 +507,23 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
           {sessions.map((session) => (
             <div
               key={session.id}
-              className={cn('absolute inset-0', session.id !== activeSessionId && 'hidden')}
+              className={cn('absolute inset-0 flex', session.id !== activeSessionId && 'hidden')}
             >
-              <TerminalSurface
-                sessionId={session.id}
-                connection={session.connection}
-                visible={isVisible && session.id === activeSessionId}
-                retryToken={session.retryToken}
-                onEvent={onSessionEvent}
-              />
+              <div className="h-full min-w-0 flex-1">
+                <TerminalSurface
+                  sessionId={session.id}
+                  connection={session.connection}
+                  visible={isVisible && session.id === activeSessionId}
+                  retryToken={session.retryToken}
+                  onEvent={onSessionEvent}
+                />
+              </div>
+              {session.sftpMounted && session.state === 'connected' && (
+                <SftpPanel
+                  sessionId={session.id}
+                  visible={isVisible && session.id === activeSessionId && session.sftpOpen}
+                />
+              )}
             </div>
           ))}
 
