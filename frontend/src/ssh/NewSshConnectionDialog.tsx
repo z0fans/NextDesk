@@ -11,6 +11,8 @@ interface NewSshConnectionDialogProps {
   open: boolean;
   onClose: () => void;
   onCreated: (connection: SshConnection) => void;
+  onUpdated: (connection: SshConnection) => void;
+  editConnection?: SshConnection | null;
 }
 
 function newConnectionId(): string {
@@ -22,18 +24,24 @@ export function NewSshConnectionDialog({
   open,
   onClose,
   onCreated,
+  onUpdated,
+  editConnection,
 }: NewSshConnectionDialogProps) {
   const { t } = useTranslation();
-  const [name, setName] = useState('');
-  const [host, setHost] = useState('');
-  const [port, setPort] = useState('22');
-  const [username, setUsername] = useState('root');
-  const [authMethod, setAuthMethod] = useState<SshAuthMethod>('password');
+  const [name, setName] = useState(editConnection?.name ?? '');
+  const [host, setHost] = useState(editConnection?.host ?? '');
+  const [port, setPort] = useState(String(editConnection?.port ?? 22));
+  const [username, setUsername] = useState(editConnection?.username ?? 'root');
+  const [authMethod, setAuthMethod] = useState<SshAuthMethod>(editConnection?.authMethod ?? 'password');
   const [secret, setSecret] = useState('');
-  const [privateKeyPath, setPrivateKeyPath] = useState('');
-  const [routePolicy, setRoutePolicy] = useState<SshRoutePolicy>('auto');
+  const [privateKeyPath, setPrivateKeyPath] = useState(editConnection?.privateKeyPath ?? '');
+  const [routePolicy, setRoutePolicy] = useState<SshRoutePolicy>(editConnection?.routePolicy ?? 'auto');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const isEdit = Boolean(editConnection);
+  const canReuseCredential = Boolean(
+    editConnection?.credentialReference && editConnection.authMethod === authMethod,
+  );
 
   if (!open) return null;
 
@@ -51,7 +59,7 @@ export function NewSshConnectionDialog({
       setError(t('sshFormInvalid'));
       return;
     }
-    if (authMethod === 'password' && !secret) {
+    if (authMethod === 'password' && !secret && !canReuseCredential) {
       setError(t('sshPasswordRequired'));
       return;
     }
@@ -63,12 +71,20 @@ export function NewSshConnectionDialog({
     setSaving(true);
     setError('');
     try {
-      const id = newConnectionId();
-      const credentialReference = secret ? `ssh-${id}` : undefined;
-      if (credentialReference) {
-        await sshApi.storeCredential(credentialReference, secret);
+      const id = editConnection?.id ?? newConnectionId();
+      let credentialReference = canReuseCredential
+        ? editConnection?.credentialReference
+        : undefined;
+      if (secret) {
+        // Active tabs keep immutable connection snapshots, so edited secrets must use a new vault entry.
+        credentialReference = editConnection
+          ? `ssh-${id}-${newConnectionId()}`
+          : `ssh-${id}`;
       }
-      onCreated({
+      if (credentialReference) {
+        if (secret) await sshApi.storeCredential(credentialReference, secret);
+      }
+      const savedConnection: SshConnection = {
         id,
         name: name.trim() || host.trim(),
         host: host.trim(),
@@ -78,12 +94,13 @@ export function NewSshConnectionDialog({
         credentialReference,
         privateKeyPath: authMethod === 'private_key' ? privateKeyPath.trim() : undefined,
         routePolicy,
-      });
-      setName('');
-      setHost('');
-      setPort('22');
-      setSecret('');
-      setPrivateKeyPath('');
+        preferredRegion: editConnection?.preferredRegion,
+      };
+      if (editConnection) {
+        onUpdated(savedConnection);
+      } else {
+        onCreated(savedConnection);
+      }
       onClose();
     } catch {
       setError(t('sshErrorCredential'));
@@ -100,7 +117,9 @@ export function NewSshConnectionDialog({
       >
         <div className="flex items-start justify-between border-b border-border px-6 py-5">
           <div>
-            <h2 className="text-lg font-semibold text-foreground">{t('sshNewConnection')}</h2>
+            <h2 className="text-lg font-semibold text-foreground">
+              {isEdit ? t('sshEditConnection') : t('sshNewConnection')}
+            </h2>
             <p className="mt-1 text-sm text-muted-foreground">{t('sshCredentialVaultHint')}</p>
           </div>
           <Button type="button" variant="ghost" size="icon" onClick={onClose} aria-label={t('sshCancel')}>
@@ -150,12 +169,16 @@ export function NewSshConnectionDialog({
               {authMethod === 'password' ? t('sshPassword') : t('sshPassphraseOptional')}
             </span>
             <Input
-              required={authMethod === 'password'}
+              required={authMethod === 'password' && !canReuseCredential}
               type="password"
               value={secret}
               onChange={(event) => setSecret(event.target.value)}
+              placeholder={isEdit && canReuseCredential ? t('sshKeepSavedCredential') : undefined}
               autoComplete="new-password"
             />
+            {isEdit && canReuseCredential && (
+              <span className="block text-[11px] text-muted-foreground">{t('sshKeepSavedCredentialHint')}</span>
+            )}
           </label>
 
           <label className="space-y-1.5 sm:col-span-2">
@@ -182,7 +205,7 @@ export function NewSshConnectionDialog({
           <Button type="button" variant="outline" onClick={onClose}>{t('sshCancel')}</Button>
           <Button type="submit" disabled={saving} className="bg-cyan-600 text-white hover:bg-cyan-500">
             <KeyRound className="h-4 w-4" />
-            {saving ? t('sshSaving') : t('sshSaveAndConnect')}
+            {saving ? t('sshSaving') : isEdit ? t('sshSave') : t('sshSaveAndConnect')}
           </Button>
         </div>
       </form>

@@ -2,6 +2,8 @@ import { useCallback, useMemo, useState } from 'react';
 import {
   AlertTriangle,
   KeyRound,
+  Pencil,
+  Play,
   Plus,
   RotateCw,
   ShieldCheck,
@@ -44,15 +46,29 @@ function newSessionId(connectionId: string): string {
 }
 
 function routeBadgeClass(routeLabel?: string): string {
-  if (routeLabel === 'cloud') return 'border-cyan-500/30 bg-cyan-500/10 text-cyan-400';
-  if (routeLabel === 'lan_direct') return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-400';
-  if (routeLabel === 'cloud_fallback') return 'border-amber-500/30 bg-amber-500/10 text-amber-400';
-  return 'border-slate-500/30 bg-slate-500/10 text-slate-400';
+  if (routeLabel === 'cloud') {
+    return 'border-cyan-500/30 bg-cyan-500/10 text-cyan-700 dark:text-cyan-400';
+  }
+  if (routeLabel === 'lan_direct') {
+    return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400';
+  }
+  if (routeLabel === 'cloud_fallback') {
+    return 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400';
+  }
+  return 'border-border bg-muted text-muted-foreground';
 }
 
 function isReconnectable(session: SshSessionTab): boolean {
   if (session.state === 'disconnected' || session.state === 'exited') return true;
   if (session.state !== 'error' || !session.message) return false;
+  const code = session.message.split(':', 1)[0];
+  if ([
+    'ssh_session_already_exists',
+    'ssh_session_cancelled',
+    'ssh_session_closed',
+    'ssh_session_not_found',
+    'ssh_start_failed',
+  ].includes(code)) return true;
   return [
     'ssh_transport_',
     'ssh_channel_',
@@ -80,12 +96,24 @@ function stateTranslationKey(state: string): TranslationKey {
 
 function errorTranslationKey(message: string): TranslationKey {
   const code = message.split(':', 1)[0];
+  if (code === 'ssh_session_already_exists') return 'sshErrorSessionBusy';
+  if (code === 'ssh_session_cancelled') return 'sshErrorCancelled';
+  if (code === 'ssh_session_closed' || code === 'ssh_session_not_found') {
+    return 'sshErrorSessionClosed';
+  }
+  if (code.startsWith('ssh_kex_') || code.startsWith('ssh_host_key_')) return 'sshErrorKex';
   if (code.includes('authentication') || code === 'ssh_password_required') return 'sshErrorAuth';
   if (code.includes('private_key') || code === 'ssh_key_algorithm_failed') return 'sshErrorPrivateKey';
   if (code.startsWith('credential_')) return 'sshErrorCredential';
   if (code.startsWith('cloud_')) return 'sshErrorCloud';
   if (code.startsWith('ssh_transport_')) return 'sshErrorTransport';
+  if (code.endsWith('_invalid') || code.endsWith('_required')) return 'sshErrorInvalid';
   return 'sshErrorGeneric';
+}
+
+function isLifecycleClosure(message?: string): boolean {
+  const code = message?.split(':', 1)[0];
+  return code === 'ssh_session_closed' || code === 'ssh_session_not_found';
 }
 
 export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceProps) {
@@ -94,6 +122,12 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
   const [sessions, setSessions] = useState<SshSessionTab[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [editingConnection, setEditingConnection] = useState<SshConnection | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    connection: SshConnection;
+    x: number;
+    y: number;
+  } | null>(null);
 
   const activeSession = useMemo(
     () => sessions.find((session) => session.id === activeSessionId),
@@ -128,6 +162,18 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
           };
         }
         if (session.pendingHostKey && event.state === 'disconnected') return session;
+        if (
+          session.state === 'error'
+          && session.message
+          && event.state === 'error'
+          && isLifecycleClosure(event.message)
+          && !isLifecycleClosure(session.message)
+        ) {
+          return {
+            ...session,
+            routeLabel: event.routeLabel ?? session.routeLabel,
+          };
+        }
         return {
           ...session,
           state: event.state,
@@ -212,6 +258,28 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
     openConnection(connection);
   }, [openConnection]);
 
+  const updateConnection = useCallback((connection: SshConnection) => {
+    setConnections((current) => {
+      const next = current.map((candidate) =>
+        candidate.id === connection.id ? connection : candidate,
+      );
+      saveSshConnections(next);
+      return next;
+    });
+  }, []);
+
+  const openNewConnectionDialog = useCallback(() => {
+    setEditingConnection(null);
+    setContextMenu(null);
+    setDialogOpen(true);
+  }, []);
+
+  const openEditConnectionDialog = useCallback((connection: SshConnection) => {
+    setEditingConnection(connection);
+    setContextMenu(null);
+    setDialogOpen(true);
+  }, []);
+
   const removeConnection = useCallback((connection: SshConnection) => {
     sessions
       .filter((session) => session.connection.id === connection.id)
@@ -227,18 +295,18 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
   }, [closeSession, sessions]);
 
   return (
-    <div className="flex h-full min-h-0 bg-[#080d16] text-slate-100">
-      <aside className="flex w-64 shrink-0 flex-col border-r border-slate-800 bg-[#0c1320]">
-        <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
+    <div className="flex h-full min-h-0 bg-background text-foreground transition-colors duration-300">
+      <aside className="flex w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground">
+        <div className="flex items-center justify-between border-b border-sidebar-border px-4 py-3">
           <div className="flex items-center gap-2">
-            <TerminalSquare className="h-4 w-4 text-cyan-400" />
+            <TerminalSquare className="h-4 w-4 text-cyan-600 dark:text-cyan-400" />
             <span className="text-sm font-semibold">{t('sshConnections')}</span>
           </div>
           <Button
             size="icon-sm"
             variant="ghost"
-            className="text-slate-400 hover:bg-slate-800 hover:text-cyan-300"
-            onClick={() => setDialogOpen(true)}
+            className="text-muted-foreground hover:bg-sidebar-accent hover:text-cyan-600 dark:hover:text-cyan-300"
+            onClick={openNewConnectionDialog}
             aria-label={t('sshNewConnection')}
           >
             <Plus className="h-4 w-4" />
@@ -249,7 +317,18 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
           {connections.map((connection) => {
             const session = sessions.find((candidate) => candidate.connection.id === connection.id);
             return (
-              <div key={connection.id} className="group flex items-center rounded-md hover:bg-slate-800/70">
+              <div
+                key={connection.id}
+                className="group flex items-center rounded-md hover:bg-sidebar-accent"
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  setContextMenu({
+                    connection,
+                    x: event.clientX,
+                    y: event.clientY,
+                  });
+                }}
+              >
                 <button
                   type="button"
                   onClick={() => openConnection(connection)}
@@ -258,11 +337,11 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
                 >
                   <span className={cn(
                     'h-2 w-2 shrink-0 rounded-full',
-                    session?.state === 'connected' ? 'bg-emerald-400' : session ? 'bg-amber-400' : 'bg-slate-600',
+                    session?.state === 'connected' ? 'bg-emerald-500' : session ? 'bg-amber-500' : 'bg-muted-foreground/50',
                   )} />
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-sm font-medium text-slate-200">{connection.name}</span>
-                    <span className="block truncate font-mono text-[11px] text-slate-500">
+                    <span className="block truncate text-sm font-medium text-sidebar-foreground">{connection.name}</span>
+                    <span className="block truncate font-mono text-[11px] text-muted-foreground">
                       {connection.username}@{connection.host}:{connection.port}
                     </span>
                   </span>
@@ -271,7 +350,7 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
                   type="button"
                   size="icon-sm"
                   variant="ghost"
-                  className="mr-1 opacity-0 text-slate-500 hover:bg-red-500/10 hover:text-red-400 group-hover:opacity-100"
+                  className="mr-1 text-muted-foreground opacity-0 hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
                   onClick={() => removeConnection(connection)}
                   aria-label={`${t('sshDelete')} ${connection.name}`}
                 >
@@ -281,17 +360,17 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
             );
           })}
           {connections.length === 0 && (
-            <div className="px-3 py-10 text-center text-xs leading-5 text-slate-500">
+            <div className="px-3 py-10 text-center text-xs leading-5 text-muted-foreground">
               {t('sshNoConnections')}
             </div>
           )}
         </div>
 
-        <div className="border-t border-slate-800 p-3">
+        <div className="border-t border-sidebar-border p-3">
           <Button
             className="w-full bg-cyan-600 text-white hover:bg-cyan-500"
             size="sm"
-            onClick={() => setDialogOpen(true)}
+            onClick={openNewConnectionDialog}
           >
             <Plus className="h-4 w-4" />
             {t('sshNewConnection')}
@@ -300,15 +379,15 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
       </aside>
 
       <section className="flex min-w-0 flex-1 flex-col">
-        <div className="flex h-11 shrink-0 items-end gap-1 overflow-x-auto border-b border-slate-800 bg-[#0c1320] px-2 pt-1">
+        <div className="flex h-11 shrink-0 items-end gap-1 overflow-x-auto border-b border-border bg-sidebar px-2 pt-1">
           {sessions.map((session) => (
             <div
               key={session.id}
               className={cn(
                 'flex h-9 min-w-36 max-w-56 items-center rounded-t-md border border-b-0 px-2',
                 session.id === activeSessionId
-                  ? 'border-slate-700 bg-[#080d16] text-slate-100'
-                  : 'border-transparent text-slate-500 hover:bg-slate-800/60 hover:text-slate-300',
+                  ? 'border-border bg-background text-foreground'
+                  : 'border-transparent text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
               )}
             >
               <button
@@ -323,7 +402,7 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
               <button
                 type="button"
                 onClick={() => closeSession(session.id)}
-                className="ml-1 rounded p-1 text-slate-600 hover:bg-slate-700 hover:text-slate-200"
+                className="ml-1 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                 aria-label={`${t('sshClose')} ${session.connection.name}`}
               >
                 <X className="h-3 w-3" />
@@ -333,9 +412,9 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
         </div>
 
         {activeSession && (
-          <div className="flex h-9 shrink-0 items-center justify-between border-b border-slate-800 bg-[#0a101b] px-4 text-xs">
+          <div className="flex h-9 shrink-0 items-center justify-between border-b border-border bg-muted/30 px-4 text-xs">
             <div className="flex min-w-0 items-center gap-3">
-              <span className="truncate font-mono text-slate-400">
+              <span className="truncate font-mono text-muted-foreground">
                 {activeSession.connection.username}@{activeSession.connection.host}:{activeSession.connection.port}
               </span>
               <Badge variant="outline" className={routeBadgeClass(activeSession.routeLabel)}>
@@ -347,23 +426,52 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
                       ? t('sshCloudFallback')
                     : activeSession.routeLabel
                       ? t('sshDirectRoute')
-                      : t('sshRouteResolving')}
+                      : activeSession.state === 'error'
+                        ? t('sshStateError')
+                        : t('sshRouteResolving')}
               </Badge>
             </div>
             <div className="flex shrink-0 items-center gap-2">
               <span className={cn(
                 'font-medium',
-                activeSession.state === 'connected' ? 'text-emerald-400' : activeSession.state === 'error' ? 'text-red-400' : 'text-amber-400',
+                activeSession.state === 'connected'
+                  ? 'text-emerald-600 dark:text-emerald-400'
+                  : activeSession.state === 'error'
+                    ? 'text-destructive'
+                    : 'text-amber-600 dark:text-amber-400',
               )}>
                 {t('sshState')}: {t(stateTranslationKey(activeSession.state))}
               </span>
-              {isReconnectable(activeSession) && !activeSession.message && (
-                <Button size="sm" variant="outline" className="h-7 border-slate-700" onClick={() => reconnectSession(activeSession.id)}>
+              {isReconnectable(activeSession) && activeSession.state !== 'error' && (
+                <Button size="sm" variant="outline" className="h-7 border-border" onClick={() => reconnectSession(activeSession.id)}>
                   <RotateCw className="h-3.5 w-3.5" />
                   {t('sshReconnect')}
                 </Button>
               )}
             </div>
+          </div>
+        )}
+
+        {activeSession?.state === 'error'
+          && activeSession.message
+          && !activeSession.pendingHostKey && (
+          <div
+            role="alert"
+            className="flex shrink-0 items-center gap-2 border-b border-destructive/30 bg-popover px-4 py-3 text-sm text-destructive shadow-sm"
+          >
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            <span className="min-w-0 flex-1">{t(errorTranslationKey(activeSession.message))}</span>
+            {isReconnectable(activeSession) && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="border-destructive/30 bg-transparent text-destructive hover:bg-destructive/10"
+                onClick={() => reconnectSession(activeSession.id)}
+              >
+                <RotateCw className="h-3.5 w-3.5" />
+                {t('sshReconnect')}
+              </Button>
+            )}
           </div>
         )}
 
@@ -389,9 +497,9 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
                 <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-xl border border-cyan-500/20 bg-cyan-500/10">
                   <TerminalSquare className="h-7 w-7 text-cyan-400" />
                 </div>
-                <h2 className="mt-5 text-lg font-semibold text-slate-200">{t('sshWorkspaceEmptyTitle')}</h2>
-                <p className="mt-2 text-sm leading-6 text-slate-500">{t('sshWorkspaceEmptyDesc')}</p>
-                <Button className="mt-5 bg-cyan-600 text-white hover:bg-cyan-500" onClick={() => setDialogOpen(true)}>
+                <h2 className="mt-5 text-lg font-semibold text-foreground">{t('sshWorkspaceEmptyTitle')}</h2>
+                <p className="mt-2 text-sm leading-6 text-muted-foreground">{t('sshWorkspaceEmptyDesc')}</p>
+                <Button className="mt-5 bg-cyan-600 text-white hover:bg-cyan-500" onClick={openNewConnectionDialog}>
                   <Plus className="h-4 w-4" />
                   {t('sshNewConnection')}
                 </Button>
@@ -400,25 +508,25 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
           )}
 
           {activeSession?.pendingHostKey && (
-            <div className="absolute inset-x-4 top-4 z-20 rounded-lg border border-amber-500/40 bg-slate-950/95 p-4 shadow-2xl backdrop-blur">
+            <div className="absolute inset-x-4 top-4 z-20 rounded-lg border border-amber-500/40 bg-popover/95 p-4 text-popover-foreground shadow-2xl backdrop-blur">
               <div className="flex items-start gap-3">
                 {activeSession.pendingHostKey.status === 'changed'
-                  ? <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-400" />
-                  : <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-amber-400" />}
+                  ? <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
+                  : <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-amber-600 dark:text-amber-400" />}
                 <div className="min-w-0 flex-1">
-                  <h3 className="font-semibold text-slate-100">
+                  <h3 className="font-semibold text-popover-foreground">
                     {activeSession.pendingHostKey.status === 'changed'
                       ? t('sshHostKeyChanged')
                       : t('sshHostKeyUnknown')}
                   </h3>
-                  <p className="mt-1 text-xs leading-5 text-slate-400">
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">
                     {activeSession.pendingHostKey.status === 'changed'
                       ? t('sshHostKeyChangedWarning')
                       : t('sshHostKeyUnknownWarning')}
                   </p>
-                  <div className="mt-3 rounded border border-slate-800 bg-black/30 px-3 py-2 font-mono text-xs text-cyan-300">
+                  <div className="mt-3 rounded border border-border bg-muted/50 px-3 py-2 font-mono text-xs text-cyan-700 dark:text-cyan-300">
                     <div>{activeSession.pendingHostKey.algorithm}</div>
-                    <div className="mt-1 break-all text-slate-400">{activeSession.pendingHostKey.fingerprint}</div>
+                    <div className="mt-1 break-all text-muted-foreground">{activeSession.pendingHostKey.fingerprint}</div>
                   </div>
                   <div className="mt-4 flex gap-2">
                     <Button
@@ -443,27 +551,70 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
               </div>
             </div>
           )}
-
-          {activeSession?.message && !activeSession.pendingHostKey && (
-            <div className="absolute inset-x-4 top-4 z-10 flex items-center gap-2 rounded-md border border-red-500/30 bg-red-950/90 px-4 py-3 text-sm text-red-200">
-              <AlertTriangle className="h-4 w-4 shrink-0" />
-              <span className="min-w-0 flex-1">{t(errorTranslationKey(activeSession.message))}</span>
-              {isReconnectable(activeSession) && (
-                <Button size="sm" variant="outline" className="border-red-400/30 bg-transparent text-red-100 hover:bg-red-900" onClick={() => reconnectSession(activeSession.id)}>
-                  <RotateCw className="h-3.5 w-3.5" />
-                  {t('sshReconnect')}
-                </Button>
-              )}
-            </div>
-          )}
         </div>
       </section>
+
+      {contextMenu && (
+        <>
+          <div
+            className="fixed inset-0 z-50"
+            onClick={() => setContextMenu(null)}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              setContextMenu(null);
+            }}
+          />
+          <div
+            className="fixed z-50 min-w-40 rounded-lg border border-border/60 bg-card/95 py-1 shadow-xl backdrop-blur-md animate-in fade-in zoom-in-95 duration-100"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+          >
+            <button
+              type="button"
+              className="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-xs transition-colors hover:bg-accent/50"
+              onClick={() => {
+                const { connection } = contextMenu;
+                setContextMenu(null);
+                openConnection(connection);
+              }}
+            >
+              <Play className="h-3 w-3" />
+              {t('sshConnect')}
+            </button>
+            <button
+              type="button"
+              className="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-xs transition-colors hover:bg-accent/50"
+              onClick={() => openEditConnectionDialog(contextMenu.connection)}
+            >
+              <Pencil className="h-3 w-3" />
+              {t('sshEdit')}
+            </button>
+            <div className="my-0.5 h-px bg-border/50" />
+            <button
+              type="button"
+              className="flex w-full cursor-pointer items-center gap-2 px-3 py-1.5 text-xs text-red-400 transition-colors hover:bg-red-500/10"
+              onClick={() => {
+                const { connection } = contextMenu;
+                setContextMenu(null);
+                removeConnection(connection);
+              }}
+            >
+              <Trash2 className="h-3 w-3" />
+              {t('sshDelete')}
+            </button>
+          </div>
+        </>
+      )}
 
       {dialogOpen && (
         <NewSshConnectionDialog
           open
-          onClose={() => setDialogOpen(false)}
+          editConnection={editingConnection}
+          onClose={() => {
+            setDialogOpen(false);
+            setEditingConnection(null);
+          }}
           onCreated={addConnection}
+          onUpdated={updateConnection}
         />
       )}
     </div>
