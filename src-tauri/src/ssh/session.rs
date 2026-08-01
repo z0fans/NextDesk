@@ -1,11 +1,15 @@
 use super::host_keys::{self, HostKeyStatus};
 use super::manager::SshControl;
 use super::sftp::SftpRuntime;
-use super::types::{SshAuthMethod, SshEvent, SshHostKeyPreview, SshStartRequest};
+use super::types::{
+    SshAuthMethod, SshEvent, SshHostKeyPreview, SshStartRequest, StoredPrivateKeyCredential,
+};
 use crate::connection_resolver::{self, RouteLease, ServiceKind};
 use crate::state::AppState;
 use russh::client;
-use russh::keys::{load_secret_key, ssh_key::PublicKey, PrivateKeyWithHashAlg};
+use russh::keys::{
+    decode_secret_key, load_secret_key, ssh_key::PublicKey, PrivateKey, PrivateKeyWithHashAlg,
+};
 use russh::{ChannelMsg, Disconnect};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -251,19 +255,32 @@ async fn run_session_inner(
             }
         }
         SshAuthMethod::PrivateKey => {
-            let key_path =
-                expand_private_key_path(request.private_key_path.as_deref().unwrap_or_default())?;
-            let passphrase = secret;
+            let key_path = request
+                .private_key_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(expand_private_key_path)
+                .transpose()?;
+            let stored_credential = secret;
             let key_loader = tauri::async_runtime::spawn_blocking(move || {
-                load_secret_key(key_path, passphrase.as_deref())
+                if let Some(key_path) = key_path {
+                    return load_secret_key(key_path, stored_credential.as_deref()).map_err(
+                        |error| {
+                            SessionFailure::Message(format!("ssh_private_key_load_failed:{error}"))
+                        },
+                    );
+                }
+                let stored_credential = stored_credential.ok_or_else(|| {
+                    SessionFailure::Message("ssh_private_key_required".to_string())
+                })?;
+                decode_inline_private_key(&stored_credential)
             });
             let key = match tokio::select! {
                 _ = cancellation.cancelled() => return Err(SessionFailure::Cancelled),
                 result = key_loader => result,
             } {
-                Ok(result) => result.map_err(|error| {
-                    SessionFailure::Message(format!("ssh_private_key_load_failed:{error}"))
-                })?,
+                Ok(result) => result?,
                 Err(error) => {
                     return Err(SessionFailure::Message(format!(
                         "ssh_private_key_task_failed:{error}"
@@ -452,6 +469,12 @@ fn expand_private_key_path(path: &str) -> Result<PathBuf, SessionFailure> {
         ));
     }
     Ok(Path::new(path).to_path_buf())
+}
+
+fn decode_inline_private_key(stored: &str) -> Result<PrivateKey, SessionFailure> {
+    let credential = StoredPrivateKeyCredential::decode(stored).map_err(SessionFailure::Message)?;
+    decode_secret_key(credential.private_key(), credential.passphrase())
+        .map_err(|error| SessionFailure::Message(format!("ssh_private_key_load_failed:{error}")))
 }
 
 #[cfg(test)]

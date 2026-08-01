@@ -64,4 +64,24 @@ describe('SSH IPC bridge', () => {
       expect.objectContaining({ kind: 'state', state: 'connected' }),
     );
   });
+
+  it('stores a typed private-key credential through the Rust boundary', async () => {
+    invokeMock.mockResolvedValue(undefined);
+
+    await sshApi.storePrivateKeyCredential(
+      'ssh-key-1',
+      'Deployment key',
+      '-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----',
+      'ssh-ed25519 AAAATEST deployment@example',
+      'passphrase',
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith('ssh_private_key_credential_store', {
+      reference: 'ssh-key-1',
+      label: 'Deployment key',
+      privateKey: expect.stringContaining('BEGIN PRIVATE KEY'),
+      publicKey: 'ssh-ed25519 AAAATEST deployment@example',
+      passphrase: 'passphrase',
+    });
+  });
 });

@@ -8,6 +8,94 @@ pub enum SshAuthMethod {
     PrivateKey,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum StoredCredentialKind {
+    PrivateKey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct StoredPrivateKeyCredential {
+    kind: StoredCredentialKind,
+    version: u8,
+    label: String,
+    private_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    passphrase: Option<String>,
+}
+
+impl StoredPrivateKeyCredential {
+    const VERSION: u8 = 1;
+
+    pub(crate) fn new(
+        label: String,
+        private_key: String,
+        public_key: Option<String>,
+        passphrase: Option<String>,
+    ) -> Result<Self, String> {
+        let label = label.trim().to_string();
+        if label.is_empty() || label.len() > 128 {
+            return Err("ssh_private_key_label_invalid".to_string());
+        }
+        let private_key = private_key.trim().to_string();
+        if private_key.is_empty() || private_key.len() > 60 * 1024 {
+            return Err("ssh_private_key_credential_invalid".to_string());
+        }
+        let passphrase = passphrase.filter(|value| !value.is_empty());
+        if passphrase
+            .as_deref()
+            .is_some_and(|value| value.len() > 4096)
+        {
+            return Err("ssh_private_key_passphrase_invalid".to_string());
+        }
+        let public_key = public_key
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if public_key
+            .as_deref()
+            .is_some_and(|value| value.len() > 16 * 1024)
+        {
+            return Err("ssh_public_key_invalid".to_string());
+        }
+        Ok(Self {
+            kind: StoredCredentialKind::PrivateKey,
+            version: Self::VERSION,
+            label,
+            private_key,
+            public_key,
+            passphrase,
+        })
+    }
+
+    pub(crate) fn encode(&self) -> Result<String, String> {
+        serde_json::to_string(self).map_err(|_| "ssh_private_key_credential_invalid".to_string())
+    }
+
+    pub(crate) fn decode(stored: &str) -> Result<Self, String> {
+        let credential: Self = serde_json::from_str(stored)
+            .map_err(|_| "ssh_private_key_credential_invalid".to_string())?;
+        if credential.version != Self::VERSION || credential.private_key.trim().is_empty() {
+            return Err("ssh_private_key_credential_invalid".to_string());
+        }
+        Ok(credential)
+    }
+
+    pub(crate) fn private_key(&self) -> &str {
+        &self.private_key
+    }
+
+    pub(crate) fn public_key(&self) -> Option<&str> {
+        self.public_key.as_deref()
+    }
+
+    pub(crate) fn passphrase(&self) -> Option<&str> {
+        self.passphrase.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SshStartRequest {
@@ -74,6 +162,12 @@ impl SshStartRequest {
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    self.credential_reference
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                })
                 .is_none()
         {
             return Err("ssh_private_key_required".to_string());
@@ -377,8 +471,38 @@ mod tests {
     use super::{
         SftpCreateDirectoryRequest, SftpEntry, SftpEntryKind, SftpListRequest, SftpRemoveRequest,
         SftpRenameRequest, SftpTransferDirection, SftpTransferEvent, SftpTransferRequest,
-        SftpTransferState,
+        SftpTransferState, SshAuthMethod, SshStartRequest,
     };
+    use crate::connection_resolver::RoutePolicy;
+
+    #[test]
+    fn inline_private_key_auth_uses_a_vault_reference_without_a_file_path() {
+        let request = SshStartRequest {
+            session_id: "ssh-inline-key".to_string(),
+            host: "server.example.com".to_string(),
+            port: 22,
+            username: "deploy".to_string(),
+            auth_method: SshAuthMethod::PrivateKey,
+            credential_reference: Some("ssh-inline-key".to_string()),
+            private_key_path: None,
+            cols: 80,
+            rows: 24,
+            pixel_width: 0,
+            pixel_height: 0,
+            route_policy: RoutePolicy::Direct,
+            preferred_region: None,
+            reuse_cloud_binding: false,
+        };
+
+        assert!(request.validate().is_ok());
+
+        let mut missing_key = request;
+        missing_key.credential_reference = None;
+        assert_eq!(
+            missing_key.validate(),
+            Err("ssh_private_key_required".to_string())
+        );
+    }
 
     #[test]
     fn sftp_list_requests_validate_the_public_remote_path_boundary() {

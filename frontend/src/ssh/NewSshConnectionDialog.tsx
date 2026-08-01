@@ -4,6 +4,7 @@ import { KeyRound, ShieldCheck, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { useTranslation } from '@/i18n/useTranslation';
+import { cn } from '@/lib/utils';
 import { sshApi } from './ssh-api';
 import type { SshAuthMethod, SshConnection, SshRoutePolicy } from './types';
 
@@ -34,13 +35,21 @@ export function NewSshConnectionDialog({
   const [username, setUsername] = useState(editConnection?.username ?? 'root');
   const [authMethod, setAuthMethod] = useState<SshAuthMethod>(editConnection?.authMethod ?? 'password');
   const [secret, setSecret] = useState('');
-  const [privateKeyPath, setPrivateKeyPath] = useState(editConnection?.privateKeyPath ?? '');
+  const [privateKeyLabel, setPrivateKeyLabel] = useState(
+    editConnection?.privateKeyLabel
+      ?? (editConnection?.authMethod === 'private_key' ? editConnection.name : ''),
+  );
+  const [privateKey, setPrivateKey] = useState('');
+  const [publicKey, setPublicKey] = useState(editConnection?.publicKey ?? '');
   const [routePolicy, setRoutePolicy] = useState<SshRoutePolicy>(editConnection?.routePolicy ?? 'auto');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const isEdit = Boolean(editConnection);
   const canReuseCredential = Boolean(
     editConnection?.credentialReference && editConnection.authMethod === authMethod,
+  );
+  const canReuseLegacyKeyPath = Boolean(
+    editConnection?.privateKeyPath && editConnection.authMethod === authMethod,
   );
 
   if (!open) return null;
@@ -63,7 +72,25 @@ export function NewSshConnectionDialog({
       setError(t('sshPasswordRequired'));
       return;
     }
-    if (authMethod === 'private_key' && !privateKeyPath.trim()) {
+    if (authMethod === 'private_key' && !privateKeyLabel.trim()) {
+      setError(t('sshPrivateKeyLabelRequired'));
+      return;
+    }
+    if (
+      authMethod === 'private_key'
+      && !privateKey.trim()
+      && !canReuseCredential
+      && !canReuseLegacyKeyPath
+    ) {
+      setError(t('sshPrivateKeyRequired'));
+      return;
+    }
+    if (
+      authMethod === 'private_key'
+      && secret
+      && !privateKey.trim()
+      && !canReuseLegacyKeyPath
+    ) {
       setError(t('sshPrivateKeyRequired'));
       return;
     }
@@ -75,14 +102,34 @@ export function NewSshConnectionDialog({
       let credentialReference = canReuseCredential
         ? editConnection?.credentialReference
         : undefined;
-      if (secret) {
+      const replacesInlinePrivateKey = authMethod === 'private_key' && Boolean(privateKey.trim());
+      const replacesLegacyPassphrase = authMethod === 'private_key'
+        && !privateKey.trim()
+        && canReuseLegacyKeyPath
+        && Boolean(secret);
+      const replacesCredential = authMethod === 'password'
+        ? Boolean(secret)
+        : replacesInlinePrivateKey || replacesLegacyPassphrase;
+      if (replacesCredential) {
         // Active tabs keep immutable connection snapshots, so edited secrets must use a new vault entry.
         credentialReference = editConnection
           ? `ssh-${id}-${newConnectionId()}`
           : `ssh-${id}`;
       }
       if (credentialReference) {
-        if (secret) await sshApi.storeCredential(credentialReference, secret);
+        if (replacesCredential) {
+          if (authMethod === 'password' || replacesLegacyPassphrase) {
+            await sshApi.storeCredential(credentialReference, secret);
+          } else {
+            await sshApi.storePrivateKeyCredential(
+              credentialReference,
+              privateKeyLabel.trim(),
+              privateKey.trim(),
+              publicKey.trim() || undefined,
+              secret || undefined,
+            );
+          }
+        }
       }
       const savedConnection: SshConnection = {
         id,
@@ -92,7 +139,11 @@ export function NewSshConnectionDialog({
         username: username.trim(),
         authMethod,
         credentialReference,
-        privateKeyPath: authMethod === 'private_key' ? privateKeyPath.trim() : undefined,
+        privateKeyLabel: authMethod === 'private_key' ? privateKeyLabel.trim() : undefined,
+        publicKey: authMethod === 'private_key' && publicKey.trim() ? publicKey.trim() : undefined,
+        privateKeyPath: authMethod === 'private_key' && !privateKey.trim()
+          ? editConnection?.privateKeyPath
+          : undefined,
         routePolicy,
         preferredRegion: editConnection?.preferredRegion,
       };
@@ -113,9 +164,9 @@ export function NewSshConnectionDialog({
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/70 p-4 backdrop-blur-sm">
       <form
         onSubmit={submit}
-        className="w-full max-w-lg overflow-hidden rounded-xl border border-border bg-card shadow-2xl"
+        className="flex max-h-[calc(100vh-2rem)] w-full max-w-lg flex-col overflow-hidden rounded-xl border border-border bg-card shadow-2xl"
       >
-        <div className="flex items-start justify-between border-b border-border px-6 py-5">
+        <div className="flex shrink-0 items-start justify-between border-b border-border px-6 py-5">
           <div>
             <h2 className="text-lg font-semibold text-foreground">
               {isEdit ? t('sshEditConnection') : t('sshNewConnection')}
@@ -127,7 +178,7 @@ export function NewSshConnectionDialog({
           </Button>
         </div>
 
-        <div className="grid gap-4 px-6 py-5 sm:grid-cols-2">
+        <div className="grid overflow-y-auto gap-4 px-6 py-5 sm:grid-cols-2">
           <label className="space-y-1.5 sm:col-span-2">
             <span className="text-xs font-medium text-muted-foreground">{t('sshName')}</span>
             <Input value={name} onChange={(event) => setName(event.target.value)} placeholder={t('sshNamePlaceholder')} />
@@ -144,42 +195,110 @@ export function NewSshConnectionDialog({
             <span className="text-xs font-medium text-muted-foreground">{t('sshUsername')}</span>
             <Input required value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" />
           </label>
-          <label className="space-y-1.5">
-            <span className="text-xs font-medium text-muted-foreground">{t('sshAuthentication')}</span>
-            <select
-              value={authMethod}
-              onChange={(event) => setAuthMethod(event.target.value as SshAuthMethod)}
-              className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring/50"
+          <fieldset className="space-y-1.5">
+            <legend className="text-xs font-medium text-muted-foreground">{t('sshAuthentication')}</legend>
+            <div
+              role="radiogroup"
+              aria-label={t('sshAuthentication')}
+              className="grid h-9 grid-cols-2 rounded-md border border-input bg-muted/30 p-0.5"
             >
-              <option value="password">{t('sshPassword')}</option>
-              <option value="private_key">{t('sshPrivateKey')}</option>
-            </select>
-          </label>
+              {(['password', 'private_key'] as const).map((method) => (
+                <label key={method} className="relative cursor-pointer">
+                  <input
+                    className="peer sr-only"
+                    type="radio"
+                    name="ssh-authentication"
+                    value={method}
+                    checked={authMethod === method}
+                    onChange={() => {
+                      if (method !== authMethod) setSecret('');
+                      setAuthMethod(method);
+                      setError('');
+                    }}
+                  />
+                  <span
+                    className={cn(
+                      'flex h-full items-center justify-center rounded-[5px] px-2 text-sm font-medium text-muted-foreground transition-colors',
+                      'peer-focus-visible:ring-2 peer-focus-visible:ring-ring/50',
+                      'peer-checked:bg-background peer-checked:text-foreground peer-checked:shadow-sm',
+                    )}
+                  >
+                    {method === 'password' ? t('sshPassword') : t('sshPrivateKey')}
+                  </span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
 
           {authMethod === 'private_key' && (
-            <label className="space-y-1.5 sm:col-span-2">
-              <span className="text-xs font-medium text-muted-foreground">{t('sshPrivateKeyPath')}</span>
-              <Input value={privateKeyPath} onChange={(event) => setPrivateKeyPath(event.target.value)} placeholder="~/.ssh/id_ed25519" />
-              <span className="block text-[11px] text-muted-foreground">{t('sshModernKeyHint')}</span>
-            </label>
+            <div className="grid gap-4 rounded-lg border border-border bg-muted/15 p-4 sm:col-span-2">
+              <label className="space-y-1.5">
+                <span className="text-xs font-medium text-muted-foreground">{t('sshPrivateKeyLabel')}</span>
+                <Input
+                  required
+                  value={privateKeyLabel}
+                  onChange={(event) => setPrivateKeyLabel(event.target.value)}
+                  placeholder={t('sshPrivateKeyLabelPlaceholder')}
+                />
+              </label>
+              <label className="space-y-1.5">
+                <span className="text-xs font-medium text-muted-foreground">{t('sshPrivateKeyContent')}</span>
+                <textarea
+                  aria-label={t('sshPrivateKeyContent')}
+                  required={!canReuseCredential && !canReuseLegacyKeyPath}
+                  value={privateKey}
+                  onChange={(event) => setPrivateKey(event.target.value)}
+                  placeholder={canReuseCredential || canReuseLegacyKeyPath
+                    ? t('sshKeepSavedPrivateKey')
+                    : '-----BEGIN OPENSSH PRIVATE KEY-----'}
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="min-h-28 w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-xs text-foreground shadow-xs outline-none transition-[color,box-shadow] placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                />
+                <span className="block text-[11px] text-muted-foreground">{t('sshModernKeyHint')}</span>
+              </label>
+              <label className="space-y-1.5">
+                <span className="text-xs font-medium text-muted-foreground">{t('sshPublicKey')}</span>
+                <textarea
+                  aria-label={t('sshPublicKey')}
+                  value={publicKey}
+                  onChange={(event) => setPublicKey(event.target.value)}
+                  placeholder="ssh-ed25519 AAAA... user@host"
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="min-h-20 w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-xs text-foreground shadow-xs outline-none transition-[color,box-shadow] placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+                />
+                <span className="block text-[11px] text-muted-foreground">{t('sshPublicKeyHint')}</span>
+              </label>
+              <label className="space-y-1.5">
+                <span className="text-xs font-medium text-muted-foreground">{t('sshPassphraseOptional')}</span>
+                <Input
+                  type="password"
+                  value={secret}
+                  onChange={(event) => setSecret(event.target.value)}
+                  placeholder={canReuseCredential ? t('sshKeepSavedCredential') : undefined}
+                  autoComplete="new-password"
+                />
+              </label>
+            </div>
           )}
 
-          <label className="space-y-1.5 sm:col-span-2">
-            <span className="text-xs font-medium text-muted-foreground">
-              {authMethod === 'password' ? t('sshPassword') : t('sshPassphraseOptional')}
-            </span>
-            <Input
-              required={authMethod === 'password' && !canReuseCredential}
-              type="password"
-              value={secret}
-              onChange={(event) => setSecret(event.target.value)}
-              placeholder={isEdit && canReuseCredential ? t('sshKeepSavedCredential') : undefined}
-              autoComplete="new-password"
-            />
-            {isEdit && canReuseCredential && (
-              <span className="block text-[11px] text-muted-foreground">{t('sshKeepSavedCredentialHint')}</span>
-            )}
-          </label>
+          {authMethod === 'password' && (
+            <label className="space-y-1.5 sm:col-span-2">
+              <span className="text-xs font-medium text-muted-foreground">{t('sshPassword')}</span>
+              <Input
+                required={!canReuseCredential}
+                type="password"
+                value={secret}
+                onChange={(event) => setSecret(event.target.value)}
+                placeholder={isEdit && canReuseCredential ? t('sshKeepSavedCredential') : undefined}
+                autoComplete="new-password"
+              />
+              {isEdit && canReuseCredential && (
+                <span className="block text-[11px] text-muted-foreground">{t('sshKeepSavedCredentialHint')}</span>
+              )}
+            </label>
+          )}
 
           <label className="space-y-1.5 sm:col-span-2">
             <span className="text-xs font-medium text-muted-foreground">{t('sshRoutePolicy')}</span>
@@ -201,7 +320,7 @@ export function NewSshConnectionDialog({
           {error && <p className="text-sm text-destructive sm:col-span-2">{error}</p>}
         </div>
 
-        <div className="flex justify-end gap-3 border-t border-border bg-muted/20 px-6 py-4">
+        <div className="flex shrink-0 justify-end gap-3 border-t border-border bg-muted/20 px-6 py-4">
           <Button type="button" variant="outline" onClick={onClose}>{t('sshCancel')}</Button>
           <Button type="submit" disabled={saving} className="bg-cyan-600 text-white hover:bg-cyan-500">
             <KeyRound className="h-4 w-4" />

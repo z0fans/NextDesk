@@ -1595,6 +1595,7 @@ pub fn run() {
             ssh::ssh_session_resize,
             ssh::ssh_session_close,
             ssh::ssh_credential_store,
+            ssh::ssh_private_key_credential_store,
             ssh::ssh_credential_delete,
             ssh::ssh_credential_exists,
             ssh::ssh_trust_host_key,

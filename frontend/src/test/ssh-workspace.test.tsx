@@ -21,6 +21,9 @@ const terminalProps = vi.hoisted(() => new Map<string, {
 
 const credentialApi = vi.hoisted(() => ({
   storeCredential: vi.fn<(...args: [string, string]) => Promise<void>>(),
+  storePrivateKeyCredential: vi.fn<(
+    ...args: [string, string, string, string?, string?]
+  ) => Promise<void>>(),
   deleteCredential: vi.fn<(...args: [string]) => Promise<void>>(),
 }));
 
@@ -65,6 +68,7 @@ describe('SSH workspace', () => {
   beforeEach(() => {
     terminalProps.clear();
     credentialApi.storeCredential.mockReset().mockResolvedValue(undefined);
+    credentialApi.storePrivateKeyCredential.mockReset().mockResolvedValue(undefined);
     credentialApi.deleteCredential.mockReset().mockResolvedValue(undefined);
     localStorage.clear();
     localStorage.setItem(
@@ -184,6 +188,43 @@ describe('SSH workspace', () => {
     });
   });
 
+  it('uses an in-app authentication control and stores pasted private keys outside connection metadata', async () => {
+    render(<SshWorkspace isVisible />);
+    fireEvent.click(screen.getAllByRole('button', { name: 'sshNewConnection' })[0]);
+
+    expect(screen.getByRole('radiogroup', { name: 'sshAuthentication' })).toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: 'sshAuthentication' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('radio', { name: 'sshPrivateKey' }));
+    fireEvent.change(screen.getByLabelText('sshHost'), { target: { value: 'key.example.com' } });
+    fireEvent.change(screen.getByLabelText('sshPrivateKeyLabel'), { target: { value: 'Deployment key' } });
+    fireEvent.change(screen.getByRole('textbox', { name: 'sshPrivateKeyContent' }), {
+      target: { value: '-----BEGIN OPENSSH PRIVATE KEY-----\nprivate-material\n-----END OPENSSH PRIVATE KEY-----' },
+    });
+    fireEvent.change(screen.getByLabelText('sshPublicKey'), {
+      target: { value: 'ssh-ed25519 AAAATEST deployment@example' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'sshSaveAndConnect' }));
+
+    await waitFor(() => expect(credentialApi.storePrivateKeyCredential).toHaveBeenCalledOnce());
+    const [credentialReference, storedLabel, storedPrivateKey, storedPublicKey, storedPassphrase] =
+      credentialApi.storePrivateKeyCredential.mock.calls[0];
+    expect(credentialReference).toMatch(/^ssh-/);
+    expect(storedLabel).toBe('Deployment key');
+    expect(storedPrivateKey).toContain('BEGIN OPENSSH PRIVATE KEY');
+    expect(storedPublicKey).toBe('ssh-ed25519 AAAATEST deployment@example');
+    expect(storedPassphrase).toBeUndefined();
+
+    const savedRaw = localStorage.getItem(SSH_CONNECTIONS_STORAGE_KEY) ?? '';
+    expect(savedRaw).not.toContain('private-material');
+    expect(JSON.parse(savedRaw).at(-1)).toMatchObject({
+      authMethod: 'private_key',
+      privateKeyLabel: 'Deployment key',
+      publicKey: 'ssh-ed25519 AAAATEST deployment@example',
+      credentialReference,
+    });
+  });
+
   it('versions a replacement credential without changing an active session snapshot', async () => {
     render(<SshWorkspace isVisible />);
     fireEvent.click(screen.getByRole('button', { name: 'sshConnect Alpha' }));
@@ -212,19 +253,53 @@ describe('SSH workspace', () => {
 
     fireEvent.contextMenu(screen.getByRole('button', { name: 'sshConnect Alpha' }));
     fireEvent.click(screen.getByRole('button', { name: 'sshEdit' }));
-    fireEvent.change(screen.getByLabelText('sshAuthentication'), {
-      target: { value: 'private_key' },
+    fireEvent.click(screen.getByRole('radio', { name: 'sshPrivateKey' }));
+    fireEvent.change(screen.getByLabelText('sshPrivateKeyLabel'), {
+      target: { value: 'Alpha deployment key' },
     });
-    fireEvent.change(screen.getByPlaceholderText('~/.ssh/id_ed25519'), {
-      target: { value: '~/.ssh/id_ed25519' },
+    fireEvent.change(screen.getByRole('textbox', { name: 'sshPrivateKeyContent' }), {
+      target: {
+        value: '-----BEGIN OPENSSH PRIVATE KEY-----\nreplacement-key\n-----END OPENSSH PRIVATE KEY-----',
+      },
     });
     fireEvent.click(screen.getByRole('button', { name: 'sshSave' }));
 
     await waitFor(() => expect(screen.queryByRole('heading', { name: 'sshEditConnection' })).not.toBeInTheDocument());
     expect(terminalProps.get('alpha')?.connection.credentialReference).toBe('ssh-alpha');
     expect(credentialApi.deleteCredential).not.toHaveBeenCalled();
-    expect(JSON.parse(localStorage.getItem(SSH_CONNECTIONS_STORAGE_KEY) ?? '[]')[0])
-      .not.toHaveProperty('credentialReference');
+    const saved = JSON.parse(localStorage.getItem(SSH_CONNECTIONS_STORAGE_KEY) ?? '[]')[0];
+    expect(saved.credentialReference).not.toBe('ssh-alpha');
+    expect(saved.privateKeyLabel).toBe('Alpha deployment key');
+  });
+
+  it('keeps a legacy private-key path when adding its passphrase', async () => {
+    localStorage.setItem(
+      SSH_CONNECTIONS_STORAGE_KEY,
+      JSON.stringify([{
+        id: 'legacy-key',
+        name: 'Legacy key',
+        host: 'legacy.example.com',
+        port: 22,
+        username: 'root',
+        authMethod: 'private_key',
+        privateKeyPath: '~/.ssh/id_ed25519',
+        routePolicy: 'direct',
+      }]),
+    );
+    render(<SshWorkspace isVisible />);
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'sshConnect Legacy key' }));
+    fireEvent.click(screen.getByRole('button', { name: 'sshEdit' }));
+    fireEvent.change(screen.getByLabelText('sshPassphraseOptional'), {
+      target: { value: 'legacy-passphrase' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'sshSave' }));
+
+    await waitFor(() => expect(credentialApi.storeCredential).toHaveBeenCalledOnce());
+    expect(credentialApi.storePrivateKeyCredential).not.toHaveBeenCalled();
+    const saved = JSON.parse(localStorage.getItem(SSH_CONNECTIONS_STORAGE_KEY) ?? '[]')[0];
+    expect(saved.privateKeyPath).toBe('~/.ssh/id_ed25519');
+    expect(saved.credentialReference).toMatch(/^ssh-legacy-key-/);
   });
 
   it('shows direct fallback distinctly and retries the same session lease', () => {

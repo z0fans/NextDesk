@@ -42,6 +42,16 @@ export const sshApi = {
     return api.sshCredentialStore(reference, secret);
   },
 
+  storePrivateKeyCredential(
+    reference: string,
+    label: string,
+    privateKey: string,
+    publicKey?: string,
+    passphrase?: string,
+  ): Promise<void> {
+    return api.sshPrivateKeyCredentialStore(reference, label, privateKey, publicKey, passphrase);
+  },
+
   deleteCredential(reference: string): Promise<void> {
     return api.sshCredentialDelete(reference);
   },

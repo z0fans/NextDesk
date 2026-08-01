@@ -162,6 +162,19 @@ export const api = {
     invoke<void>('ssh_session_close', { sessionId }),
   sshCredentialStore: (reference: string, secret: string) =>
     invoke<void>('ssh_credential_store', { reference, secret }),
+  sshPrivateKeyCredentialStore: (
+    reference: string,
+    label: string,
+    privateKey: string,
+    publicKey?: string,
+    passphrase?: string,
+  ) => invoke<void>('ssh_private_key_credential_store', {
+    reference,
+    label,
+    privateKey,
+    publicKey,
+    passphrase,
+  }),
   sshCredentialDelete: (reference: string) =>
     invoke<void>('ssh_credential_delete', { reference }),
   sshCredentialExists: (reference: string) =>

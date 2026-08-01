@@ -9,6 +9,9 @@ export interface SshConnection {
   username: string;
   authMethod: SshAuthMethod;
   credentialReference?: string;
+  privateKeyLabel?: string;
+  publicKey?: string;
+  /** Legacy file-based key records remain readable during migration. */
   privateKeyPath?: string;
   routePolicy: SshRoutePolicy;
   preferredRegion?: string;

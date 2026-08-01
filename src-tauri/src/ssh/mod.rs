@@ -8,14 +8,14 @@ use crate::connection_resolver::{self, ConnectionIntent, ServiceKind};
 use crate::credential_vault;
 use crate::state::AppState;
 use manager::{SshControl, SshSessionHandle};
-use russh::keys::ssh_key::PublicKey;
+use russh::keys::{decode_secret_key, ssh_key::PublicKey};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, State};
 use types::{
     validate_sftp_session_id, SftpCreateDirectoryRequest, SftpListRequest, SftpListResponse,
     SftpOpenResponse, SftpRemoveRequest, SftpRenameRequest, SftpTransferDirection,
     SftpTransferEvent, SftpTransferRequest, SshEvent, SshHostKeyTrustRequest, SshStartRequest,
-    SshStartResponse,
+    SshStartResponse, StoredPrivateKeyCredential,
 };
 
 #[tauri::command]
@@ -157,6 +157,42 @@ pub fn ssh_session_close(session_id: String, app_state: State<'_, AppState>) -> 
 #[tauri::command]
 pub fn ssh_credential_store(reference: String, secret: String) -> Result<(), String> {
     credential_vault::store(&reference, &secret)
+}
+
+#[tauri::command]
+pub async fn ssh_private_key_credential_store(
+    reference: String,
+    label: String,
+    private_key: String,
+    public_key: Option<String>,
+    passphrase: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let stored =
+            encode_validated_private_key_credential(label, private_key, public_key, passphrase)?;
+        credential_vault::store(&reference, &stored)
+    })
+    .await
+    .map_err(|_| "ssh_private_key_task_failed".to_string())?
+}
+
+fn encode_validated_private_key_credential(
+    label: String,
+    private_key: String,
+    public_key: Option<String>,
+    passphrase: Option<String>,
+) -> Result<String, String> {
+    let credential = StoredPrivateKeyCredential::new(label, private_key, public_key, passphrase)?;
+    let private_key = decode_secret_key(credential.private_key(), credential.passphrase())
+        .map_err(|error| format!("ssh_private_key_load_failed:{error}"))?;
+    if let Some(public_key) = credential.public_key() {
+        let public_key = PublicKey::from_openssh(public_key)
+            .map_err(|_| "ssh_public_key_invalid".to_string())?;
+        if public_key.key_data() != private_key.public_key().key_data() {
+            return Err("ssh_public_key_mismatch".to_string());
+        }
+    }
+    credential.encode()
 }
 
 #[tauri::command]
@@ -393,4 +429,37 @@ pub async fn ssh_sftp_remove(
     result
         .await
         .map_err(|_| "sftp_session_closed".to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_validated_private_key_credential;
+    use russh::keys::decode_secret_key;
+
+    const TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
+MC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\n\
+-----END PRIVATE KEY-----";
+
+    #[test]
+    fn private_key_credential_validates_the_optional_public_key() {
+        let decoded = decode_secret_key(TEST_PRIVATE_KEY, None).unwrap();
+        let public_key = decoded.public_key().to_openssh().unwrap();
+
+        assert!(encode_validated_private_key_credential(
+            "Deployment key".to_string(),
+            TEST_PRIVATE_KEY.to_string(),
+            Some(public_key),
+            None,
+        )
+        .is_ok());
+        assert_eq!(
+            encode_validated_private_key_credential(
+                "Deployment key".to_string(),
+                TEST_PRIVATE_KEY.to_string(),
+                Some("not-an-ssh-public-key".to_string()),
+                None,
+            ),
+            Err("ssh_public_key_invalid".to_string()),
+        );
+    }
 }

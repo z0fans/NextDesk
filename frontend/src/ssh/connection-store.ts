@@ -39,6 +39,12 @@ function sanitizeConnection(value: unknown): SshConnection | null {
     ...(typeof candidate.credentialReference === 'string'
       ? { credentialReference: candidate.credentialReference }
       : {}),
+    ...(typeof candidate.privateKeyLabel === 'string'
+      ? { privateKeyLabel: candidate.privateKeyLabel }
+      : {}),
+    ...(typeof candidate.publicKey === 'string'
+      ? { publicKey: candidate.publicKey }
+      : {}),
     ...(typeof candidate.privateKeyPath === 'string'
       ? { privateKeyPath: candidate.privateKeyPath }
       : {}),
