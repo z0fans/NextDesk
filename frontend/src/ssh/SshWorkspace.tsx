@@ -123,6 +123,7 @@ function isLifecycleClosure(message?: string): boolean {
 export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceProps) {
   const { t } = useTranslation();
   const [connections, setConnections] = useState<SshConnection[]>(loadSshConnections);
+  const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<SshSessionTab[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -140,6 +141,7 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
 
   const openConnection = useCallback((connection: SshConnection) => {
     const sessionId = newSessionId(connection.id);
+    setSelectedConnectionId(connection.id);
     setSessions((current) => [
       ...current,
       {
@@ -295,6 +297,7 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
       saveSshConnections(next);
       return next;
     });
+    setSelectedConnectionId((selected) => selected === connection.id ? null : selected);
     if (connection.credentialReference) {
       void sshApi.deleteCredential(connection.credentialReference).catch(() => {});
     }
@@ -325,7 +328,11 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
             return (
               <div
                 key={connection.id}
-                className="group flex items-center rounded-md hover:bg-sidebar-accent"
+                className={cn(
+                  'group flex items-center rounded-md hover:bg-sidebar-accent',
+                  selectedConnectionId === connection.id
+                    && 'border-l-2 border-cyan-500 bg-cyan-500/10',
+                )}
                 onContextMenu={(event) => {
                   event.preventDefault();
                   setContextMenu({
@@ -337,17 +344,33 @@ export function SshWorkspace({ isVisible, onMainSidebarCollapse }: SshWorkspaceP
               >
                 <button
                   type="button"
-                  onClick={() => openConnection(connection)}
+                  onClick={() => setSelectedConnectionId((selected) =>
+                    selected === connection.id ? null : connection.id
+                  )}
+                  onDoubleClick={() => openConnection(connection)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault();
+                      openConnection(connection);
+                    }
+                  }}
                   className="flex min-w-0 flex-1 items-center gap-3 px-3 py-2 text-left"
                   aria-label={`${t('sshConnect')} ${connection.name}`}
+                  aria-pressed={selectedConnectionId === connection.id}
                 >
                   <span className={cn(
                     'h-2 w-2 shrink-0 rounded-full',
                     session?.state === 'connected' ? 'bg-emerald-500' : session ? 'bg-amber-500' : 'bg-muted-foreground/50',
                   )} />
                   <span className="min-w-0 flex-1">
-                    <span className="block truncate text-sm font-medium text-sidebar-foreground">{connection.name}</span>
-                    <span className="block truncate font-mono text-[11px] text-muted-foreground">
+                    <span className={cn(
+                      'block truncate text-sm font-medium',
+                      selectedConnectionId === connection.id ? 'text-cyan-300' : 'text-sidebar-foreground',
+                    )}>{connection.name}</span>
+                    <span className={cn(
+                      'block truncate font-mono text-[11px]',
+                      selectedConnectionId === connection.id ? 'text-cyan-300/70' : 'text-muted-foreground',
+                    )}>
                       {connection.username}@{connection.host}:{connection.port}
                     </span>
                   </span>

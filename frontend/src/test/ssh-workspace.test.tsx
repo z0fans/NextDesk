@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { SSH_CONNECTIONS_STORAGE_KEY } from '@/ssh/connection-store';
@@ -110,11 +111,29 @@ describe('SSH workspace', () => {
     expect(screen.getByText('sshWorkspaceEmptyDesc')).toHaveClass('text-muted-foreground');
   });
 
+  it('selects a saved connection on single click and opens it on double click', async () => {
+    const user = userEvent.setup();
+    render(<SshWorkspace isVisible />);
+    const alpha = screen.getByRole('button', { name: 'sshConnect Alpha' });
+
+    await user.click(alpha);
+    expect(alpha).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByText('Alpha')).toHaveClass('text-cyan-300');
+    expect(screen.queryByTestId('terminal-alpha')).not.toBeInTheDocument();
+
+    await user.click(alpha);
+    expect(alpha).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByText('Alpha')).toHaveClass('text-sidebar-foreground');
+
+    await user.dblClick(alpha);
+    expect(screen.getByTestId('terminal-alpha')).toHaveAttribute('data-visible', 'true');
+  });
+
   it('keeps inactive terminals mounted while switching session tabs', () => {
     render(<SshWorkspace isVisible />);
 
-    fireEvent.click(screen.getByRole('button', { name: 'sshConnect Alpha' }));
-    fireEvent.click(screen.getByRole('button', { name: 'sshConnect Beta' }));
+    fireEvent.doubleClick(screen.getByRole('button', { name: 'sshConnect Alpha' }));
+    fireEvent.doubleClick(screen.getByRole('button', { name: 'sshConnect Beta' }));
 
     const alpha = screen.getByTestId('terminal-alpha');
     const beta = screen.getByTestId('terminal-beta');
@@ -128,7 +147,7 @@ describe('SSH workspace', () => {
 
   it('opens the SFTP browser only after the SSH session is connected', () => {
     render(<SshWorkspace isVisible />);
-    fireEvent.click(screen.getByRole('button', { name: 'sshConnect Alpha' }));
+    fireEvent.doubleClick(screen.getByRole('button', { name: 'sshConnect Alpha' }));
     const session = terminalProps.get('alpha');
     const filesButton = screen.getByRole('button', { name: 'sftpOpenFiles' });
     expect(filesButton).toBeDisabled();
@@ -227,7 +246,7 @@ describe('SSH workspace', () => {
 
   it('versions a replacement credential without changing an active session snapshot', async () => {
     render(<SshWorkspace isVisible />);
-    fireEvent.click(screen.getByRole('button', { name: 'sshConnect Alpha' }));
+    fireEvent.doubleClick(screen.getByRole('button', { name: 'sshConnect Alpha' }));
 
     fireEvent.contextMenu(screen.getByRole('button', { name: 'sshConnect Alpha' }));
     fireEvent.click(screen.getByRole('button', { name: 'sshEdit' }));
@@ -249,7 +268,7 @@ describe('SSH workspace', () => {
 
   it('keeps an active session credential when the saved connection changes authentication', async () => {
     render(<SshWorkspace isVisible />);
-    fireEvent.click(screen.getByRole('button', { name: 'sshConnect Alpha' }));
+    fireEvent.doubleClick(screen.getByRole('button', { name: 'sshConnect Alpha' }));
 
     fireEvent.contextMenu(screen.getByRole('button', { name: 'sshConnect Alpha' }));
     fireEvent.click(screen.getByRole('button', { name: 'sshEdit' }));
@@ -304,7 +323,7 @@ describe('SSH workspace', () => {
 
   it('shows direct fallback distinctly and retries the same session lease', () => {
     render(<SshWorkspace isVisible />);
-    fireEvent.click(screen.getByRole('button', { name: 'sshConnect Alpha' }));
+    fireEvent.doubleClick(screen.getByRole('button', { name: 'sshConnect Alpha' }));
     const first = terminalProps.get('alpha');
     expect(first).toBeDefined();
 
@@ -327,7 +346,7 @@ describe('SSH workspace', () => {
 
   it('renders session failures as an opaque in-flow alert with a specific message', () => {
     render(<SshWorkspace isVisible />);
-    fireEvent.click(screen.getByRole('button', { name: 'sshConnect Alpha' }));
+    fireEvent.doubleClick(screen.getByRole('button', { name: 'sshConnect Alpha' }));
     const session = terminalProps.get('alpha');
 
     act(() => {
@@ -347,7 +366,7 @@ describe('SSH workspace', () => {
 
   it('does not present a normal remote exit status as a session error', () => {
     render(<SshWorkspace isVisible />);
-    fireEvent.click(screen.getByRole('button', { name: 'sshConnect Alpha' }));
+    fireEvent.doubleClick(screen.getByRole('button', { name: 'sshConnect Alpha' }));
     const session = terminalProps.get('alpha');
 
     act(() => {
@@ -366,7 +385,7 @@ describe('SSH workspace', () => {
 
   it('preserves the first transport failure when a lifecycle error arrives later', () => {
     render(<SshWorkspace isVisible />);
-    fireEvent.click(screen.getByRole('button', { name: 'sshConnect Alpha' }));
+    fireEvent.doubleClick(screen.getByRole('button', { name: 'sshConnect Alpha' }));
     const session = terminalProps.get('alpha');
 
     act(() => {
