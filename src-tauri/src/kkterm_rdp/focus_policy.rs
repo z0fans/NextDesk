@@ -1,32 +1,25 @@
-pub(crate) fn should_activate_rdp_overlay(
-    click_targets_rdp: bool,
-    foreground_is_rdp: bool,
-    foreground_covers_click: bool,
-) -> bool {
-    click_targets_rdp && (foreground_is_rdp || !foreground_covers_click)
+pub(crate) fn should_focus_rdp_control(foreground_is_owner: bool) -> bool {
+    foreground_is_owner
 }
 
 #[cfg(test)]
 mod tests {
-    use super::should_activate_rdp_overlay;
+    use super::should_focus_rdp_control;
 
     #[test]
-    fn does_not_activate_through_a_foreground_app_covering_the_click() {
-        assert!(!should_activate_rdp_overlay(true, false, true));
+    fn passive_input_does_not_focus_rdp_while_another_app_is_foreground() {
+        assert!(!should_focus_rdp_control(false));
     }
 
     #[test]
-    fn activates_an_exposed_rdp_area_while_another_app_is_foreground() {
-        assert!(should_activate_rdp_overlay(true, false, false));
+    fn input_can_focus_rdp_when_nextdesk_is_already_foreground() {
+        assert!(should_focus_rdp_control(true));
     }
 
     #[test]
-    fn keeps_rdp_clicks_active_when_nextdesk_is_already_foreground() {
-        assert!(should_activate_rdp_overlay(true, true, true));
-    }
-
-    #[test]
-    fn ignores_clicks_that_do_not_target_rdp() {
-        assert!(!should_activate_rdp_overlay(false, false, false));
+    fn windows_activex_host_is_a_child_of_the_nextdesk_window() {
+        let source = include_str!("windows.rs");
+        assert!(source.contains("WS_CHILD | WS_VISIBLE"));
+        assert!(!source.contains("WS_POPUP | WS_VISIBLE"));
     }
 }

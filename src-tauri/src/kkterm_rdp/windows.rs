@@ -1,8 +1,7 @@
 #[cfg(target_os = "windows")]
 mod platform {
-    use super::super::focus_policy::should_activate_rdp_overlay;
+    use super::super::focus_policy::should_focus_rdp_control;
     use std::{
-        cell::RefCell,
         collections::HashMap,
         ffi::c_void,
         mem::ManuallyDrop,
@@ -19,12 +18,11 @@ mod platform {
         core::{IUnknown_Vtbl, Interface, BSTR, GUID, PCSTR, PCWSTR},
         Win32::{
             Foundation::{
-                GetLastError, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT,
-                VARIANT_BOOL, VARIANT_FALSE, VARIANT_TRUE, WPARAM,
+                GetLastError, HANDLE, HGLOBAL, HWND, LPARAM, RECT, VARIANT_BOOL, VARIANT_FALSE,
+                VARIANT_TRUE, WPARAM,
             },
             Graphics::Gdi::{
-                ClientToScreen, CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, RGN_DIFF,
-                RGN_ERROR,
+                CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, RGN_DIFF, RGN_ERROR,
             },
             System::{
                 Com::{
@@ -32,7 +30,7 @@ mod platform {
                     DISPPARAMS,
                 },
                 DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
-                LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW},
+                LibraryLoader::{GetProcAddress, LoadLibraryW},
                 Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
                 Ole::{OleInitialize, CF_UNICODETEXT, DISPID_PROPERTYPUT},
                 Variant::{
@@ -47,13 +45,10 @@ mod platform {
                     MAPVK_VK_TO_VSC_EX, MAPVK_VSC_TO_VK_EX, VIRTUAL_KEY,
                 },
                 WindowsAndMessaging::{
-                    CallNextHookEx, CreateWindowExW, DestroyWindow, GetForegroundWindow,
-                    GetWindowRect, IsChild, PostMessageW, SendMessageW, SetForegroundWindow,
-                    SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx,
-                    WindowFromPoint, HC_ACTION, HHOOK, HMENU, MSLLHOOKSTRUCT, SWP_NOACTIVATE,
-                    SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WH_MOUSE_LL, WM_LBUTTONDOWN,
-                    WM_MBUTTONDOWN, WM_RBUTTONDOWN, WM_XBUTTONDOWN, WS_CLIPCHILDREN,
-                    WS_CLIPSIBLINGS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+                    CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindowRect, IsChild,
+                    PostMessageW, SendMessageW, SetWindowPos, ShowWindow, HMENU, HWND_TOP,
+                    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_CHILD,
+                    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
                 },
             },
         },
@@ -526,17 +521,7 @@ mod platform {
         device_scale_factor: i32,
         dynamic_resize_failures: u32,
         resolution_mode: RemoteResolutionMode,
-        viewport_bounds: RdpViewportBounds,
         visible: bool,
-    }
-
-    #[derive(Clone, Copy)]
-    struct RdpViewportBounds {
-        x: f64,
-        y: f64,
-        width: f64,
-        height: f64,
-        scale_factor: f64,
     }
 
     // These values are always created, used, and destroyed through closures
@@ -550,23 +535,6 @@ mod platform {
         requested
             .filter(|scale| scale.is_finite() && *scale >= 0.25 && *scale <= 8.0)
             .unwrap_or(host_scale_factor)
-    }
-
-    fn update_viewport_bounds(
-        session: &mut RdpSession,
-        scale_factor: f64,
-        x: f64,
-        y: f64,
-        width: f64,
-        height: f64,
-    ) {
-        session.viewport_bounds = RdpViewportBounds {
-            x,
-            y,
-            width,
-            height,
-            scale_factor,
-        };
     }
 
     impl RdpSessionManager {
@@ -606,14 +574,6 @@ mod platform {
                 let session = sessions
                     .get_mut(&request.session_id)
                     .ok_or_else(|| format!("RDP session '{}' was not found", request.session_id))?;
-                update_viewport_bounds(
-                    session,
-                    scale_factor,
-                    request.x,
-                    request.y,
-                    request.width,
-                    request.height,
-                );
                 show_and_resize_rdp(
                     session,
                     scale_factor,
@@ -654,14 +614,6 @@ mod platform {
                     let session = sessions.get_mut(&request.session_id).ok_or_else(|| {
                         format!("RDP session '{}' was not found", request.session_id)
                     })?;
-                    update_viewport_bounds(
-                        session,
-                        scale_factor,
-                        request.x,
-                        request.y,
-                        request.width,
-                        request.height,
-                    );
                     let connection_state =
                         get_property_i32(&session.dispatch, "Connected").unwrap_or(-1);
                     let rect = show_rdp_for_session(
@@ -674,7 +626,6 @@ mod platform {
                     )?;
                     apply_rdp_clip_region(
                         session.hwnd,
-                        session.owner,
                         rect,
                         request.x,
                         request.y,
@@ -684,7 +635,6 @@ mod platform {
                         scale_factor,
                     )?;
                     session.visible = true;
-                    set_rdp_overlay_focus_targets(Some(session.hwnd), Some(session.owner));
                     rdp_debug(
                         "visibility.set",
                         &json!({
@@ -720,14 +670,6 @@ mod platform {
                     let session = sessions.get_mut(&request.session_id).ok_or_else(|| {
                         format!("RDP session '{}' was not found", request.session_id)
                     })?;
-                    update_viewport_bounds(
-                        session,
-                        scale_factor,
-                        request.x,
-                        request.y,
-                        request.width,
-                        request.height,
-                    );
                     let connection_state =
                         get_property_i32(&session.dispatch, "Connected").unwrap_or(-1);
                     let rect = stage_rdp(
@@ -740,7 +682,6 @@ mod platform {
                     )?;
                     reset_rdp_clip_region(session.hwnd)?;
                     session.visible = false;
-                    clear_rdp_overlay_focus_targets(session.hwnd);
                     rdp_debug(
                         "visibility.set",
                         &json!({
@@ -769,14 +710,10 @@ mod platform {
         }
 
         pub fn follow_host_window(&self, app: AppHandle) -> Result<(), String> {
-            let sessions = Arc::clone(&self.sessions);
-            run_on_main_thread_quiet("follow_rdp_host_window", app, move |_app| {
-                let sessions = lock_sessions(&sessions)?;
-                for session in sessions.values().filter(|session| session.visible) {
-                    follow_rdp_host_window(session)?;
-                }
-                Ok(())
-            })
+            // AtlAxWin is a real child of the Tauri window, so Windows moves it
+            // together with its parent. Keep the command as a compatibility
+            // no-op for the existing frontend interface.
+            run_on_main_thread_quiet("follow_rdp_host_window", app, move |_app| Ok(()))
         }
 
         pub fn sync_display_size(
@@ -895,20 +832,13 @@ mod platform {
             let sessions = Arc::clone(&self.sessions);
             run_on_main_thread("close_rdp_session", app, move |_app| {
                 let mut sessions = lock_sessions(&sessions)?;
-                let mut closed_hwnd = None;
                 if let Some(session) = sessions.remove(&request.session_id) {
-                    closed_hwnd = Some(session.hwnd);
                     let _ = invoke_method(&session.dispatch, "Disconnect");
                     unsafe {
                         DestroyWindow(session.hwnd).map_err(|error| {
                             format!("failed to destroy RDP host window: {error}")
                         })?;
                     }
-                }
-                if sessions.is_empty() {
-                    uninstall_rdp_overlay_focus_hook();
-                } else if let Some(hwnd) = closed_hwnd {
-                    clear_rdp_overlay_focus_targets(hwnd);
                 }
                 Ok(())
             })
@@ -962,6 +892,13 @@ mod platform {
                         "RDP session is not visible; refusing to send Ctrl+Alt+Delete to a background tab"
                             .to_string(),
                     );
+                }
+                let focus = focus_rdp_control(session.owner, session.hwnd);
+                if !focus.targets_rdp() {
+                    return Err(format!(
+                        "refusing to send Ctrl+Alt+Delete while NextDesk is not foreground: {}",
+                        focus.as_json()
+                    ));
                 }
                 send_ctrl_alt_end_via_windows_input(session.owner, session.hwnd)
                     .or_else(|_| send_ctrl_alt_end_to_rdp(&session.dispatch))
@@ -1017,7 +954,13 @@ mod platform {
                         char_count: 0,
                     });
                 }
-                focus_rdp_control(session.owner, session.hwnd);
+                let focus = focus_rdp_control(session.owner, session.hwnd);
+                if !focus.targets_rdp() {
+                    return Err(format!(
+                        "refusing to send text while NextDesk is not foreground: {}",
+                        focus.as_json()
+                    ));
+                }
                 match requested_mode.as_str() {
                     RDP_TEXT_MODE_SEND_KEYS => {
                         send_text_via_keys(&session.dispatch, &request.text, press_enter)?;
@@ -1080,6 +1023,12 @@ mod platform {
                     );
                 }
                 let focus = focus_rdp_control(session.owner, session.hwnd);
+                if request.down && !focus.targets_rdp() {
+                    return Err(format!(
+                        "refusing to send a key-down event while NextDesk is not foreground: {}",
+                        focus.as_json()
+                    ));
+                }
                 match send_scancode_event(&session.dispatch, request.scancode, request.down) {
                     Ok(()) => Ok(()),
                     Err(send_keys_error) => {
@@ -1137,9 +1086,21 @@ mod platform {
                             .to_string(),
                     );
                 }
+                if !session.visible {
+                    return Err(
+                        "RDP session is not visible; refusing to inject a mouse click into a background tab"
+                            .to_string(),
+                    );
+                }
                 let (down_message, up_message, button_mask) =
                     rdp_mouse_messages_for_button(&request.button)?;
-                focus_rdp_control(session.owner, session.hwnd);
+                let focus = focus_rdp_control(session.owner, session.hwnd);
+                if !focus.targets_rdp() {
+                    return Err(format!(
+                        "refusing to send a mouse click while NextDesk is not foreground: {}",
+                        focus.as_json()
+                    ));
+                }
                 send_rdp_mouse_click_messages(
                     session.hwnd,
                     request.x,
@@ -1514,13 +1475,6 @@ mod platform {
                 device_scale_factor: display_settings.device_scale_factor,
                 dynamic_resize_failures: 0,
                 resolution_mode,
-                viewport_bounds: RdpViewportBounds {
-                    x: request.x,
-                    y: request.y,
-                    width: request.width,
-                    height: request.height,
-                    scale_factor,
-                },
                 visible: false,
             },
         );
@@ -1565,10 +1519,10 @@ mod platform {
             let control_name = wide_null(progid);
             let hwnd = unsafe {
                 CreateWindowExW(
-                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    WINDOW_EX_STYLE(0),
                     PCWSTR(class_name.as_ptr()),
                     PCWSTR(control_name.as_ptr()),
-                    WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                    WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
                     rect.0,
                     rect.1,
                     rect.2,
@@ -2185,128 +2139,6 @@ mod platform {
         events.push(KeyEvent::up(vk));
     }
 
-    #[derive(Default)]
-    struct RdpOverlayFocusHook {
-        hook: Option<HHOOK>,
-        overlay: Option<HWND>,
-        owner: Option<HWND>,
-    }
-
-    thread_local! {
-        // The low-level mouse hook is installed from Tauri's main thread and
-        // Windows invokes its callback on that same thread. Keeping the raw
-        // HHOOK/HWND values thread-local preserves that affinity without
-        // claiming that the pointer-backed handle wrappers are Send.
-        static RDP_OVERLAY_FOCUS_HOOK: RefCell<RdpOverlayFocusHook> =
-            RefCell::new(RdpOverlayFocusHook::default());
-    }
-
-    fn is_rdp_overlay_click_message(message: u32) -> bool {
-        matches!(
-            message,
-            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
-        )
-    }
-
-    unsafe extern "system" fn rdp_overlay_focus_hook_proc(
-        code: i32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
-        if code == HC_ACTION as i32 && is_rdp_overlay_click_message(wparam.0 as u32) {
-            let click = if lparam.0 != 0 {
-                let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
-                let target = unsafe { WindowFromPoint(info.pt) };
-                (!target.0.is_null()).then_some((info.pt, target))
-            } else {
-                None
-            };
-            let focus_target = RDP_OVERLAY_FOCUS_HOOK.with(|state| {
-                let state = state.borrow();
-                match (state.overlay, state.owner, click) {
-                    (Some(overlay), Some(owner), Some((point, target))) => {
-                        let click_targets_rdp =
-                            target == overlay || unsafe { IsChild(overlay, target).as_bool() };
-                        let foreground = unsafe { GetForegroundWindow() };
-                        let foreground_is_rdp = foreground == overlay || foreground == owner;
-                        let foreground_covers_click = window_rect_contains(foreground, point);
-                        should_activate_rdp_overlay(
-                            click_targets_rdp,
-                            foreground_is_rdp,
-                            foreground_covers_click,
-                        )
-                        .then_some((owner, overlay, target))
-                    }
-                    _ => None,
-                }
-            });
-            if let Some((owner, overlay, focus)) = focus_target {
-                focus_rdp_window(owner, overlay, focus);
-            }
-        }
-        unsafe { CallNextHookEx(None, code, wparam, lparam) }
-    }
-
-    fn window_rect_contains(hwnd: HWND, point: POINT) -> bool {
-        if hwnd.0.is_null() {
-            return false;
-        }
-        let mut rect = RECT::default();
-        unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok()
-            && point.x >= rect.left
-            && point.x < rect.right
-            && point.y >= rect.top
-            && point.y < rect.bottom
-    }
-
-    fn set_rdp_overlay_focus_targets(overlay: Option<HWND>, owner: Option<HWND>) {
-        RDP_OVERLAY_FOCUS_HOOK.with(|state| {
-            let mut state = state.borrow_mut();
-            state.overlay = overlay;
-            state.owner = owner;
-            if overlay.is_some() && state.hook.is_none() {
-                let module = unsafe { GetModuleHandleW(PCWSTR::null()) }
-                    .ok()
-                    .map(|handle| HINSTANCE(handle.0));
-                match unsafe {
-                    SetWindowsHookExW(WH_MOUSE_LL, Some(rdp_overlay_focus_hook_proc), module, 0)
-                } {
-                    Ok(hook) => state.hook = Some(hook),
-                    Err(error) => rdp_debug(
-                        "focus_hook.install_error",
-                        &json!({ "error": error.to_string() }),
-                    ),
-                }
-            }
-        });
-    }
-
-    fn clear_rdp_overlay_focus_targets(overlay: HWND) {
-        RDP_OVERLAY_FOCUS_HOOK.with(|state| {
-            let mut state = state.borrow_mut();
-            if state.overlay == Some(overlay) {
-                state.overlay = None;
-                state.owner = None;
-            }
-        });
-    }
-
-    fn uninstall_rdp_overlay_focus_hook() {
-        RDP_OVERLAY_FOCUS_HOOK.with(|state| {
-            let mut state = state.borrow_mut();
-            if let Some(hook) = state.hook.take() {
-                if let Err(error) = unsafe { UnhookWindowsHookEx(hook) } {
-                    rdp_debug(
-                        "focus_hook.uninstall_error",
-                        &json!({ "error": error.to_string() }),
-                    );
-                }
-            }
-            state.overlay = None;
-            state.owner = None;
-        });
-    }
-
     #[derive(Clone, Copy)]
     struct RdpInputFocusState {
         owner: HWND,
@@ -2314,7 +2146,7 @@ mod platform {
         foreground: HWND,
         active: HWND,
         focus: HWND,
-        foreground_set: bool,
+        activation_allowed: bool,
     }
 
     impl RdpInputFocusState {
@@ -2337,7 +2169,7 @@ mod platform {
                 "foreground": hwnd_value(self.foreground),
                 "active": hwnd_value(self.active),
                 "focus": hwnd_value(self.focus),
-                "foregroundSet": self.foreground_set,
+                "activationAllowed": self.activation_allowed,
                 "hasRdpFocus": self.has_rdp_focus(),
                 "targetsRdp": self.targets_rdp(),
             })
@@ -2353,20 +2185,24 @@ mod platform {
     }
 
     fn focus_rdp_window(owner: HWND, hwnd: HWND, focus: HWND) -> RdpInputFocusState {
-        // The ActiveX host is an owned WS_EX_NOACTIVATE popup. Explicitly activate
-        // that popup before using IMsRdpClientNonScriptable::SendKeys; focusing only
-        // the owner leaves the control UI-inactive and SendKeys returns E_FAIL.
+        // Never promote NextDesk from a background application while flushing a
+        // delayed or blur-triggered input event. As a true child HWND, AtlAxWin
+        // participates in the owner's normal activation and only needs thread-local
+        // active/focus state once the owner is already foreground.
         let state = unsafe {
-            let foreground_set = SetForegroundWindow(hwnd).as_bool();
-            let _ = SetActiveWindow(hwnd);
-            let _ = SetFocus(Some(focus));
+            let foreground = GetForegroundWindow();
+            let activation_allowed = should_focus_rdp_control(foreground == owner);
+            if activation_allowed {
+                let _ = SetActiveWindow(owner);
+                let _ = SetFocus(Some(focus));
+            }
             RdpInputFocusState {
                 owner,
                 hwnd,
-                foreground: GetForegroundWindow(),
+                foreground,
                 active: GetActiveWindow(),
                 focus: GetFocus(),
-                foreground_set,
+                activation_allowed,
             }
         };
         rdp_debug("input.focus", &state.as_json());
@@ -2910,15 +2746,7 @@ mod platform {
         height: f64,
     ) -> Result<(i32, i32, i32, i32), String> {
         apply_smart_sizing(&session.dispatch, session.resolution_mode.smart_sizing());
-        let rect = show_rdp(
-            session.hwnd,
-            session.owner,
-            scale_factor,
-            x,
-            y,
-            width,
-            height,
-        )?;
+        let rect = show_rdp(session.hwnd, scale_factor, x, y, width, height)?;
         Ok(rect)
     }
 
@@ -2943,14 +2771,13 @@ mod platform {
 
     fn show_rdp(
         hwnd: HWND,
-        owner: HWND,
         scale_factor: f64,
         x: f64,
         y: f64,
         width: f64,
         height: f64,
     ) -> Result<(i32, i32, i32, i32), String> {
-        let rect = screen_rect(owner, scale_factor, x, y, width, height)?;
+        let rect = scaled_rect(x, y, width, height, scale_factor);
         position_rdp(hwnd, rect)?;
         Ok(rect)
     }
@@ -2959,12 +2786,12 @@ mod platform {
         unsafe {
             SetWindowPos(
                 hwnd,
-                None,
+                Some(HWND_TOP),
                 rect.0,
                 rect.1,
                 rect.2,
                 rect.3,
-                SWP_NOACTIVATE | SWP_NOZORDER,
+                SWP_NOACTIVATE,
             )
             .map_err(|error| format!("failed to position RDP control: {error}"))?;
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -2972,34 +2799,8 @@ mod platform {
         Ok(())
     }
 
-    fn follow_rdp_host_window(session: &RdpSession) -> Result<(), String> {
-        let bounds = session.viewport_bounds;
-        let rect = scaled_rect(
-            bounds.x,
-            bounds.y,
-            bounds.width,
-            bounds.height,
-            bounds.scale_factor,
-        );
-        let origin = client_to_screen_point(session.owner, rect.0, rect.1)?;
-        unsafe {
-            SetWindowPos(
-                session.hwnd,
-                None,
-                origin.0,
-                origin.1,
-                0,
-                0,
-                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
-            )
-            .map_err(|error| format!("failed to follow RDP host window: {error}"))?;
-        }
-        Ok(())
-    }
-
     fn apply_rdp_clip_region(
         hwnd: HWND,
-        owner: HWND,
         native_rect: (i32, i32, i32, i32),
         viewport_x: f64,
         viewport_y: f64,
@@ -3008,14 +2809,13 @@ mod platform {
         clip_rects: &[crate::kkterm_rdp::types::KktermRdpClipRect],
         scale_factor: f64,
     ) -> Result<(), String> {
-        let viewport_rect = screen_rect(
-            owner,
-            scale_factor,
+        let viewport_rect = scaled_rect(
             viewport_x,
             viewport_y,
             viewport_width,
             viewport_height,
-        )?;
+            scale_factor,
+        );
         let Some((base_left, base_top, base_right, base_bottom)) = intersect_rect_with_bounds(
             viewport_rect.0 - native_rect.0,
             viewport_rect.1 - native_rect.1,
@@ -3054,15 +2854,8 @@ mod platform {
                     clip_rect.height,
                     scale_factor,
                 );
-                let clip_origin = match client_to_screen_point(owner, clip.0, clip.1) {
-                    Ok(origin) => origin,
-                    Err(error) => {
-                        let _ = DeleteObject(visible_region.into());
-                        return Err(error);
-                    }
-                };
-                let raw_left = clip_origin.0 - native_rect.0;
-                let raw_top = clip_origin.1 - native_rect.1;
+                let raw_left = clip.0 - native_rect.0;
+                let raw_top = clip.1 - native_rect.1;
                 let Some((left, top, right, bottom)) = intersect_rect_with_bounds(
                     raw_left,
                     raw_top,
@@ -3141,19 +2934,6 @@ mod platform {
         Ok(staged)
     }
 
-    fn screen_rect(
-        owner: HWND,
-        scale_factor: f64,
-        x: f64,
-        y: f64,
-        width: f64,
-        height: f64,
-    ) -> Result<(i32, i32, i32, i32), String> {
-        let rect = scaled_rect(x, y, width, height, scale_factor);
-        let origin = client_to_screen_point(owner, rect.0, rect.1)?;
-        Ok((origin.0, origin.1, rect.2, rect.3))
-    }
-
     fn staged_rect(width: i32, height: i32) -> (i32, i32, i32, i32) {
         (
             HIDDEN_RDP_POSITION,
@@ -3161,15 +2941,6 @@ mod platform {
             width.max(1),
             height.max(1),
         )
-    }
-
-    fn client_to_screen_point(owner: HWND, x: i32, y: i32) -> Result<(i32, i32), String> {
-        let mut point = POINT { x, y };
-        let ok = unsafe { ClientToScreen(owner, &mut point) };
-        if !ok.as_bool() {
-            return Err("failed to translate RDP host coordinates to screen space".to_string());
-        }
-        Ok((point.x, point.y))
     }
 
     fn park_rdp_at_current_size(hwnd: HWND) -> Result<(), String> {
@@ -3488,16 +3259,6 @@ mod platform {
             assert_eq!(rdp_request_scale_factor(Some(f64::NAN), 1.25), 1.25);
             assert_eq!(rdp_request_scale_factor(Some(0.1), 2.0), 2.0);
             assert_eq!(rdp_request_scale_factor(None, 1.75), 1.75);
-        }
-
-        #[test]
-        fn focus_hook_reacts_only_to_button_down_messages() {
-            assert!(is_rdp_overlay_click_message(WM_LBUTTONDOWN));
-            assert!(is_rdp_overlay_click_message(WM_RBUTTONDOWN));
-            assert!(is_rdp_overlay_click_message(WM_MBUTTONDOWN));
-            assert!(is_rdp_overlay_click_message(WM_XBUTTONDOWN));
-            assert!(!is_rdp_overlay_click_message(WM_LBUTTONUP_MSG));
-            assert!(!is_rdp_overlay_click_message(0x0200));
         }
 
         #[test]
