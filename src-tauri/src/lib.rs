@@ -8,6 +8,7 @@ mod cloud_gateway;
 mod cloud_probe;
 mod config;
 mod connection_resolver;
+mod credential_vault;
 mod diagnostic_logs;
 mod file_transfer_ws;
 #[cfg(feature = "nextdesk-native-rdp")]
@@ -32,6 +33,7 @@ mod rdp_session;
 #[cfg(feature = "nextdesk-native-rdp")]
 mod rdp_shared_frame;
 mod rdpdr_backend;
+mod ssh;
 mod state;
 mod updater;
 mod virtual_file_clipboard;
@@ -153,6 +155,7 @@ struct RdpLogEntry {
 struct NativeRdpConnectResponse {
     ws_port: u16,
     route_label: String,
+    route_lease_id: u64,
 }
 
 const RDP_DEBUG_LOG: &str = "nextdesk_rdp_debug.log";
@@ -676,6 +679,7 @@ async fn rdp_native_connect(
     )
     .await?;
     let route_label = resolved.route_label.clone();
+    let route_lease_id = resolved.route_lease_id;
     let connect_host = resolved.host;
     let connect_port = resolved.port;
     log::info!(
@@ -688,9 +692,18 @@ async fn rdp_native_connect(
     // Start a local WebSocket server on a random port for frame delivery.
     // This bypasses Tauri Channel's 5-layer IPC overhead entirely.
     let (ws_port, frame_tx, frame_ws_shutdown) =
-        frame_ws::start_frame_server(tab_id.clone(), connect_host.clone())
-            .await
-            .map_err(|e| format!("Failed to start frame WS: {e}"))?;
+        match frame_ws::start_frame_server(tab_id.clone(), connect_host.clone()).await {
+            Ok(server) => server,
+            Err(error) => {
+                connection_resolver::release_session_route_if_current(
+                    app_state.inner(),
+                    connection_resolver::ServiceKind::Rdp,
+                    &tab_id,
+                    route_lease_id,
+                );
+                return Err(format!("Failed to start frame WS: {error}"));
+            }
+        };
     let frame_transport =
         rdp_session::native_frame_transport_from_profile(render_profile.as_deref());
     log::info!(
@@ -721,6 +734,7 @@ async fn rdp_native_connect(
     Ok(NativeRdpConnectResponse {
         ws_port,
         route_label,
+        route_lease_id,
     })
 }
 
@@ -941,13 +955,41 @@ fn rdp_native_wheel(
 
 #[cfg(feature = "nextdesk-native-rdp")]
 #[tauri::command]
-fn rdp_native_disconnect(tab_id: String, app_state: State<'_, AppState>) -> Result<(), String> {
+fn rdp_native_disconnect(
+    tab_id: String,
+    route_lease_id: Option<u64>,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    if let Some(lease_id) = route_lease_id {
+        if !connection_resolver::route_lease_is_current(
+            app_state.inner(),
+            connection_resolver::ServiceKind::Rdp,
+            &tab_id,
+            lease_id,
+        ) {
+            return Ok(());
+        }
+    }
     rdp_native_view::remove_bounds(&app_state.native_view_bounds, &tab_id)?;
     if rdp_native_view::remove_host(&app_state.native_view_hosts, &tab_id)? {
         log::debug!("[rdp-native-view] removed host-state tab={tab_id}");
     }
     let mut mgr = app_state.native_sessions.lock().unwrap();
     mgr.disconnect(&tab_id);
+    if let Some(lease_id) = route_lease_id {
+        connection_resolver::release_session_route_if_current(
+            app_state.inner(),
+            connection_resolver::ServiceKind::Rdp,
+            &tab_id,
+            lease_id,
+        );
+    } else {
+        connection_resolver::release_session_route(
+            app_state.inner(),
+            connection_resolver::ServiceKind::Rdp,
+            &tab_id,
+        );
+    }
     Ok(())
 }
 
@@ -987,6 +1029,7 @@ async fn kkterm_rdp_start(
         Some(tab_id.clone()),
     )
     .await?;
+    let route_lease_id = resolved.route_lease_id;
     request.host = resolved.host.clone();
     request.port = resolved.port;
     log::info!(
@@ -996,11 +1039,20 @@ async fn kkterm_rdp_start(
         resolved.route_label
     );
     let start_request = kkterm_rdp::windows::StartRdpSessionRequest::from_kkterm_start(request);
-    kkterm_rdp_windows_manager().start_session(app, start_request)?;
+    if let Err(error) = kkterm_rdp_windows_manager().start_session(app, start_request) {
+        connection_resolver::release_session_route_if_current(
+            app_state.inner(),
+            connection_resolver::ServiceKind::Rdp,
+            &tab_id,
+            route_lease_id,
+        );
+        return Err(error);
+    }
     Ok(kkterm_rdp::types::KktermRdpStartResponse {
         session_id: tab_id.clone(),
         tab_id,
         route_label: resolved.route_label,
+        route_lease_id,
     })
 }
 
@@ -1027,6 +1079,7 @@ async fn kkterm_rdp_start(
         Some(tab_id.clone()),
     )
     .await?;
+    let route_lease_id = resolved.route_lease_id;
     request.host = resolved.host.clone();
     request.port = resolved.port;
     log::info!(
@@ -1036,15 +1089,26 @@ async fn kkterm_rdp_start(
         resolved.route_label
     );
     let start_request = kkterm_rdp::macos::StartRdpClientSessionRequest::from_kkterm_start(request);
-    tauri::async_runtime::spawn_blocking(move || {
+    let start_result = tauri::async_runtime::spawn_blocking(move || {
         kkterm_rdp_macos_manager().start_session(app.clone(), start_request)
     })
     .await
-    .map_err(|error| format!("RDP startup task failed: {error}"))??;
+    .map_err(|error| format!("RDP startup task failed: {error}"))
+    .and_then(|result| result);
+    if let Err(error) = start_result {
+        connection_resolver::release_session_route_if_current(
+            app_state.inner(),
+            connection_resolver::ServiceKind::Rdp,
+            &tab_id,
+            route_lease_id,
+        );
+        return Err(error);
+    }
     Ok(kkterm_rdp::types::KktermRdpStartResponse {
         tab_id,
         session_id,
         route_label: resolved.route_label,
+        route_lease_id,
     })
 }
 
@@ -1242,11 +1306,39 @@ fn kkterm_rdp_force_clipboard_check(
 fn kkterm_rdp_disconnect(
     app: tauri::AppHandle,
     request: kkterm_rdp::types::KktermRdpSimpleRequest,
+    app_state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let tab_id = request.tab_id.clone();
+    let route_lease_id = request.route_lease_id;
+    if let Some(lease_id) = route_lease_id {
+        if !connection_resolver::route_lease_is_current(
+            app_state.inner(),
+            connection_resolver::ServiceKind::Rdp,
+            &tab_id,
+            lease_id,
+        ) {
+            return Ok(());
+        }
+    }
     kkterm_rdp_windows_manager().close_session(
         app,
         kkterm_rdp::windows::RdpSimpleRequest::from_kkterm_simple(request),
-    )
+    )?;
+    if let Some(lease_id) = route_lease_id {
+        connection_resolver::release_session_route_if_current(
+            app_state.inner(),
+            connection_resolver::ServiceKind::Rdp,
+            &tab_id,
+            lease_id,
+        );
+    } else {
+        connection_resolver::release_session_route(
+            app_state.inner(),
+            connection_resolver::ServiceKind::Rdp,
+            &tab_id,
+        );
+    }
+    Ok(())
 }
 
 #[cfg(all(
@@ -1255,9 +1347,39 @@ fn kkterm_rdp_disconnect(
     not(target_os = "windows")
 ))]
 #[tauri::command]
-fn kkterm_rdp_disconnect(request: kkterm_rdp::types::KktermRdpSimpleRequest) -> Result<(), String> {
+fn kkterm_rdp_disconnect(
+    request: kkterm_rdp::types::KktermRdpSimpleRequest,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    let tab_id = request.tab_id.clone();
+    let route_lease_id = request.route_lease_id;
+    if let Some(lease_id) = route_lease_id {
+        if !connection_resolver::route_lease_is_current(
+            app_state.inner(),
+            connection_resolver::ServiceKind::Rdp,
+            &tab_id,
+            lease_id,
+        ) {
+            return Ok(());
+        }
+    }
     kkterm_rdp_macos_manager()
-        .close_session(kkterm_rdp::macos::RdpClientSimpleRequest::from_kkterm_simple(request))
+        .close_session(kkterm_rdp::macos::RdpClientSimpleRequest::from_kkterm_simple(request))?;
+    if let Some(lease_id) = route_lease_id {
+        connection_resolver::release_session_route_if_current(
+            app_state.inner(),
+            connection_resolver::ServiceKind::Rdp,
+            &tab_id,
+            lease_id,
+        );
+    } else {
+        connection_resolver::release_session_route(
+            app_state.inner(),
+            connection_resolver::ServiceKind::Rdp,
+            &tab_id,
+        );
+    }
+    Ok(())
 }
 
 // ── RDP Audio Commands ──────────────────────────────────────
@@ -1329,6 +1451,9 @@ fn rdp_audio_close(tab_id: String, app_state: State<'_, AppState>) -> Result<(),
 pub fn run() {
     // Initialize structured logging FIRST so all subsequent code can log.
     logging::init();
+    if let Err(error) = credential_vault::initialize() {
+        log::error!("[ssh] OS credential vault initialization failed: {error}");
+    }
 
     // Load saved config on startup
     let saved = config::load_saved_config();
@@ -1465,6 +1590,32 @@ pub fn run() {
             cloud_refresh_status,
             cloud_keep_binding_alive,
             cloud_disable,
+            ssh::ssh_session_start,
+            ssh::ssh_session_input,
+            ssh::ssh_session_resize,
+            ssh::ssh_session_close,
+            ssh::ssh_monitor_snapshot,
+            ssh::ssh_log_start_failure,
+            ssh::ssh_credential_store,
+            ssh::ssh_private_key_credential_store,
+            ssh::ssh_credential_delete,
+            ssh::ssh_credential_exists,
+            ssh::ssh_trust_host_key,
+            ssh::ssh_known_hosts_list,
+            ssh::ssh_known_host_remove,
+            ssh::ssh_known_hosts_import,
+            ssh::ssh_known_hosts_export,
+            ssh::ssh_sftp_open,
+            ssh::ssh_sftp_list,
+            ssh::ssh_sftp_upload,
+            ssh::ssh_sftp_download,
+            ssh::ssh_sftp_cancel,
+            ssh::ssh_sftp_create_directory,
+            ssh::ssh_sftp_rename,
+            ssh::ssh_sftp_remove,
+            ssh::ssh_sftp_read_text,
+            ssh::ssh_sftp_write_text,
+            ssh::ssh_sftp_set_permissions,
             rdp_audio_set_format,
             rdp_audio_push,
             rdp_audio_push_raw,

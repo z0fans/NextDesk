@@ -80,7 +80,7 @@ type KktermRdpSurfaceProps = {
   onConnected: (tabId: string, width?: number, height?: number) => void;
   onDisconnected: (tabId: string) => void;
   onError: (tabId: string, message: string) => void;
-  onRouteSelected?: (tabId: string, routeLabel: ConnectionRoute) => void;
+  onRouteSelected?: (tabId: string, routeLabel: ConnectionRoute, routeLeaseId: number) => void;
   onCanvasRef?: (tabId: string, canvas: HTMLCanvasElement | null) => void;
 };
 
@@ -287,6 +287,7 @@ export function KktermRdpSurface({
       : undefined;
 
     sessionIdRef.current = sessionId;
+    let routeLeaseId: number | undefined;
 
     const clearConnectTimeout = () => {
       window.clearTimeout(connectTimeout);
@@ -300,7 +301,7 @@ export function KktermRdpSurface({
         tabId,
         'RDP connection timed out before the native client returned a diagnostic result',
       );
-      void kktermRdpDisconnect({ tabId }).catch(() => undefined);
+      void kktermRdpDisconnect({ tabId, routeLeaseId }).catch(() => undefined);
     };
     const connectTimeout = window.setTimeout(
       failIfStillConnecting,
@@ -359,8 +360,13 @@ export function KktermRdpSurface({
             scaleFactor: window.devicePixelRatio || 1,
             reuseCloudBinding,
           });
+          routeLeaseId = response.routeLeaseId;
+          if (disposed) {
+            await kktermRdpDisconnect({ tabId, routeLeaseId }).catch(() => undefined);
+            return;
+          }
           if (response?.routeLabel) {
-            callbacksRef.current.onRouteSelected?.(tabId, response.routeLabel);
+            callbacksRef.current.onRouteSelected?.(tabId, response.routeLabel, routeLeaseId);
           }
           startCloudKeepalive();
           recoverKeyboardTargetSoon();
@@ -372,7 +378,7 @@ export function KktermRdpSurface({
             failWithMessage(message);
             return;
           }
-          await kktermRdpDisconnect({ tabId }).catch(() => undefined);
+          await kktermRdpDisconnect({ tabId, routeLeaseId }).catch(() => undefined);
           await sleepMs(delay);
         }
       }
@@ -388,7 +394,7 @@ export function KktermRdpSurface({
       }
       startupRetrying = true;
       void (async () => {
-        await kktermRdpDisconnect({ tabId }).catch(() => undefined);
+        await kktermRdpDisconnect({ tabId, routeLeaseId }).catch(() => undefined);
         await sleepMs(delay);
         startupRetrying = false;
         if (!disposed && !connectFinished && !timedOut) {
@@ -495,7 +501,7 @@ export function KktermRdpSurface({
         window.clearInterval(keepaliveTimer);
       }
       unlisten?.();
-      void kktermRdpDisconnect({ tabId }).catch(() => undefined);
+      void kktermRdpDisconnect({ tabId, routeLeaseId }).catch(() => undefined);
       sessionIdRef.current = null;
     };
   }, [

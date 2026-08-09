@@ -174,6 +174,11 @@ function GroupSelect({ groups, value, onChange }: {
   }, [open]);
 
   const selected = groups.find(g => g.id === value);
+  const selectedName = selected
+    ? selected.id === 'default'
+      ? t('rdpServers')
+      : selected.name
+    : t('rdpSelect');
 
   return (
     <div ref={ref} className="relative">
@@ -182,7 +187,7 @@ function GroupSelect({ groups, value, onChange }: {
         onClick={() => setOpen(o => !o)}
         className="flex h-8 w-full items-center justify-between rounded-md border border-input bg-transparent px-3 text-sm transition-colors hover:border-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-ring"
       >
-        <span className="truncate">{selected?.name ?? t('rdpSelect')}</span>
+        <span className="truncate">{selectedName}</span>
         <ChevronDown className={`h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform ${open ? 'rotate-180' : ''}`} />
       </button>
       {open && (
@@ -196,7 +201,7 @@ function GroupSelect({ groups, value, onChange }: {
                 className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors hover:bg-accent hover:text-accent-foreground ${g.id === value ? 'text-foreground' : 'text-muted-foreground'}`}
               >
                 <Check className={`h-3.5 w-3.5 shrink-0 ${g.id === value ? 'opacity-100' : 'opacity-0'}`} />
-                <span className="truncate">{g.name}</span>
+                <span className="truncate">{g.id === 'default' ? t('rdpServers') : g.name}</span>
               </button>
             ))}
           </div>

@@ -177,11 +177,14 @@ export function RdpSidebar({
   }
 
   return (
-    <div className="w-52 flex flex-col bg-card/50 border-r border-border shrink-0 overflow-hidden select-none">
-      <div className="flex items-center justify-between px-3 py-1 border-b border-border">
+    <div className="w-52 flex flex-col bg-card/50 border-r border-sidebar-border shrink-0 overflow-hidden select-none">
+      <div
+        data-region="rdp-sidebar-header"
+        className="flex h-[73px] shrink-0 items-center justify-between border-b border-sidebar-border px-3"
+      >
         <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">{t('rdpServers')}</span>
-        <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setSidebarOpen(false)}>
-          <PanelLeftClose className="h-3.5 w-3.5" />
+        <Button variant="ghost" size="icon-sm" className="text-muted-foreground" onClick={() => setSidebarOpen(false)}>
+          <PanelLeftClose className="h-4 w-4" />
         </Button>
       </div>
       <div className="px-3 py-2">
@@ -253,7 +256,7 @@ export function RdpSidebar({
                 </div>
               ) : (
                 <div className={cn(
-                  "flex items-center gap-0.5 px-1 py-1.5 text-xs font-medium rounded-md transition-colors group/grp",
+                  "flex items-center gap-1.5 px-2 py-1.5 text-xs font-medium rounded-md transition-colors group/grp",
                   isOver ? "text-cyan-400" : "text-muted-foreground hover:text-foreground"
                 )}>
                   {group.id !== 'fav' && group.id !== 'default' && (
@@ -285,8 +288,8 @@ export function RdpSidebar({
                     }}
                   >
                     {group.isExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-                    {group.name}
-                    <span className="text-[10px] text-muted-foreground/60 ml-auto">({groupServers.length})</span>
+                    {group.id === 'default' ? t('rdpServers') : group.name}
+                    <span className="text-[10px] text-muted-foreground/60 ml-auto">{groupServers.length}</span>
                   </button>
                 </div>
               )}
@@ -338,7 +341,13 @@ export function RdpSidebar({
         )}
       </div>
 
-      <div className="px-3 py-2 border-t border-border space-y-1.5 mt-auto">
+      <div
+        data-region="rdp-sidebar-actions"
+        className={cn(
+          "mt-auto shrink-0 border-t border-sidebar-border px-3",
+          showNewGroup ? "py-1.5" : "flex h-11 items-center",
+        )}
+      >
         {showNewGroup ? (
           <div className="space-y-1">
             <div className={cn("flex gap-1", groupNameError && "animate-shake")}>
@@ -359,12 +368,12 @@ export function RdpSidebar({
             )}
           </div>
         ) : (
-          <div className="flex gap-1.5">
-            <Button variant="outline" size="sm" className="h-7 flex-1 text-xs gap-1" onClick={onNewServer}>
-              <Plus className="h-3 w-3" /> {t('rdpServer')}
+          <div className="flex w-full gap-2">
+            <Button variant="outline" size="sm" className="min-w-0 flex-1" onClick={onNewServer}>
+              <Plus className="h-4 w-4" /> {t('rdpServer')}
             </Button>
-            <Button variant="outline" size="sm" className="h-7 flex-1 text-xs gap-1" onClick={() => setShowNewGroup(true)}>
-              <FolderPlus className="h-3 w-3" /> {t('rdpGroup')}
+            <Button variant="outline" size="sm" className="min-w-0 flex-1" onClick={() => setShowNewGroup(true)}>
+              <FolderPlus className="h-4 w-4" /> {t('rdpGroup')}
             </Button>
           </div>
         )}

@@ -236,8 +236,12 @@ fn token_request_body(
 
 #[cfg(test)]
 mod tests {
-    use super::{abort_payload, token_rejection, token_request_body, CloudPrepareResponse};
+    use super::{
+        abort_payload, prepare_request_body, token_rejection, token_request_body,
+        CloudPrepareResponse,
+    };
     use crate::cloud_probe::CloudProbeResult;
+    use crate::connection_resolver::ServiceKind;
     use reqwest::StatusCode;
 
     #[test]
@@ -276,14 +280,33 @@ mod tests {
     }
 
     #[test]
+    fn ssh_prepare_requests_a_tcp_only_service_binding() {
+        let body = prepare_request_body(
+            "server.example.com",
+            22,
+            "auto",
+            true,
+            Some("ssh-tab-a"),
+            ServiceKind::Ssh,
+        );
+
+        assert_eq!(body["service_kind"], "ssh");
+        assert_eq!(body["requested_protocols"], serde_json::json!(["tcp"]));
+        assert_eq!(body["target_host"], "server.example.com");
+        assert_eq!(body["target_port"], 22);
+    }
+
+    #[test]
     fn abort_payload_keeps_probe_results_for_diagnostics() {
         let payload = abort_payload(
             "prep_test",
             "all_candidates_failed",
             &[CloudProbeResult {
                 binding_id: "bnd_test".to_string(),
+                service_kind: ServiceKind::Rdp,
                 ok: false,
                 tcp_connect_ms: Some(701),
+                protocol_handshake_ms: None,
                 x224_ms: None,
                 tls_ms: None,
                 total_ms: 2500,
@@ -396,22 +419,20 @@ pub async fn prepare(
     preferred_region: &str,
     reuse_existing: bool,
     session_id: Option<&str>,
+    service_kind: crate::connection_resolver::ServiceKind,
 ) -> Result<CloudPrepareResponse, String> {
     client()?
         .post(format!("{}/api/v1/connect/prepare", base(panel_url)))
         .bearer_auth(token)
         .header("X-Device-Id", device_id)
-        .json(&serde_json::json!({
-            "target_host": host,
-            "target_port": port,
-            "preferred_region": preferred_region,
-            "reuse_existing": reuse_existing,
-            "session_id": session_id,
-            "client": {
-                "platform": std::env::consts::OS,
-                "app_version": env!("CARGO_PKG_VERSION")
-            }
-        }))
+        .json(&prepare_request_body(
+            host,
+            port,
+            preferred_region,
+            reuse_existing,
+            session_id,
+            service_kind,
+        ))
         .send()
         .await
         .map_err(|e| format!("cloud prepare request failed: {e}"))?
@@ -426,6 +447,33 @@ pub async fn prepare(
         .json::<CloudPrepareResponse>()
         .await
         .map_err(|e| format!("cloud prepare parse failed: {e}"))
+}
+
+fn prepare_request_body(
+    host: &str,
+    port: u16,
+    preferred_region: &str,
+    reuse_existing: bool,
+    session_id: Option<&str>,
+    service_kind: crate::connection_resolver::ServiceKind,
+) -> serde_json::Value {
+    let requested_protocols = match service_kind {
+        crate::connection_resolver::ServiceKind::Rdp => vec!["tcp", "udp"],
+        crate::connection_resolver::ServiceKind::Ssh => vec!["tcp"],
+    };
+    serde_json::json!({
+        "service_kind": service_kind,
+        "target_host": host,
+        "target_port": port,
+        "preferred_region": preferred_region,
+        "requested_protocols": requested_protocols,
+        "reuse_existing": reuse_existing,
+        "session_id": session_id,
+        "client": {
+            "platform": std::env::consts::OS,
+            "app_version": env!("CARGO_PKG_VERSION")
+        }
+    })
 }
 
 pub async fn commit(

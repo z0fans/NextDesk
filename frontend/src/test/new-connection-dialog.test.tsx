@@ -31,6 +31,34 @@ const store = {
 } as unknown as SessionStore;
 
 describe('NewConnectionDialog password visibility', () => {
+  it('localizes the built-in default group without changing custom group names', () => {
+    const localizedStore = {
+      groups: [
+        { id: 'fav', name: 'Favorites', isExpanded: true },
+        { id: 'default', name: 'Servers', isExpanded: true },
+        { id: 'production', name: 'Production', isExpanded: true },
+      ],
+    } as unknown as SessionStore;
+
+    render(
+      <NewConnectionDialog
+        store={localizedStore}
+        open
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+        editServer={editServer}
+      />,
+    );
+
+    const groupSelect = screen.getByRole('button', { name: 'rdpServers' });
+    expect(groupSelect).toBeInTheDocument();
+    fireEvent.click(groupSelect);
+
+    expect(screen.getAllByText('rdpServers')).toHaveLength(2);
+    expect(screen.getByText('Production')).toBeInTheDocument();
+    expect(screen.queryByText('Servers')).not.toBeInTheDocument();
+  });
+
   it('shows and hides the saved password from the trailing eye button', () => {
     render(
       <NewConnectionDialog

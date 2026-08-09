@@ -1,6 +1,6 @@
 [package]
 name = "nextdesk"
-version = "1.0.129"
+version = "1.0.130"
 edition = "2021"
 
 [features]
@@ -53,6 +53,12 @@ ironrdp-core = "0.2"
 ironrdp-tokio = "0.9"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
+# IronRDP 0.16 pins a RustCrypto pre-release line that conflicts with russh
+# 0.57+. Keep the SSH transport on the ring-only compatible line until the
+# shared crypto graph can be upgraded without vendoring IronRDP.
+russh = { version = "=0.56.0", default-features = false, features = ["ring"] }
+russh-sftp = "=2.3.0"
+keyring-core = "1.0.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nextdesk_kkterm_rdp)'] }
@@ -62,6 +68,7 @@ block2 = "0.6.2"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", features = ["NSPasteboard", "NSFilePromiseProvider", "NSPasteboardItem", "NSCursor", "NSEvent"] }
 objc2-foundation = { version = "0.3.2", features = ["NSItemProvider", "NSArray", "NSData", "NSError", "NSProgress", "NSString", "NSURL", "block2"] }
+apple-native-keyring-store = { version = "1.0.0", features = ["keychain"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = [
@@ -79,6 +86,7 @@ windows = { version = "0.62", features = [
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
+windows-native-keyring-store = "1.1.0"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

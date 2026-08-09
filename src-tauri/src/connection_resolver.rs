@@ -2,8 +2,10 @@ use crate::cloud_auth;
 use crate::cloud_gateway::{self, CloudBindingResponse, CloudPrepareMode, CloudPrepareResponse};
 use crate::config;
 use crate::state::{ActiveCloudBinding, AppState, CloudResolveResult, CloudResolveSender};
+use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
@@ -17,6 +19,93 @@ const CLOUD_ENDPOINT_READY_TIMEOUT_MS: u64 = 12_000;
 const CLOUD_ENDPOINT_READY_CONNECT_TIMEOUT_MS: u64 = 700;
 const CLOUD_ENDPOINT_READY_INTERVAL_MS: u64 = 300;
 const CLOUD_ENDPOINT_READY_SETTLE_MS: u64 = 500;
+static NEXT_ROUTE_LEASE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceKind {
+    Rdp,
+    Ssh,
+}
+
+impl ServiceKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rdp => "rdp",
+            Self::Ssh => "ssh",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutePolicy {
+    #[default]
+    Auto,
+    Direct,
+    CloudOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetAddress {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectionIntent {
+    pub service_kind: ServiceKind,
+    pub session_id: Option<String>,
+    pub host: String,
+    pub port: u16,
+    pub reuse_cloud_binding: bool,
+    pub route_policy: RoutePolicy,
+    pub preferred_region: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteLease {
+    pub lease_id: u64,
+    pub service_kind: ServiceKind,
+    pub session_id: Option<String>,
+    pub dial_target: TargetAddress,
+    pub identity_target: TargetAddress,
+    pub binding_id: Option<String>,
+    pub route_label: String,
+    pub force_direct: bool,
+}
+
+impl RouteLease {
+    fn from_resolved(intent: &ConnectionIntent, resolved: ResolvedTarget) -> Self {
+        Self {
+            lease_id: NEXT_ROUTE_LEASE_ID.fetch_add(1, Ordering::Relaxed),
+            service_kind: intent.service_kind,
+            session_id: intent.session_id.clone(),
+            dial_target: TargetAddress {
+                host: resolved.host,
+                port: resolved.port,
+            },
+            identity_target: TargetAddress {
+                host: intent.host.clone(),
+                port: intent.port,
+            },
+            binding_id: resolved.binding_id,
+            route_label: resolved.route_label,
+            force_direct: resolved.force_direct,
+        }
+    }
+
+    fn into_resolved(self) -> ResolvedTarget {
+        ResolvedTarget {
+            host: self.dial_target.host,
+            port: self.dial_target.port,
+            binding_id: self.binding_id,
+            route_label: self.route_label,
+            force_direct: self.force_direct,
+            route_lease_id: self.lease_id,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ResolvedTarget {
@@ -25,6 +114,7 @@ pub struct ResolvedTarget {
     pub binding_id: Option<String>,
     pub route_label: String,
     pub force_direct: bool,
+    pub route_lease_id: u64,
 }
 
 enum CloudResolveFlight {
@@ -76,7 +166,47 @@ fn direct_target(host: String, port: u16, route_label: &str) -> ResolvedTarget {
         binding_id: None,
         route_label: route_label.to_string(),
         force_direct: true,
+        route_lease_id: 0,
     }
+}
+
+fn direct_fallback_lease(current: &RouteLease) -> RouteLease {
+    RouteLease {
+        lease_id: NEXT_ROUTE_LEASE_ID.fetch_add(1, Ordering::Relaxed),
+        service_kind: current.service_kind,
+        session_id: current.session_id.clone(),
+        dial_target: current.identity_target.clone(),
+        identity_target: current.identity_target.clone(),
+        binding_id: None,
+        route_label: "cloud_fallback".to_string(),
+        force_direct: true,
+    }
+}
+
+pub fn replace_route_with_direct_fallback(
+    app_state: &AppState,
+    current: &RouteLease,
+) -> Result<RouteLease, String> {
+    let session_id = current
+        .session_id
+        .as_deref()
+        .ok_or_else(|| "ssh_route_session_required".to_string())?;
+    let key = active_route_key(current.service_kind, session_id);
+    let fallback = direct_fallback_lease(current);
+    let replaced = {
+        let mut leases = app_state.active_route_leases.lock().unwrap();
+        let is_current = leases
+            .get(&key)
+            .is_some_and(|lease| lease.lease_id == current.lease_id);
+        if !is_current {
+            return Err("ssh_route_lease_stale".to_string());
+        }
+        leases.insert(key, fallback.clone())
+    };
+    if let Some(replaced) = replaced {
+        release_lease_resources(app_state, replaced);
+    }
+    Ok(fallback)
 }
 
 fn cloud_credentials_present(saved: &config::SavedConfig) -> bool {
@@ -111,12 +241,25 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
-fn cloud_binding_key(session_id: Option<&str>, host: &str, port: u16) -> String {
+fn cloud_binding_key(
+    service_kind: ServiceKind,
+    session_id: Option<&str>,
+    host: &str,
+    port: u16,
+) -> String {
     let session_id = session_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("__legacy__");
-    format!("{session_id}|{}:{port}", host.to_ascii_lowercase())
+    format!(
+        "{}|{session_id}|{}:{port}",
+        service_kind.as_str(),
+        host.to_ascii_lowercase()
+    )
+}
+
+fn active_route_key(service_kind: ServiceKind, session_id: &str) -> String {
+    format!("{}|{}", service_kind.as_str(), session_id.trim())
 }
 
 async fn wait_for_cloud_resolve(
@@ -252,6 +395,7 @@ async fn prepare_with_retry(
     preferred_region: &str,
     reuse_existing: bool,
     session_id: Option<&str>,
+    service_kind: ServiceKind,
 ) -> Result<CloudPrepareResponse, String> {
     let mut last_error = None;
     for attempt in 0..=CLOUD_PREPARE_RETRY_DELAYS_MS.len() {
@@ -264,6 +408,7 @@ async fn prepare_with_retry(
             preferred_region,
             reuse_existing,
             session_id,
+            service_kind,
         )
         .await
         {
@@ -319,9 +464,25 @@ async fn renew_with_retry(
     Err(last_error.unwrap_or_else(|| "cloud renew failed".to_string()))
 }
 
-async fn wait_for_cloud_endpoint_ready(binding: &CloudBindingResponse) {
-    let host = binding.endpoint.host.as_str();
-    let port = binding.endpoint.port;
+async fn wait_for_cloud_endpoint_ready(binding: &CloudBindingResponse) -> Result<(), String> {
+    wait_for_endpoint_ready(
+        &binding.binding_id,
+        &binding.endpoint.host,
+        binding.endpoint.port,
+    )
+    .await
+}
+
+async fn wait_for_cached_endpoint_ready(binding: &ActiveCloudBinding) -> Result<(), String> {
+    wait_for_endpoint_ready(
+        &binding.binding_id,
+        &binding.endpoint_host,
+        binding.endpoint_port,
+    )
+    .await
+}
+
+async fn wait_for_endpoint_ready(binding_id: &str, host: &str, port: u16) -> Result<(), String> {
     let started = Instant::now();
     loop {
         let attempt = timeout(
@@ -333,22 +494,22 @@ async fn wait_for_cloud_endpoint_ready(binding: &CloudBindingResponse) {
             sleep(Duration::from_millis(CLOUD_ENDPOINT_READY_SETTLE_MS)).await;
             log::info!(
                 "[cloud] endpoint ready binding={} endpoint={}:{} wait_ms={}",
-                binding.binding_id,
+                binding_id,
                 host,
                 port,
                 started.elapsed().as_millis()
             );
-            return;
+            return Ok(());
         }
         if started.elapsed() >= Duration::from_millis(CLOUD_ENDPOINT_READY_TIMEOUT_MS) {
             log::warn!(
                 "[cloud] endpoint readiness timed out binding={} endpoint={}:{} wait_ms={}",
-                binding.binding_id,
+                binding_id,
                 host,
                 port,
                 started.elapsed().as_millis()
             );
-            return;
+            return Err("cloud_endpoint_not_ready".to_string());
         }
         sleep(Duration::from_millis(CLOUD_ENDPOINT_READY_INTERVAL_MS)).await;
     }
@@ -356,6 +517,16 @@ async fn wait_for_cloud_endpoint_ready(binding: &CloudBindingResponse) {
 
 pub async fn keep_binding_alive(
     app_state: &AppState,
+    session_id: Option<&str>,
+    host: &str,
+    port: u16,
+) -> Result<(), String> {
+    keep_route_alive(app_state, ServiceKind::Rdp, session_id, host, port).await
+}
+
+pub async fn keep_route_alive(
+    app_state: &AppState,
+    service_kind: ServiceKind,
     session_id: Option<&str>,
     host: &str,
     port: u16,
@@ -369,7 +540,7 @@ pub async fn keep_binding_alive(
         return Ok(());
     }
 
-    let key = cloud_binding_key(session_id, host, port);
+    let key = cloud_binding_key(service_kind, session_id, host, port);
     let Some(binding) = app_state
         .cloud_active_bindings
         .lock()
@@ -432,16 +603,29 @@ async fn resolve_connection_target_inner(
     port: u16,
     reuse_cloud_binding: bool,
     session_id: Option<&str>,
+    service_kind: ServiceKind,
+    route_policy: RoutePolicy,
+    preferred_region: Option<&str>,
 ) -> Result<ResolvedTarget, String> {
     if should_bypass_cloud_for_host(&host) {
+        if route_policy == RoutePolicy::CloudOnly {
+            return Err("cloud_private_target_unsupported".to_string());
+        }
         return Ok(direct_target(host, port, "lan_direct"));
+    }
+
+    if route_policy == RoutePolicy::Direct {
+        return Ok(direct_target(host, port, "local_direct"));
     }
 
     let saved = config::load_saved_config();
     if !cloud_credentials_present(&saved) {
+        if route_policy == RoutePolicy::CloudOnly {
+            return Err("cloud_authorization_required".to_string());
+        }
         return Ok(direct_target(host, port, "local_direct"));
     }
-    let key = cloud_binding_key(session_id, &host, port);
+    let key = cloud_binding_key(service_kind, session_id, &host, port);
     let now = now_ms();
     let cached_binding = {
         app_state
@@ -479,6 +663,12 @@ async fn resolve_connection_target_inner(
                             updated.endpoint_host,
                             updated.endpoint_port
                         );
+                        if reuse_cloud_binding {
+                            if let Err(error) = wait_for_cached_endpoint_ready(&updated).await {
+                                app_state.cloud_active_bindings.lock().unwrap().remove(&key);
+                                return Err(error);
+                            }
+                        }
                         return Ok(updated.resolved());
                     }
                     Err(error) => {
@@ -490,6 +680,12 @@ async fn resolve_connection_target_inner(
                                 binding.binding_id,
                                 error
                             );
+                            if reuse_cloud_binding {
+                                if let Err(error) = wait_for_cached_endpoint_ready(&binding).await {
+                                    app_state.cloud_active_bindings.lock().unwrap().remove(&key);
+                                    return Err(error);
+                                }
+                            }
                             return Ok(binding.resolved());
                         } else {
                             log::warn!(
@@ -512,6 +708,12 @@ async fn resolve_connection_target_inner(
                     binding.endpoint_host,
                     binding.endpoint_port
                 );
+                if reuse_cloud_binding {
+                    if let Err(error) = wait_for_cached_endpoint_ready(&binding).await {
+                        app_state.cloud_active_bindings.lock().unwrap().remove(&key);
+                        return Err(error);
+                    }
+                }
                 return Ok(binding.resolved());
             }
         } else if reuse_cloud_binding {
@@ -547,9 +749,10 @@ async fn resolve_connection_target_inner(
         &token,
         &host,
         port,
-        "auto",
+        preferred_region.unwrap_or("auto"),
         reuse_cloud_binding,
         session_id,
+        service_kind,
     )
     .await
     .map_err(normalize_cloud_error)?;
@@ -587,8 +790,12 @@ async fn resolve_connection_target_inner(
                 prepare_id
             );
             let probe_timeout_ms = prepared.probe_timeout_ms.unwrap_or(2500);
-            let results =
-                crate::cloud_probe::probe_candidates(&prepared.candidates, probe_timeout_ms).await;
+            let results = crate::cloud_probe::probe_candidates_for_service(
+                &prepared.candidates,
+                probe_timeout_ms,
+                service_kind,
+            )
+            .await;
             let winner = match crate::cloud_probe::select_winner(&results) {
                 Some(result) => result,
                 None => {
@@ -636,7 +843,16 @@ async fn resolve_connection_target_inner(
     };
 
     if !endpoint_was_probed {
-        wait_for_cloud_endpoint_ready(&ready).await;
+        if let Err(error) = wait_for_cloud_endpoint_ready(&ready).await {
+            cloud_gateway::close(
+                &saved.dashboard_url,
+                &saved.cloud_device_id,
+                &token,
+                &ready.binding_id,
+            )
+            .await;
+            return Err(error);
+        }
     }
 
     let binding = ActiveCloudBinding::from_response(&host, port, &ready);
@@ -648,6 +864,75 @@ async fn resolve_connection_target_inner(
     Ok(binding.resolved())
 }
 
+pub async fn resolve_connection(
+    app_state: &AppState,
+    intent: ConnectionIntent,
+) -> Result<RouteLease, String> {
+    let original_host = intent.host.clone();
+    let host = intent.host.clone();
+    let port = intent.port;
+    let result =
+        if should_bypass_cloud_for_host(&host) || intent.route_policy == RoutePolicy::Direct {
+            resolve_connection_target_inner(
+                app_state,
+                host,
+                port,
+                intent.reuse_cloud_binding,
+                intent.session_id.as_deref(),
+                intent.service_kind,
+                intent.route_policy,
+                intent.preferred_region.as_deref(),
+            )
+            .await
+        } else {
+            let key = cloud_binding_key(
+                intent.service_kind,
+                intent.session_id.as_deref(),
+                &host,
+                port,
+            );
+            run_cloud_resolve_singleflight(app_state, key, || {
+                resolve_connection_target_inner(
+                    app_state,
+                    host,
+                    port,
+                    intent.reuse_cloud_binding,
+                    intent.session_id.as_deref(),
+                    intent.service_kind,
+                    intent.route_policy,
+                    intent.preferred_region.as_deref(),
+                )
+            })
+            .await
+        };
+    if result.as_ref().is_err_and(|error| cloud_auth_error(error)) {
+        cloud_auth::invalidate_authorization();
+        app_state.cloud_active_bindings.lock().unwrap().clear();
+    }
+    let resolved = match intent.route_policy {
+        RoutePolicy::Auto => resolve_cloud_result(original_host, port, result),
+        RoutePolicy::Direct | RoutePolicy::CloudOnly => result?,
+    };
+    let lease = RouteLease::from_resolved(&intent, resolved);
+    if let Some(session_id) = lease
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let replaced = app_state.active_route_leases.lock().unwrap().insert(
+            active_route_key(lease.service_kind, session_id),
+            lease.clone(),
+        );
+        if let Some(replaced) = replaced {
+            if replaced.binding_id != lease.binding_id {
+                release_lease_resources(app_state, replaced);
+            }
+        }
+    }
+    Ok(lease)
+}
+
 pub async fn resolve_connection_target(
     app_state: &AppState,
     host: String,
@@ -655,34 +940,20 @@ pub async fn resolve_connection_target(
     reuse_cloud_binding: bool,
     session_id: Option<String>,
 ) -> Result<ResolvedTarget, String> {
-    let original_host = host.clone();
-    let result = if should_bypass_cloud_for_host(&host) {
-        resolve_connection_target_inner(
-            app_state,
+    resolve_connection(
+        app_state,
+        ConnectionIntent {
+            service_kind: ServiceKind::Rdp,
+            session_id,
             host,
             port,
             reuse_cloud_binding,
-            session_id.as_deref(),
-        )
-        .await
-    } else {
-        let key = cloud_binding_key(session_id.as_deref(), &host, port);
-        run_cloud_resolve_singleflight(app_state, key, || {
-            resolve_connection_target_inner(
-                app_state,
-                host,
-                port,
-                reuse_cloud_binding,
-                session_id.as_deref(),
-            )
-        })
-        .await
-    };
-    if result.as_ref().is_err_and(|error| cloud_auth_error(error)) {
-        cloud_auth::invalidate_authorization();
-        app_state.cloud_active_bindings.lock().unwrap().clear();
-    }
-    Ok(resolve_cloud_result(original_host, port, result))
+            route_policy: RoutePolicy::Auto,
+            preferred_region: None,
+        },
+    )
+    .await
+    .map(RouteLease::into_resolved)
 }
 
 pub fn clear_binding(app_state: &AppState, session_id: Option<&str>, host: &str, port: u16) {
@@ -690,16 +961,132 @@ pub fn clear_binding(app_state: &AppState, session_id: Option<&str>, host: &str,
         .cloud_active_bindings
         .lock()
         .unwrap()
-        .remove(&cloud_binding_key(session_id, host, port));
+        .remove(&cloud_binding_key(ServiceKind::Rdp, session_id, host, port));
+}
+
+pub fn release_session_route(
+    app_state: &AppState,
+    service_kind: ServiceKind,
+    session_id: &str,
+) -> bool {
+    release_session_route_inner(app_state, service_kind, session_id, None)
+}
+
+pub fn release_session_route_if_current(
+    app_state: &AppState,
+    service_kind: ServiceKind,
+    session_id: &str,
+    expected_lease_id: u64,
+) -> bool {
+    release_session_route_inner(app_state, service_kind, session_id, Some(expected_lease_id))
+}
+
+pub fn route_lease_is_current(
+    app_state: &AppState,
+    service_kind: ServiceKind,
+    session_id: &str,
+    lease_id: u64,
+) -> bool {
+    app_state
+        .active_route_leases
+        .lock()
+        .unwrap()
+        .get(&active_route_key(service_kind, session_id))
+        .is_some_and(|lease| lease.lease_id == lease_id)
+}
+
+pub fn release_route_lease(app_state: &AppState, lease: &RouteLease) -> bool {
+    let Some(session_id) = lease.session_id.as_deref() else {
+        return false;
+    };
+    release_session_route_if_current(app_state, lease.service_kind, session_id, lease.lease_id)
+}
+
+fn release_session_route_inner(
+    app_state: &AppState,
+    service_kind: ServiceKind,
+    session_id: &str,
+    expected_lease_id: Option<u64>,
+) -> bool {
+    let key = active_route_key(service_kind, session_id);
+    let lease = {
+        let mut leases = app_state.active_route_leases.lock().unwrap();
+        let Some(current) = leases.get(&key) else {
+            return false;
+        };
+        if expected_lease_id.is_some_and(|expected| current.lease_id != expected) {
+            log::debug!(
+                "[cloud] ignored stale route release service={} session={} expected_lease={} current_lease={}",
+                service_kind.as_str(),
+                session_id,
+                expected_lease_id.unwrap_or_default(),
+                current.lease_id
+            );
+            return false;
+        }
+        leases
+            .remove(&key)
+            .expect("route lease disappeared while locked")
+    };
+
+    release_lease_resources(app_state, lease);
+    true
+}
+
+fn release_lease_resources(app_state: &AppState, lease: RouteLease) {
+    let service_kind = lease.service_kind;
+    let binding_key = cloud_binding_key(
+        lease.service_kind,
+        lease.session_id.as_deref(),
+        &lease.identity_target.host,
+        lease.identity_target.port,
+    );
+    let mut bindings = app_state.cloud_active_bindings.lock().unwrap();
+    if bindings
+        .get(&binding_key)
+        .is_some_and(|binding| Some(&binding.binding_id) == lease.binding_id.as_ref())
+    {
+        bindings.remove(&binding_key);
+    }
+    drop(bindings);
+
+    if let Some(binding_id) = lease.binding_id {
+        tauri::async_runtime::spawn(async move {
+            let saved = config::load_saved_config();
+            if saved.dashboard_url.is_empty() || saved.cloud_device_id.is_empty() {
+                log::warn!(
+                    "[cloud] route released locally but remote close credentials are unavailable service={}",
+                    service_kind.as_str()
+                );
+                return;
+            }
+            let Ok(token) = cloud_auth::load_device_token(&saved.cloud_device_id) else {
+                log::warn!(
+                    "[cloud] route released locally but remote close token is unavailable service={}",
+                    service_kind.as_str()
+                );
+                return;
+            };
+            cloud_gateway::close(
+                &saved.dashboard_url,
+                &saved.cloud_device_id,
+                &token,
+                &binding_id,
+            )
+            .await;
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         binding_is_valid, binding_needs_renewal, can_reuse_cached_binding, cloud_binding_key,
-        cloud_credentials_present, cloud_rate_limited, direct_target, normalize_cloud_error,
-        resolve_cloud_result, resolve_connection_target, run_cloud_resolve_singleflight,
-        ResolvedTarget,
+        cloud_credentials_present, cloud_rate_limited, direct_fallback_lease, direct_target,
+        normalize_cloud_error, release_session_route, release_session_route_if_current,
+        resolve_cloud_result, resolve_connection, resolve_connection_target,
+        run_cloud_resolve_singleflight, ConnectionIntent, ResolvedTarget, RouteLease, RoutePolicy,
+        ServiceKind, TargetAddress,
     };
     use crate::config::SavedConfig;
     use crate::state::{ActiveCloudBinding, AppState};
@@ -747,12 +1134,23 @@ mod tests {
 
     #[test]
     fn cloud_binding_cache_is_isolated_per_rdp_session() {
-        let first = cloud_binding_key(Some("tab-a"), "203.0.113.10", 3389);
-        let second = cloud_binding_key(Some("tab-b"), "203.0.113.10", 3389);
-        let first_reconnect = cloud_binding_key(Some("tab-a"), "203.0.113.10", 3389);
+        let first = cloud_binding_key(ServiceKind::Rdp, Some("tab-a"), "203.0.113.10", 3389);
+        let second = cloud_binding_key(ServiceKind::Rdp, Some("tab-b"), "203.0.113.10", 3389);
+        let first_reconnect =
+            cloud_binding_key(ServiceKind::Rdp, Some("tab-a"), "203.0.113.10", 3389);
 
         assert_ne!(first, second);
         assert_eq!(first, first_reconnect);
+    }
+
+    #[test]
+    fn cloud_binding_cache_is_isolated_per_service() {
+        let rdp = cloud_binding_key(ServiceKind::Rdp, Some("tab-a"), "203.0.113.10", 22);
+        let ssh = cloud_binding_key(ServiceKind::Ssh, Some("tab-a"), "203.0.113.10", 22);
+
+        assert_ne!(rdp, ssh);
+        assert!(rdp.starts_with("rdp|"));
+        assert!(ssh.starts_with("ssh|"));
     }
 
     #[test]
@@ -781,6 +1179,35 @@ mod tests {
         assert_eq!(resolved.binding_id, None);
         assert_eq!(resolved.route_label, "cloud_fallback");
         assert!(resolved.force_direct);
+    }
+
+    #[test]
+    fn direct_fallback_lease_dials_the_original_ssh_identity() {
+        let cloud = RouteLease {
+            lease_id: 41,
+            service_kind: ServiceKind::Ssh,
+            session_id: Some("ssh-tab".to_string()),
+            dial_target: TargetAddress {
+                host: "relay.example.com".to_string(),
+                port: 42022,
+            },
+            identity_target: TargetAddress {
+                host: "203.0.113.10".to_string(),
+                port: 22,
+            },
+            binding_id: Some("binding-test".to_string()),
+            route_label: "cloud".to_string(),
+            force_direct: true,
+        };
+
+        let fallback = direct_fallback_lease(&cloud);
+
+        assert_ne!(fallback.lease_id, cloud.lease_id);
+        assert_eq!(fallback.dial_target, cloud.identity_target);
+        assert_eq!(fallback.identity_target, cloud.identity_target);
+        assert_eq!(fallback.binding_id, None);
+        assert_eq!(fallback.route_label, "cloud_fallback");
+        assert!(fallback.force_direct);
     }
 
     #[test]
@@ -831,6 +1258,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ssh_route_keeps_dial_and_identity_targets_separate() {
+        let app_state = AppState::default();
+        let intent = ConnectionIntent {
+            service_kind: ServiceKind::Ssh,
+            session_id: Some("ssh-tab-a".to_string()),
+            host: "192.168.3.105".to_string(),
+            port: 22,
+            reuse_cloud_binding: false,
+            route_policy: RoutePolicy::Auto,
+            preferred_region: None,
+        };
+
+        let lease = resolve_connection(&app_state, intent)
+            .await
+            .expect("private SSH target should resolve directly");
+
+        assert_eq!(lease.dial_target.host, "192.168.3.105");
+        assert_eq!(lease.dial_target.port, 22);
+        assert_eq!(lease.identity_target.host, "192.168.3.105");
+        assert_eq!(lease.identity_target.port, 22);
+        assert_eq!(lease.service_kind, ServiceKind::Ssh);
+        assert_eq!(lease.route_label, "lan_direct");
+    }
+
+    #[tokio::test]
+    async fn cloud_only_never_silently_routes_a_private_target_directly() {
+        let app_state = AppState::default();
+        let result = resolve_connection(
+            &app_state,
+            ConnectionIntent {
+                service_kind: ServiceKind::Ssh,
+                session_id: Some("ssh-cloud-only".to_string()),
+                host: "192.168.3.105".to_string(),
+                port: 22,
+                reuse_cloud_binding: false,
+                route_policy: RoutePolicy::CloudOnly,
+                preferred_region: None,
+            },
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err(), "cloud_private_target_unsupported");
+        assert!(app_state.active_route_leases.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn route_lease_is_released_by_service_and_session() {
+        let app_state = AppState::default();
+        let intent = ConnectionIntent {
+            service_kind: ServiceKind::Ssh,
+            session_id: Some("ssh-tab-release".to_string()),
+            host: "192.168.3.105".to_string(),
+            port: 22,
+            reuse_cloud_binding: false,
+            route_policy: RoutePolicy::Auto,
+            preferred_region: None,
+        };
+
+        resolve_connection(&app_state, intent).await.unwrap();
+        assert_eq!(app_state.active_route_leases.lock().unwrap().len(), 1);
+
+        assert!(release_session_route(
+            &app_state,
+            ServiceKind::Ssh,
+            "ssh-tab-release"
+        ));
+        assert!(app_state.active_route_leases.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_release_cannot_remove_a_replacement_lease() {
+        let app_state = AppState::default();
+        let intent = || ConnectionIntent {
+            service_kind: ServiceKind::Ssh,
+            session_id: Some("ssh-tab-generation".to_string()),
+            host: "192.168.3.105".to_string(),
+            port: 22,
+            reuse_cloud_binding: false,
+            route_policy: RoutePolicy::Auto,
+            preferred_region: None,
+        };
+        let first = resolve_connection(&app_state, intent()).await.unwrap();
+        let replacement = resolve_connection(&app_state, intent()).await.unwrap();
+
+        assert_ne!(first.lease_id, replacement.lease_id);
+        assert!(!release_session_route_if_current(
+            &app_state,
+            ServiceKind::Ssh,
+            "ssh-tab-generation",
+            first.lease_id,
+        ));
+        assert_eq!(
+            app_state
+                .active_route_leases
+                .lock()
+                .unwrap()
+                .get("ssh|ssh-tab-generation")
+                .unwrap()
+                .lease_id,
+            replacement.lease_id
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_resolves_for_the_same_target_share_one_operation() {
         let app_state = AppState::default();
         let calls = AtomicUsize::new(0);
@@ -845,6 +1376,7 @@ mod tests {
                 binding_id: Some("bnd_shared".to_string()),
                 route_label: "cloud".to_string(),
                 force_direct: true,
+                route_lease_id: 0,
             })
         });
         let second = run_cloud_resolve_singleflight(&app_state, key, || async {
@@ -855,6 +1387,7 @@ mod tests {
                 binding_id: Some("bnd_duplicate".to_string()),
                 route_label: "cloud".to_string(),
                 force_direct: true,
+                route_lease_id: 0,
             })
         });
 
