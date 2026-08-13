@@ -32,6 +32,7 @@ import type { SessionStore } from '@/lib/useSessionStore';
 import { Monitor } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { canRecoverKktermWindowsResize } from '@/rdp/kkterm/resize-recovery';
+import { recoverGoneCloudBinding } from '@/rdp/cloud-binding-recovery';
 import { cn } from '@/lib/utils';
 import { useTranslation } from '@/i18n/useTranslation';
 import { codeToScancode } from '@/lib/scancodeMap';
@@ -789,8 +790,15 @@ export function RdpManager({
   const nativeTabsRef = useRef<Set<string>>(new Set());
   const nativeRouteLeaseIdsRef = useRef<Map<string, number>>(new Map());
   const cloudKeepaliveTimersRef = useRef<Map<string, ReturnType<typeof window.setInterval>>>(new Map());
+  const cloudKeepaliveGenerationRef = useRef<Map<string, number>>(new Map());
+  const cloudBindingRecoveryTabsRef = useRef<Set<string>>(new Set());
+  const cloudBindingRecoveryRef = useRef<(tabId: string) => void>(() => undefined);
 
   const stopCloudKeepalive = useCallback((tabId: string) => {
+    cloudKeepaliveGenerationRef.current.set(
+      tabId,
+      (cloudKeepaliveGenerationRef.current.get(tabId) ?? 0) + 1,
+    );
     const timer = cloudKeepaliveTimersRef.current.get(tabId);
     if (timer !== undefined) {
       window.clearInterval(timer);
@@ -800,13 +808,27 @@ export function RdpManager({
 
   const startCloudKeepalive = useCallback((tabId: string, host: string, port: number) => {
     stopCloudKeepalive(tabId);
+    cloudBindingRecoveryTabsRef.current.delete(tabId);
+    const generation = (cloudKeepaliveGenerationRef.current.get(tabId) ?? 0) + 1;
+    cloudKeepaliveGenerationRef.current.set(tabId, generation);
     const renew = () => {
       void api.cloudKeepBindingAlive(tabId, host, port).catch(error => {
+        if (cloudKeepaliveGenerationRef.current.get(tabId) !== generation) return;
         rdpLog.warn('cloud', 'binding keepalive failed', {
           tabId,
           host,
           port,
           error: error instanceof Error ? error.message : String(error),
+        });
+        if (cloudBindingRecoveryTabsRef.current.has(tabId)) return;
+        recoverGoneCloudBinding(error, {
+          stopKeepalive: () => stopCloudKeepalive(tabId),
+          replaceRoute: () => {
+            if (userDisconnectedRef.current.has(tabId)) return;
+            cloudBindingRecoveryTabsRef.current.add(tabId);
+            rdpLog.warn('cloud', 'binding invalidated; replacing cloud route', { tabId, host, port });
+            cloudBindingRecoveryRef.current(tabId);
+          },
         });
       });
     };
@@ -822,6 +844,7 @@ export function RdpManager({
       window.clearInterval(timer);
     }
     cloudKeepaliveTimersRef.current.clear();
+    cloudKeepaliveGenerationRef.current.clear();
   }, []);
   const kktermTabsRef = useRef<Set<string>>(new Set());
   const kktermRouteLeaseIdsRef = useRef<Map<string, number>>(new Map());
@@ -3664,6 +3687,11 @@ export function RdpManager({
       }, 500);
     });
   }, [store, cleanupH264Worker, cleanupNativeFrameStream, forgetNativeResizeState, getCanvasSize, stopCloudKeepalive, stopFpsCounter]);
+
+  cloudBindingRecoveryRef.current = (tabId: string) => {
+    const desiredSize = desiredSizeRef.current;
+    reconnectWithSize(tabId, desiredSize?.w, desiredSize?.h);
+  };
 
   const performAdaptiveResize = useCallback((reason: string) => {
     if (resModeRef.current !== 'adaptive') return;

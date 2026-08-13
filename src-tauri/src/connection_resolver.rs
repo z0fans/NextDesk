@@ -524,6 +524,26 @@ pub async fn keep_binding_alive(
     keep_route_alive(app_state, ServiceKind::Rdp, session_id, host, port).await
 }
 
+const CLOUD_BINDING_GONE_ERROR: &str = "cloud_binding_gone";
+
+fn cloud_binding_is_gone(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("cloud renew rejected")
+        && (error.contains("410 gone") || error.contains("status code 410"))
+}
+
+fn invalidate_cloud_binding_if_current(app_state: &AppState, key: &str, binding_id: &str) -> bool {
+    let mut bindings = app_state.cloud_active_bindings.lock().unwrap();
+    if bindings
+        .get(key)
+        .is_some_and(|binding| binding.binding_id == binding_id)
+    {
+        bindings.remove(key);
+        return true;
+    }
+    false
+}
+
 pub async fn keep_route_alive(
     app_state: &AppState,
     service_kind: ServiceKind,
@@ -582,6 +602,18 @@ pub async fn keep_route_alive(
                 updated.endpoint_port
             );
             Ok(())
+        }
+        Err(error) if cloud_binding_is_gone(&error) => {
+            let invalidated =
+                invalidate_cloud_binding_if_current(app_state, &key, &binding.binding_id);
+            log::warn!(
+                "[cloud] keepalive binding gone target={}:{} binding={} invalidated={}",
+                host,
+                port,
+                binding.binding_id,
+                invalidated
+            );
+            Err(CLOUD_BINDING_GONE_ERROR.to_string())
         }
         Err(error) if binding_is_valid(&binding, now_ms()) => {
             log::warn!(
@@ -672,7 +704,20 @@ async fn resolve_connection_target_inner(
                         return Ok(updated.resolved());
                     }
                     Err(error) => {
-                        if binding_is_valid(&binding, now_ms()) {
+                        if cloud_binding_is_gone(&error) {
+                            let invalidated = invalidate_cloud_binding_if_current(
+                                app_state,
+                                &key,
+                                &binding.binding_id,
+                            );
+                            log::warn!(
+                                "[cloud] cached binding gone target={}:{} binding={} invalidated={}; recalculating",
+                                host,
+                                port,
+                                binding.binding_id,
+                                invalidated
+                            );
+                        } else if binding_is_valid(&binding, now_ms()) {
                             log::warn!(
                                 "[cloud] cached route renewal failed target={}:{} binding={} error={}; keeping current route until expiry",
                                 host,
@@ -695,7 +740,11 @@ async fn resolve_connection_target_inner(
                                 binding.binding_id,
                                 error
                             );
-                            app_state.cloud_active_bindings.lock().unwrap().remove(&key);
+                            invalidate_cloud_binding_if_current(
+                                app_state,
+                                &key,
+                                &binding.binding_id,
+                            );
                         }
                     }
                 }
@@ -1081,12 +1130,13 @@ fn release_lease_resources(app_state: &AppState, lease: RouteLease) {
 #[cfg(test)]
 mod tests {
     use super::{
-        binding_is_valid, binding_needs_renewal, can_reuse_cached_binding, cloud_binding_key,
-        cloud_credentials_present, cloud_rate_limited, direct_fallback_lease, direct_target,
-        normalize_cloud_error, release_session_route, release_session_route_if_current,
-        resolve_cloud_result, resolve_connection, resolve_connection_target,
-        run_cloud_resolve_singleflight, ConnectionIntent, ResolvedTarget, RouteLease, RoutePolicy,
-        ServiceKind, TargetAddress,
+        binding_is_valid, binding_needs_renewal, can_reuse_cached_binding, cloud_binding_is_gone,
+        cloud_binding_key, cloud_credentials_present, cloud_rate_limited, direct_fallback_lease,
+        direct_target, invalidate_cloud_binding_if_current, normalize_cloud_error,
+        release_session_route, release_session_route_if_current, resolve_cloud_result,
+        resolve_connection, resolve_connection_target, run_cloud_resolve_singleflight,
+        ConnectionIntent, ResolvedTarget, RouteLease, RoutePolicy, ServiceKind, TargetAddress,
+        CLOUD_BINDING_GONE_ERROR,
     };
     use crate::config::SavedConfig;
     use crate::state::{ActiveCloudBinding, AppState};
@@ -1168,6 +1218,48 @@ mod tests {
             "cloud prepare rejected: HTTP status client error (429 Too Many Requests)"
         ));
         assert!(!cloud_rate_limited("cloud prepare unsupported"));
+    }
+
+    #[test]
+    fn gone_renewal_is_a_terminal_binding_failure() {
+        assert!(cloud_binding_is_gone(
+            "cloud renew rejected: HTTP status client error (410 Gone)"
+        ));
+        assert!(!cloud_binding_is_gone(
+            "cloud renew request failed: connection reset"
+        ));
+        assert_eq!(CLOUD_BINDING_GONE_ERROR, "cloud_binding_gone");
+    }
+
+    #[test]
+    fn invalidation_only_removes_the_binding_that_failed() {
+        let state = AppState::default();
+        let key = cloud_binding_key(ServiceKind::Rdp, Some("tab-a"), "203.0.113.10", 3389);
+        state
+            .cloud_active_bindings
+            .lock()
+            .unwrap()
+            .insert(key.clone(), binding(120_000));
+
+        assert!(!invalidate_cloud_binding_if_current(
+            &state,
+            &key,
+            "newer_binding"
+        ));
+        assert!(state
+            .cloud_active_bindings
+            .lock()
+            .unwrap()
+            .contains_key(&key));
+
+        assert!(invalidate_cloud_binding_if_current(
+            &state, &key, "bnd_test"
+        ));
+        assert!(!state
+            .cloud_active_bindings
+            .lock()
+            .unwrap()
+            .contains_key(&key));
     }
 
     #[test]
