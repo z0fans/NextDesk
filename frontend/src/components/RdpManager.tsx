@@ -24,6 +24,10 @@ import {
   type KktermRdpBoundsRequest,
 } from '@/rdp/kkterm/commands';
 import { createKktermHostMoveFollower } from '@/rdp/kkterm/hostMoveFollower';
+import {
+  isKktermWindowsDisplayReady,
+  shouldRevealKktermWindowsSurface,
+} from '@/rdp/kkterm/windows-display-readiness';
 import type { SessionStore } from '@/lib/useSessionStore';
 import { Monitor } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -184,6 +188,7 @@ async function waitForKktermWindowsDisplay(
   fallbackHeight: number,
 ) {
   let lastError = '';
+  const visibleBounds = { ...bounds, visible: true };
   for (let attempt = 1; attempt <= 60; attempt += 1) {
     try {
       const display = await kktermRdpSyncDisplaySize(bounds);
@@ -195,31 +200,31 @@ async function waitForKktermWindowsDisplay(
         connected: display.connected,
         extendedDisconnectReason: display.extendedDisconnectReason,
         displaySynced: display.displaySynced,
+        surfaceVisible: display.surfaceVisible,
+        surfaceOnscreen: display.surfaceOnscreen,
+        surfaceReady: display.surfaceReady,
+        hostWindowMode: display.hostWindowMode,
         desktopWidth: display.desktopWidth,
         desktopHeight: display.desktopHeight,
       });
-      if (display.connectionState === 1 || display.connected) {
-        return {
-          width: display.desktopWidth || fallbackWidth,
-          height: display.desktopHeight || fallbackHeight,
-        };
+      if (shouldRevealKktermWindowsSurface(display)) {
+        if (!display.surfaceReady) {
+          await kktermRdpSetBounds(visibleBounds);
+        }
+        const status = display.surfaceReady
+          ? display
+          : await kktermRdpStatus({ tabId });
+        if (isKktermWindowsDisplayReady(status)) {
+          return {
+            width: display.desktopWidth || fallbackWidth,
+            height: display.desktopHeight || fallbackHeight,
+          };
+        }
+        lastError = 'RDP connected, but the Windows native surface is not visible on screen';
       }
       const disconnectError = activeXExtendedDisconnectError(display.extendedDisconnectReason);
       if (display.connectionState === 0 && disconnectError) {
         throw new Error(disconnectError);
-      }
-      if (attempt === 60 && display.displaySynced) {
-        rdpLog.warn('rdp', 'kkterm-rdp ActiveX display revealed while still establishing', {
-          attemptId,
-          tabId,
-          connectionState: display.connectionState,
-          desktopWidth: display.desktopWidth,
-          desktopHeight: display.desktopHeight,
-        });
-        return {
-          width: display.desktopWidth || fallbackWidth,
-          height: display.desktopHeight || fallbackHeight,
-        };
       }
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
@@ -232,8 +237,19 @@ async function waitForKktermWindowsDisplay(
           connectionState: status.connectionState,
           connected: status.connected,
           extendedDisconnectReason: status.extendedDisconnectReason,
+          surfaceVisible: status.surfaceVisible,
+          surfaceOnscreen: status.surfaceOnscreen,
+          surfaceReady: status.surfaceReady,
+          hostWindowMode: status.hostWindowMode,
         });
-        if (status.connected) {
+        if (shouldRevealKktermWindowsSurface(status) && !status.surfaceReady) {
+          await kktermRdpSetBounds(visibleBounds);
+          const revealedStatus = await kktermRdpStatus({ tabId });
+          if (isKktermWindowsDisplayReady(revealedStatus)) {
+            return { width: fallbackWidth, height: fallbackHeight };
+          }
+          lastError = 'RDP connected, but the Windows native surface is not visible on screen';
+        } else if (isKktermWindowsDisplayReady(status)) {
           return { width: fallbackWidth, height: fallbackHeight };
         }
         const disconnectError = activeXExtendedDisconnectError(status.extendedDisconnectReason);

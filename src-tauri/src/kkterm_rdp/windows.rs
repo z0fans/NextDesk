@@ -18,11 +18,12 @@ mod platform {
         core::{IUnknown_Vtbl, Interface, BSTR, GUID, PCSTR, PCWSTR},
         Win32::{
             Foundation::{
-                GetLastError, HANDLE, HGLOBAL, HWND, LPARAM, RECT, VARIANT_BOOL, VARIANT_FALSE,
-                VARIANT_TRUE, WPARAM,
+                GetLastError, HANDLE, HGLOBAL, HWND, LPARAM, POINT, RECT, VARIANT_BOOL,
+                VARIANT_FALSE, VARIANT_TRUE, WPARAM,
             },
             Graphics::Gdi::{
-                CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, RGN_DIFF, RGN_ERROR,
+                ClientToScreen, CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, RGN_DIFF,
+                RGN_ERROR,
             },
             System::{
                 Com::{
@@ -46,15 +47,17 @@ mod platform {
                 },
                 WindowsAndMessaging::{
                     CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindowRect, IsChild,
-                    PostMessageW, SendMessageW, SetWindowPos, ShowWindow, HMENU, HWND_TOP,
-                    SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_CHILD,
-                    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+                    IsWindowVisible, PostMessageW, SendMessageW, SetWindowPos, ShowWindow, HMENU,
+                    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE,
+                    WINDOW_STYLE, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOACTIVATE,
+                    WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
                 },
             },
         },
     };
 
     const HOST_WINDOW_LABEL: &str = "main";
+    const RDP_HOST_WINDOW_MODE: &str = "owned-popup";
     const HIDDEN_RDP_POSITION: i32 = -32_000;
     const LOCALE_USER_DEFAULT: u32 = 0x0400;
     const RDP_MIN_DESKTOP_WIDTH: i32 = 640;
@@ -412,6 +415,10 @@ mod platform {
         session_id: String,
         connection_state: i32,
         connected: bool,
+        surface_visible: bool,
+        surface_onscreen: bool,
+        surface_ready: bool,
+        host_window_mode: &'static str,
         extended_disconnect_reason: Option<i32>,
     }
 
@@ -466,6 +473,10 @@ mod platform {
         connected: bool,
         extended_disconnect_reason: Option<i32>,
         display_synced: bool,
+        surface_visible: bool,
+        surface_onscreen: bool,
+        surface_ready: bool,
+        host_window_mode: &'static str,
         desktop_width: i32,
         desktop_height: i32,
     }
@@ -521,7 +532,25 @@ mod platform {
         device_scale_factor: i32,
         dynamic_resize_failures: u32,
         resolution_mode: RemoteResolutionMode,
+        viewport_bounds: RdpViewportBounds,
         visible: bool,
+    }
+
+    #[derive(Clone, Copy)]
+    struct RdpViewportBounds {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        scale_factor: f64,
+    }
+
+    #[derive(Clone, Copy)]
+    struct RdpSurfaceState {
+        visible: bool,
+        onscreen: bool,
+        ready: bool,
+        rect: Option<(i32, i32, i32, i32)>,
     }
 
     // These values are always created, used, and destroyed through closures
@@ -535,6 +564,23 @@ mod platform {
         requested
             .filter(|scale| scale.is_finite() && *scale >= 0.25 && *scale <= 8.0)
             .unwrap_or(host_scale_factor)
+    }
+
+    fn update_viewport_bounds(
+        session: &mut RdpSession,
+        scale_factor: f64,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) {
+        session.viewport_bounds = RdpViewportBounds {
+            x,
+            y,
+            width,
+            height,
+            scale_factor,
+        };
     }
 
     impl RdpSessionManager {
@@ -574,6 +620,14 @@ mod platform {
                 let session = sessions
                     .get_mut(&request.session_id)
                     .ok_or_else(|| format!("RDP session '{}' was not found", request.session_id))?;
+                update_viewport_bounds(
+                    session,
+                    scale_factor,
+                    request.x,
+                    request.y,
+                    request.width,
+                    request.height,
+                );
                 show_and_resize_rdp(
                     session,
                     scale_factor,
@@ -614,6 +668,14 @@ mod platform {
                     let session = sessions.get_mut(&request.session_id).ok_or_else(|| {
                         format!("RDP session '{}' was not found", request.session_id)
                     })?;
+                    update_viewport_bounds(
+                        session,
+                        scale_factor,
+                        request.x,
+                        request.y,
+                        request.width,
+                        request.height,
+                    );
                     let connection_state =
                         get_property_i32(&session.dispatch, "Connected").unwrap_or(-1);
                     let rect = show_rdp_for_session(
@@ -626,6 +688,7 @@ mod platform {
                     )?;
                     apply_rdp_clip_region(
                         session.hwnd,
+                        session.owner,
                         rect,
                         request.x,
                         request.y,
@@ -635,6 +698,7 @@ mod platform {
                         scale_factor,
                     )?;
                     session.visible = true;
+                    let surface = rdp_surface_state(session);
                     rdp_debug(
                         "visibility.set",
                         &json!({
@@ -663,6 +727,16 @@ mod platform {
                                     "height": rect.height,
                                 })).collect::<Vec<_>>(),
                             "parkedOtherSessions": parked_other_sessions,
+                            "hostWindowMode": RDP_HOST_WINDOW_MODE,
+                            "surfaceVisible": surface.visible,
+                            "surfaceOnscreen": surface.onscreen,
+                            "surfaceReady": surface.ready,
+                            "surfaceRect": surface.rect.map(|rect| json!({
+                                "x": rect.0,
+                                "y": rect.1,
+                                "width": rect.2,
+                                "height": rect.3,
+                            })),
                         }),
                     );
                     Ok(())
@@ -670,6 +744,14 @@ mod platform {
                     let session = sessions.get_mut(&request.session_id).ok_or_else(|| {
                         format!("RDP session '{}' was not found", request.session_id)
                     })?;
+                    update_viewport_bounds(
+                        session,
+                        scale_factor,
+                        request.x,
+                        request.y,
+                        request.width,
+                        request.height,
+                    );
                     let connection_state =
                         get_property_i32(&session.dispatch, "Connected").unwrap_or(-1);
                     let rect = stage_rdp(
@@ -710,10 +792,14 @@ mod platform {
         }
 
         pub fn follow_host_window(&self, app: AppHandle) -> Result<(), String> {
-            // AtlAxWin is a real child of the Tauri window, so Windows moves it
-            // together with its parent. Keep the command as a compatibility
-            // no-op for the existing frontend interface.
-            run_on_main_thread_quiet("follow_rdp_host_window", app, move |_app| Ok(()))
+            let sessions = Arc::clone(&self.sessions);
+            run_on_main_thread_quiet("follow_rdp_host_window", app, move |_app| {
+                let sessions = lock_sessions(&sessions)?;
+                for session in sessions.values().filter(|session| session.visible) {
+                    follow_rdp_host_window(session)?;
+                }
+                Ok(())
+            })
         }
 
         pub fn sync_display_size(
@@ -768,6 +854,7 @@ mod platform {
                     && sync_remote_desktop_size(session, display_settings, false);
                 let display_synced =
                     rdp_display_ready_after_sync(connection_state, display_sync_completed);
+                let surface = rdp_surface_state(session);
                 rdp_debug(
                     "display.sync.state",
                     &json!({
@@ -782,6 +869,16 @@ mod platform {
                         "displaySyncAttempted": display_sync_attempted,
                         "displaySyncCompleted": display_sync_completed,
                         "displaySynced": display_synced,
+                        "hostWindowMode": RDP_HOST_WINDOW_MODE,
+                        "surfaceVisible": surface.visible,
+                        "surfaceOnscreen": surface.onscreen,
+                        "surfaceReady": surface.ready,
+                        "surfaceRect": surface.rect.map(|rect| json!({
+                            "x": rect.0,
+                            "y": rect.1,
+                            "width": rect.2,
+                            "height": rect.3,
+                        })),
                         "scaleFactor": scale_factor,
                         "hostScaleFactor": host_scale_factor,
                         "requestBounds": {
@@ -818,6 +915,10 @@ mod platform {
                     connected,
                     extended_disconnect_reason,
                     display_synced,
+                    surface_visible: surface.visible,
+                    surface_onscreen: surface.onscreen,
+                    surface_ready: connected && surface.ready,
+                    host_window_mode: RDP_HOST_WINDOW_MODE,
                     desktop_width: session.desktop_width,
                     desktop_height: session.desktop_height,
                 })
@@ -859,10 +960,16 @@ mod platform {
                 let extended_disconnect_reason = (connection_state == 0)
                     .then(|| get_property_i32(&session.dispatch, "ExtendedDisconnectReason").ok())
                     .flatten();
+                let connected = is_rdp_connected_state(connection_state);
+                let surface = rdp_surface_state(session);
                 Ok(RdpSessionStatus {
                     session_id: request.session_id,
                     connection_state,
-                    connected: is_rdp_connected_state(connection_state),
+                    connected,
+                    surface_visible: surface.visible,
+                    surface_onscreen: surface.onscreen,
+                    surface_ready: connected && surface.ready,
+                    host_window_mode: RDP_HOST_WINDOW_MODE,
                     extended_disconnect_reason,
                 })
             })
@@ -1475,6 +1582,13 @@ mod platform {
                 device_scale_factor: display_settings.device_scale_factor,
                 dynamic_resize_failures: 0,
                 resolution_mode,
+                viewport_bounds: RdpViewportBounds {
+                    x: request.x,
+                    y: request.y,
+                    width: request.width,
+                    height: request.height,
+                    scale_factor,
+                },
                 visible: false,
             },
         );
@@ -1502,6 +1616,7 @@ mod platform {
         rect: (i32, i32, i32, i32),
     ) -> Result<(HWND, IDispatch, String), String> {
         let mut last_error = String::new();
+        let (extended_style, style) = rdp_host_window_styles();
         for progid in RDP_PROGIDS {
             rdp_debug(
                 "control.create.try",
@@ -1519,10 +1634,10 @@ mod platform {
             let control_name = wide_null(progid);
             let hwnd = unsafe {
                 CreateWindowExW(
-                    WINDOW_EX_STYLE(0),
+                    extended_style,
                     PCWSTR(class_name.as_ptr()),
                     PCWSTR(control_name.as_ptr()),
-                    WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                    style,
                     rect.0,
                     rect.1,
                     rect.2,
@@ -1576,6 +1691,13 @@ mod platform {
         Err(format!(
             "failed to create Microsoft RDP ActiveX control from mstscax.dll ({last_error})"
         ))
+    }
+
+    fn rdp_host_window_styles() -> (WINDOW_EX_STYLE, WINDOW_STYLE) {
+        (
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+        )
     }
 
     fn control_dispatch(hwnd: HWND) -> Result<IDispatch, String> {
@@ -2186,9 +2308,9 @@ mod platform {
 
     fn focus_rdp_window(owner: HWND, hwnd: HWND, focus: HWND) -> RdpInputFocusState {
         // Never promote NextDesk from a background application while flushing a
-        // delayed or blur-triggered input event. As a true child HWND, AtlAxWin
-        // participates in the owner's normal activation and only needs thread-local
-        // active/focus state once the owner is already foreground.
+        // delayed or blur-triggered input event. The non-activating owned popup
+        // only needs thread-local active/focus state once the owner is already
+        // foreground.
         let state = unsafe {
             let foreground = GetForegroundWindow();
             let activation_allowed = should_focus_rdp_control(foreground == owner);
@@ -2746,7 +2868,15 @@ mod platform {
         height: f64,
     ) -> Result<(i32, i32, i32, i32), String> {
         apply_smart_sizing(&session.dispatch, session.resolution_mode.smart_sizing());
-        let rect = show_rdp(session.hwnd, scale_factor, x, y, width, height)?;
+        let rect = show_rdp(
+            session.hwnd,
+            session.owner,
+            scale_factor,
+            x,
+            y,
+            width,
+            height,
+        )?;
         Ok(rect)
     }
 
@@ -2771,13 +2901,14 @@ mod platform {
 
     fn show_rdp(
         hwnd: HWND,
+        owner: HWND,
         scale_factor: f64,
         x: f64,
         y: f64,
         width: f64,
         height: f64,
     ) -> Result<(i32, i32, i32, i32), String> {
-        let rect = scaled_rect(x, y, width, height, scale_factor);
+        let rect = screen_rect(owner, scale_factor, x, y, width, height)?;
         position_rdp(hwnd, rect)?;
         Ok(rect)
     }
@@ -2786,12 +2917,12 @@ mod platform {
         unsafe {
             SetWindowPos(
                 hwnd,
-                Some(HWND_TOP),
+                None,
                 rect.0,
                 rect.1,
                 rect.2,
                 rect.3,
-                SWP_NOACTIVATE,
+                SWP_NOACTIVATE | SWP_NOZORDER,
             )
             .map_err(|error| format!("failed to position RDP control: {error}"))?;
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -2801,6 +2932,7 @@ mod platform {
 
     fn apply_rdp_clip_region(
         hwnd: HWND,
+        owner: HWND,
         native_rect: (i32, i32, i32, i32),
         viewport_x: f64,
         viewport_y: f64,
@@ -2809,13 +2941,14 @@ mod platform {
         clip_rects: &[crate::kkterm_rdp::types::KktermRdpClipRect],
         scale_factor: f64,
     ) -> Result<(), String> {
-        let viewport_rect = scaled_rect(
+        let viewport_rect = screen_rect(
+            owner,
+            scale_factor,
             viewport_x,
             viewport_y,
             viewport_width,
             viewport_height,
-            scale_factor,
-        );
+        )?;
         let Some((base_left, base_top, base_right, base_bottom)) = intersect_rect_with_bounds(
             viewport_rect.0 - native_rect.0,
             viewport_rect.1 - native_rect.1,
@@ -2854,8 +2987,15 @@ mod platform {
                     clip_rect.height,
                     scale_factor,
                 );
-                let raw_left = clip.0 - native_rect.0;
-                let raw_top = clip.1 - native_rect.1;
+                let clip_origin = match client_to_screen_point(owner, clip.0, clip.1) {
+                    Ok(origin) => origin,
+                    Err(error) => {
+                        let _ = DeleteObject(visible_region.into());
+                        return Err(error);
+                    }
+                };
+                let raw_left = clip_origin.0 - native_rect.0;
+                let raw_top = clip_origin.1 - native_rect.1;
                 let Some((left, top, right, bottom)) = intersect_rect_with_bounds(
                     raw_left,
                     raw_top,
@@ -2908,6 +3048,31 @@ mod platform {
         Ok(())
     }
 
+    fn follow_rdp_host_window(session: &RdpSession) -> Result<(), String> {
+        let bounds = session.viewport_bounds;
+        let rect = scaled_rect(
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
+            bounds.scale_factor,
+        );
+        let origin = client_to_screen_point(session.owner, rect.0, rect.1)?;
+        unsafe {
+            SetWindowPos(
+                session.hwnd,
+                None,
+                origin.0,
+                origin.1,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+            )
+            .map_err(|error| format!("failed to follow RDP host window: {error}"))?;
+        }
+        Ok(())
+    }
+
     fn stage_rdp(
         hwnd: HWND,
         scale_factor: f64,
@@ -2941,6 +3106,56 @@ mod platform {
             width.max(1),
             height.max(1),
         )
+    }
+
+    fn screen_rect(
+        owner: HWND,
+        scale_factor: f64,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    ) -> Result<(i32, i32, i32, i32), String> {
+        let rect = scaled_rect(x, y, width, height, scale_factor);
+        let origin = client_to_screen_point(owner, rect.0, rect.1)?;
+        Ok((origin.0, origin.1, rect.2, rect.3))
+    }
+
+    fn client_to_screen_point(owner: HWND, x: i32, y: i32) -> Result<(i32, i32), String> {
+        let mut point = POINT { x, y };
+        let ok = unsafe { ClientToScreen(owner, &mut point) };
+        if !ok.as_bool() {
+            return Err("failed to translate RDP host coordinates to screen space".to_string());
+        }
+        Ok((point.x, point.y))
+    }
+
+    fn rdp_surface_state(session: &RdpSession) -> RdpSurfaceState {
+        let mut rect = RECT::default();
+        let rect = unsafe { GetWindowRect(session.hwnd, &mut rect) }
+            .ok()
+            .map(|()| {
+                (
+                    rect.left,
+                    rect.top,
+                    (rect.right - rect.left).max(0),
+                    (rect.bottom - rect.top).max(0),
+                )
+            });
+        let visible = session.visible && unsafe { IsWindowVisible(session.hwnd).as_bool() };
+        let onscreen = visible
+            && rect.is_some_and(|rect| {
+                rect.2 > 1
+                    && rect.3 > 1
+                    && rect.0 != HIDDEN_RDP_POSITION
+                    && rect.1 != HIDDEN_RDP_POSITION
+            });
+        RdpSurfaceState {
+            visible,
+            onscreen,
+            ready: visible && onscreen,
+            rect,
+        }
     }
 
     fn park_rdp_at_current_size(hwnd: HWND) -> Result<(), String> {
@@ -3037,11 +3252,10 @@ mod platform {
     }
 
     fn rdp_display_ready_after_sync(connection_state: i32, _display_sync_completed: bool) -> bool {
-        // Some servers keep ActiveX in the establishing state while showing
-        // interactive prompts, and some reject dynamic display updates after
-        // those prompts. Reveal active controls at their current size instead
-        // of leaving the pane stuck preparing off-screen.
-        is_rdp_displayable_state(connection_state)
+        // Display synchronization is not proof that the ActiveX session has
+        // finished connecting. Treat state 2 as establishing so the frontend
+        // cannot expose the app background as a successful black RDP surface.
+        is_rdp_connected_state(connection_state)
     }
 
     fn is_rdp_active_state(connection_state: i32) -> bool {
@@ -3571,12 +3785,22 @@ mod platform {
         }
 
         #[test]
-        fn treats_active_rdp_as_display_ready_when_dynamic_sync_fails() {
+        fn treats_only_connected_rdp_as_display_ready_when_dynamic_sync_fails() {
             assert!(rdp_display_ready_after_sync(1, true));
             assert!(rdp_display_ready_after_sync(1, false));
-            assert!(rdp_display_ready_after_sync(2, true));
-            assert!(rdp_display_ready_after_sync(2, false));
+            assert!(!rdp_display_ready_after_sync(2, true));
+            assert!(!rdp_display_ready_after_sync(2, false));
             assert!(!rdp_display_ready_after_sync(0, true));
+        }
+
+        #[test]
+        fn hosts_activex_in_a_nonactivating_owned_popup() {
+            let (extended_style, style) = rdp_host_window_styles();
+
+            assert_ne!(extended_style.0 & WS_EX_NOACTIVATE.0, 0);
+            assert_ne!(extended_style.0 & WS_EX_TOOLWINDOW.0, 0);
+            assert_ne!(style.0 & WS_POPUP.0, 0);
+            assert_eq!(RDP_HOST_WINDOW_MODE, "owned-popup");
         }
 
         #[test]
@@ -3641,6 +3865,10 @@ mod platform {
         session_id: String,
         connection_state: i32,
         connected: bool,
+        surface_visible: bool,
+        surface_onscreen: bool,
+        surface_ready: bool,
+        host_window_mode: &'static str,
         extended_disconnect_reason: Option<i32>,
     }
 
@@ -3688,6 +3916,10 @@ mod platform {
         connected: bool,
         extended_disconnect_reason: Option<i32>,
         display_synced: bool,
+        surface_visible: bool,
+        surface_onscreen: bool,
+        surface_ready: bool,
+        host_window_mode: &'static str,
         desktop_width: i32,
         desktop_height: i32,
     }
@@ -3776,6 +4008,10 @@ mod platform {
                 connected: false,
                 extended_disconnect_reason: None,
                 display_synced: false,
+                surface_visible: false,
+                surface_onscreen: false,
+                surface_ready: false,
+                host_window_mode: "unsupported",
                 desktop_width: 0,
                 desktop_height: 0,
             })
@@ -3798,6 +4034,10 @@ mod platform {
                 session_id: request.session_id,
                 connection_state: 0,
                 connected: is_rdp_connected_state(0),
+                surface_visible: false,
+                surface_onscreen: false,
+                surface_ready: false,
+                host_window_mode: "unsupported",
                 extended_disconnect_reason: None,
             })
         }

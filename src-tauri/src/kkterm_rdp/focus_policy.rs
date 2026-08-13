@@ -17,9 +17,10 @@ mod tests {
     }
 
     #[test]
-    fn windows_activex_host_is_a_child_of_the_nextdesk_window() {
+    fn windows_activex_host_is_a_nonactivating_owned_popup() {
         let source = include_str!("windows.rs");
-        assert!(source.contains("WS_CHILD | WS_VISIBLE"));
-        assert!(!source.contains("WS_POPUP | WS_VISIBLE"));
+        assert!(source.contains("WS_POPUP | WS_VISIBLE"));
+        assert!(source.contains("WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE"));
+        assert!(!source.contains("WS_CHILD | WS_VISIBLE"));
     }
 }

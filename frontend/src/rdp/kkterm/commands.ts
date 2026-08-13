@@ -80,6 +80,10 @@ export type KktermRdpStatusResponse = {
   sessionId: string;
   connectionState: number;
   connected: boolean;
+  surfaceVisible: boolean;
+  surfaceOnscreen: boolean;
+  surfaceReady: boolean;
+  hostWindowMode: 'owned-popup' | 'child' | 'unsupported';
   extendedDisconnectReason?: number | null;
 };
 
@@ -88,6 +92,10 @@ export type KktermRdpDisplaySyncResponse = {
   connectionState: number;
   connected: boolean;
   displaySynced: boolean;
+  surfaceVisible: boolean;
+  surfaceOnscreen: boolean;
+  surfaceReady: boolean;
+  hostWindowMode: 'owned-popup' | 'child' | 'unsupported';
   desktopWidth: number;
   desktopHeight: number;
   extendedDisconnectReason?: number | null;
