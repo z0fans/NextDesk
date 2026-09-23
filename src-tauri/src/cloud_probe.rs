@@ -1,5 +1,6 @@
 use crate::cloud_gateway::CloudPrepareCandidate;
 use crate::connection_resolver::ServiceKind;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -137,6 +138,57 @@ pub async fn probe_candidates_for_service(
         results[index] = result;
     }
 
+    results
+}
+
+pub async fn probe_candidates_for_connection(
+    candidates: &[CloudPrepareCandidate],
+    timeout_ms: u64,
+    service_kind: ServiceKind,
+) -> Vec<CloudProbeResult> {
+    let mut results = probe_candidates_for_service(candidates, timeout_ms, service_kind).await;
+    if select_winner(&results).is_some() {
+        return results;
+    }
+
+    let retry_timeout_ms = timeout_ms.clamp(500, 3_000);
+    log::warn!(
+        "[cloud] fast {} validation found no usable route; retrying candidates with {}ms per probe",
+        service_kind.as_str(),
+        retry_timeout_ms
+    );
+    let recovered = futures_util::stream::iter(candidates.iter().cloned().enumerate().map(
+        |(index, candidate)| async move {
+            let mut samples = Vec::new();
+            let mut failures = Vec::new();
+            for _ in 0..VALIDATED_SAMPLE_COUNT {
+                match probe_sample(&candidate, retry_timeout_ms, service_kind).await {
+                    Ok(sample) => samples.push(sample),
+                    Err(error) => failures.push(error),
+                }
+                if samples.len() >= 2 {
+                    break;
+                }
+            }
+            let result = if samples.is_empty() {
+                failed_result(
+                    &candidate.binding_id,
+                    retry_timeout_ms,
+                    failures.pop().unwrap_or_else(|| "probe_failed".to_string()),
+                    service_kind,
+                )
+            } else {
+                summarize_samples(&candidate.binding_id, &samples, &failures, service_kind)
+            };
+            (index, result)
+        },
+    ))
+    .buffer_unordered(2)
+    .collect::<Vec<_>>()
+    .await;
+    for (index, result) in recovered {
+        results[index] = result;
+    }
     results
 }
 
@@ -439,12 +491,13 @@ async fn read_ssh_identification(tcp: TcpStream) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        probe_candidates_for_service, read_ssh_identification, select_winner, summarize_samples,
-        CloudProbeResult, ProbeSample, FINALIST_COUNT, SSH_MAX_BANNER_BYTES,
-        VALIDATED_SAMPLE_COUNT,
+        probe_candidates_for_connection, probe_candidates_for_service, read_ssh_identification,
+        select_winner, summarize_samples, CloudProbeResult, ProbeSample, FINALIST_COUNT,
+        SSH_MAX_BANNER_BYTES, VALIDATED_SAMPLE_COUNT,
     };
     use crate::cloud_gateway::{CloudEndpoint, CloudPrepareCandidate};
     use crate::connection_resolver::ServiceKind;
+    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
 
@@ -583,6 +636,36 @@ mod tests {
         assert!(results[0].protocol_handshake_ms.is_some());
         assert_eq!(results[0].x224_ms, None);
         assert_eq!(results[0].tls_ms, None);
+    }
+
+    #[tokio::test]
+    async fn connection_recovers_a_slow_but_healthy_candidate() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(1_200)).await;
+                let _ = stream.write_all(b"SSH-2.0-SlowRelay\r\n").await;
+            }
+        });
+        let candidate = CloudPrepareCandidate {
+            binding_id: "slow-relay".to_string(),
+            endpoint: CloudEndpoint {
+                host: "127.0.0.1".to_string(),
+                port,
+                protocols: vec!["tcp".to_string()],
+            },
+            expires_at: String::new(),
+        };
+
+        let results = probe_candidates_for_connection(&[candidate], 2_500, ServiceKind::Ssh).await;
+
+        server.abort();
+        assert_eq!(
+            select_winner(&results).map(|winner| winner.binding_id.as_str()),
+            Some("slow-relay")
+        );
     }
 
     #[tokio::test]

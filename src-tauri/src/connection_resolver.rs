@@ -839,7 +839,7 @@ async fn resolve_connection_target_inner(
                 prepare_id
             );
             let probe_timeout_ms = prepared.probe_timeout_ms.unwrap_or(2500);
-            let results = crate::cloud_probe::probe_candidates_for_service(
+            let results = crate::cloud_probe::probe_candidates_for_connection(
                 &prepared.candidates,
                 probe_timeout_ms,
                 service_kind,

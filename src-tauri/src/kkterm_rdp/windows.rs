@@ -1695,7 +1695,7 @@ mod platform {
 
     fn rdp_host_window_styles() -> (WINDOW_EX_STYLE, WINDOW_STYLE) {
         (
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW,
             WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
         )
     }
@@ -2307,15 +2307,14 @@ mod platform {
     }
 
     fn focus_rdp_window(owner: HWND, hwnd: HWND, focus: HWND) -> RdpInputFocusState {
-        // Never promote NextDesk from a background application while flushing a
-        // delayed or blur-triggered input event. The non-activating owned popup
-        // only needs thread-local active/focus state once the owner is already
-        // foreground.
+        // Do not promote NextDesk for delayed input from another application.
+        // A click on the RDP popup activates it; only then move keyboard focus.
         let state = unsafe {
             let foreground = GetForegroundWindow();
-            let activation_allowed = should_focus_rdp_control(foreground == owner);
+            let activation_allowed =
+                should_focus_rdp_control(foreground == owner || foreground == hwnd);
             if activation_allowed {
-                let _ = SetActiveWindow(owner);
+                let _ = SetActiveWindow(hwnd);
                 let _ = SetFocus(Some(focus));
             }
             RdpInputFocusState {
@@ -3794,10 +3793,10 @@ mod platform {
         }
 
         #[test]
-        fn hosts_activex_in_a_nonactivating_owned_popup() {
+        fn hosts_activex_in_an_activating_owned_popup() {
             let (extended_style, style) = rdp_host_window_styles();
 
-            assert_ne!(extended_style.0 & WS_EX_NOACTIVATE.0, 0);
+            assert_eq!(extended_style.0 & WS_EX_NOACTIVATE.0, 0);
             assert_ne!(extended_style.0 & WS_EX_TOOLWINDOW.0, 0);
             assert_ne!(style.0 & WS_POPUP.0, 0);
             assert_eq!(RDP_HOST_WINDOW_MODE, "owned-popup");

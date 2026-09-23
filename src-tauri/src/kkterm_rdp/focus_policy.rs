@@ -1,5 +1,5 @@
-pub(crate) fn should_focus_rdp_control(foreground_is_owner: bool) -> bool {
-    foreground_is_owner
+pub(crate) fn should_focus_rdp_control(foreground_is_nextdesk: bool) -> bool {
+    foreground_is_nextdesk
 }
 
 #[cfg(test)]
@@ -17,10 +17,11 @@ mod tests {
     }
 
     #[test]
-    fn windows_activex_host_is_a_nonactivating_owned_popup() {
+    fn windows_activex_host_activates_on_click() {
         let source = include_str!("windows.rs");
         assert!(source.contains("WS_POPUP | WS_VISIBLE"));
-        assert!(source.contains("WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE"));
+        assert!(source.contains("WS_EX_TOOLWINDOW,"));
+        assert!(!source.contains("WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE"));
         assert!(!source.contains("WS_CHILD | WS_VISIBLE"));
     }
 }
