@@ -1,8 +1,21 @@
 import { describe, expect, it } from 'vitest';
 import {
   planKktermLocalScaling,
+  restoreRdpResolution,
   supportsKktermLocalScaling,
 } from '@/rdp/resolution-modes';
+
+it('restores the selected mode and initial connection size', () => {
+  for (const mode of ['1920x1080', '1600x900', '1440x900', '1366x768', '1280x720']) {
+    const [w, h] = mode.split('x').map(Number);
+    expect(restoreRdpResolution(mode, false)).toEqual({ mode, desktopSize: { w, h } });
+  }
+  expect(restoreRdpResolution('adaptive', true)).toEqual({ mode: 'adaptive', desktopSize: null });
+  expect(restoreRdpResolution('smartSizing', true)).toEqual({ mode: 'smartSizing', desktopSize: null });
+  for (const mode of ['smartSizing', 'invalid', '99999x99999']) {
+    expect(restoreRdpResolution(mode, false)).toEqual({ mode: 'adaptive', desktopSize: null });
+  }
+});
 
 describe('KKTerm local scaling modes', () => {
   it('is available on both supported desktop platforms', () => {

@@ -1590,6 +1590,8 @@ pub fn run() {
             cloud_refresh_status,
             cloud_keep_binding_alive,
             cloud_disable,
+            config::rdp_resolution_get,
+            config::rdp_resolution_set,
             ssh::ssh_session_start,
             ssh::ssh_session_input,
             ssh::ssh_session_resize,

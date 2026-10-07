@@ -31,6 +31,8 @@ pub struct SavedConfig {
     pub cloud_account_available_until: String,
     #[serde(default)]
     pub cloud_account_reason: String,
+    #[serde(default)]
+    pub rdp_resolution_mode: Option<String>,
 }
 
 pub fn load_saved_config() -> SavedConfig {
@@ -51,9 +53,52 @@ pub fn save_config(cfg: &SavedConfig) {
     }
 }
 
+#[tauri::command]
+pub fn rdp_resolution_get() -> String {
+    load_saved_config()
+        .rdp_resolution_mode
+        .unwrap_or_else(|| "adaptive".into())
+}
+
+#[tauri::command]
+pub fn rdp_resolution_set(mode: String) -> Result<(), String> {
+    if !matches!(
+        mode.as_str(),
+        "adaptive"
+            | "smartSizing"
+            | "1920x1080"
+            | "1600x900"
+            | "1440x900"
+            | "1366x768"
+            | "1280x720"
+    ) {
+        return Err("Unsupported RDP resolution mode".into());
+    }
+    let mut saved = load_saved_config();
+    saved.rdp_resolution_mode = Some(mode);
+    let json = serde_json::to_string_pretty(&saved).map_err(|error| error.to_string())?;
+    fs::write(get_user_config_dir().join("config.json"), json).map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::SavedConfig;
+
+    #[test]
+    fn rdp_resolution_preference_survives_config_round_trip() {
+        let legacy: SavedConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.rdp_resolution_mode, None);
+        for mode in ["adaptive", "smartSizing", "1920x1080"] {
+            let saved = SavedConfig {
+                rdp_resolution_mode: Some(mode.into()),
+                ..SavedConfig::default()
+            };
+            let restored: SavedConfig =
+                serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+            assert_eq!(restored.rdp_resolution_mode.as_deref(), Some(mode));
+        }
+        assert!(super::rdp_resolution_set("invalid".into()).is_err());
+    }
 
     #[test]
     fn legacy_subscription_and_engine_fields_are_ignored() {

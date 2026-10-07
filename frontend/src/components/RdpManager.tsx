@@ -76,6 +76,7 @@ import { GfxSurfaceCompositor } from '@/rdp/gfx-compositor';
 import { describeOfficialWebGfxFallback, type OfficialWebGfxFallbackInput } from '@/rdp/gfx-fallback';
 import {
   planKktermLocalScaling,
+  restoreRdpResolution,
   supportsKktermLocalScaling,
 } from '@/rdp/resolution-modes';
 import {
@@ -652,6 +653,8 @@ export function RdpManager({
   ] as const;
   const [resMode, setResMode] = useState('adaptive');
   const resModeRef = useRef('adaptive');
+  const resolutionLoadRef = useRef<Promise<void> | null>(null);
+  const resolutionChangedRef = useRef(false);
   resModeRef.current = resMode;
   const [showNewConn, setShowNewConn] = useState(false);
   const [editServerId, setEditServerId] = useState<string | null>(null);
@@ -759,6 +762,22 @@ export function RdpManager({
   const multiMonitorEnabledRef = useRef(KKTERM_WINDOWS_USE_MULTIMON);
   // When user picks a fixed resolution, store it here for reconnect
   const desiredSizeRef = useRef<{ w: number; h: number } | null>(null);
+  useEffect(() => {
+    let disposed = false;
+    resolutionLoadRef.current = api.rdpResolutionGet().then(savedMode => {
+      if (disposed || resolutionChangedRef.current) return;
+      const restored = restoreRdpResolution(
+        savedMode,
+        USE_KKTERM_COPY_RDP && supportsKktermLocalScaling(KKTERM_COPY_PLATFORM),
+      );
+      desiredSizeRef.current = restored.desktopSize;
+      resModeRef.current = restored.mode;
+      setResMode(restored.mode);
+    }).catch(error => {
+      rdpLog.warn('display', 'failed to load resolution preference', { error: String(error) });
+    });
+    return () => { disposed = true; };
+  }, []);
   const connectSessionRef = useRef<(tabId: string) => void>(null);
   // Auto-reconnect state
   const reconnectCountRef = useRef<Map<string, number>>(new Map());
@@ -2022,6 +2041,7 @@ export function RdpManager({
 
   // ── Connect to server ──
   const connectSession = useCallback(async (tabId: string) => {
+    await resolutionLoadRef.current;
     if (connectingTabsRef.current.has(tabId)) {
       rdpLog.warn('rdp', 'connectSession skipped: local connect lock active', { tabId });
       return;
@@ -3610,6 +3630,11 @@ export function RdpManager({
 
   // ── Reconnect helper (shared by resolution switch and adaptive resize) ──
   const reconnectWithSize = useCallback((tabId: string, w?: number, h?: number) => {
+    if (!w || !h) {
+      const fixedSize = restoreRdpResolution(resModeRef.current, false).desktopSize;
+      w = fixedSize?.w;
+      h = fixedSize?.h;
+    }
     if (w && h) {
       desiredSizeRef.current = { w, h };
     } else {
@@ -4004,12 +4029,17 @@ export function RdpManager({
   const applyResolution = useCallback((requestedMode: string) => {
     const mode = requestedMode;
     rdpLog.info('display', `applyResolution called: ${mode}`);
+    resolutionChangedRef.current = true;
+    void api.rdpResolutionSet(mode).catch(error => {
+      rdpLog.warn('display', 'failed to save resolution preference', { error: String(error) });
+    });
     if (mode === resModeRef.current) {
       rdpLog.info('display', `applyResolution skipped: ${mode} is already active`);
       return;
     }
     setResMode(mode);
     resModeRef.current = mode;
+    desiredSizeRef.current = restoreRdpResolution(mode, false).desktopSize;
     const tabId = store.activeTabId;
     if (!tabId) return;
     const tab = tabsRef.current.find(t => t.id === tabId);

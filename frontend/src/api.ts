@@ -89,6 +89,10 @@ export const api = {
   cloudKeepBindingAlive: (tabId: string, host: string, port: number) =>
     invoke<void>("cloud_keep_binding_alive", { sessionId: tabId, host, port }),
 
+  rdpResolutionGet: () => invoke<string>("rdp_resolution_get"),
+
+  rdpResolutionSet: (mode: string) => invoke<void>("rdp_resolution_set", { mode }),
+
   // ── Native RDP Session ──────────────────────────────
   rdpNativeConnect: (params: {
     tabId: string;

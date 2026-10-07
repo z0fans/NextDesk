@@ -5,6 +5,20 @@ export type DesktopSize = {
   h: number;
 };
 
+export function restoreRdpResolution(mode: string, localScalingSupported: boolean): {
+  mode: string;
+  desktopSize: DesktopSize | null;
+} {
+  if (['1920x1080', '1600x900', '1440x900', '1366x768', '1280x720'].includes(mode)) {
+    const [w, h] = mode.split('x').map(Number);
+    return { mode, desktopSize: { w, h } };
+  }
+  return {
+    mode: mode === 'smartSizing' && localScalingSupported ? mode : 'adaptive',
+    desktopSize: null,
+  };
+}
+
 export type LocalScalingPlan = {
   desktopSize: DesktopSize;
   reconnect: boolean;
