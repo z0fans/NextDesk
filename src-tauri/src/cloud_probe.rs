@@ -1133,9 +1133,13 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let refused = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let direct_port = refused.local_addr().unwrap().port();
-        drop(refused);
+        // Windows can delay connection refusal past the fast budget; use immediate EOF.
+        let direct = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_port = direct.local_addr().unwrap().port();
+        let direct_server = tokio::spawn(async move {
+            let (stream, _) = direct.accept().await.unwrap();
+            drop(stream);
+        });
         let candidates = vec![
             trusted_candidate("trusted", trusted_port),
             direct_candidate("127.0.0.1", direct_port, ServiceKind::Ssh),
@@ -1151,6 +1155,7 @@ mod tests {
         .await;
 
         server.await.unwrap();
+        direct_server.await.unwrap();
         assert!(started.elapsed() < Duration::from_millis(500));
         assert!(results[0].ok && results[0].winner_eligible);
         assert!(!results[1].ok);
