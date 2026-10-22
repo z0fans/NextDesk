@@ -1,9 +1,13 @@
 mod host_keys;
 pub(crate) mod manager;
+mod monitor;
 mod session;
 mod sftp;
 mod types;
 
+use crate::connection_outcome::{
+    spawn_report_for_lease, ConnectionOutcomeInput, OutcomeStage, OutcomeStatus,
+};
 use crate::connection_resolver::{self, ConnectionIntent, ServiceKind};
 use crate::credential_vault;
 use crate::state::AppState;
@@ -12,10 +16,12 @@ use russh::keys::{decode_secret_key, ssh_key::PublicKey};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, State};
 use types::{
-    validate_sftp_session_id, SftpCreateDirectoryRequest, SftpListRequest, SftpListResponse,
-    SftpOpenResponse, SftpRemoveRequest, SftpRenameRequest, SftpTransferDirection,
-    SftpTransferEvent, SftpTransferRequest, SshEvent, SshHostKeyTrustRequest, SshStartRequest,
-    SshStartResponse, StoredPrivateKeyCredential,
+    validate_sftp_session_id, validate_ssh_session_id, SftpCreateDirectoryRequest, SftpListRequest,
+    SftpListResponse, SftpOpenResponse, SftpReadTextRequest, SftpReadTextResponse,
+    SftpRemoveRequest, SftpRenameRequest, SftpSetPermissionsRequest, SftpTransferDirection,
+    SftpTransferEvent, SftpTransferRequest, SftpWriteTextRequest, SshEvent, SshHostKeyTrustRequest,
+    SshKnownHostEntry, SshMonitorSnapshot, SshStartRequest, SshStartResponse,
+    StoredPrivateKeyCredential,
 };
 
 #[tauri::command]
@@ -26,11 +32,31 @@ pub async fn ssh_session_start(
     on_event: Channel<SshEvent>,
     app_state: State<'_, AppState>,
 ) -> Result<SshStartResponse, String> {
-    request.validate()?;
+    let route_started = std::time::Instant::now();
+    request.validate().map_err(|error| {
+        log::warn!(
+            "[ssh] start rejected phase=validation code={}",
+            sanitize_diagnostic_code(&error)
+        );
+        error
+    })?;
     let session_id = request.session_id.clone();
+    if request.replace_existing {
+        let active = app_state.ssh_sessions.lock().unwrap().contains(&session_id);
+        if active {
+            app_state.ssh_sessions.lock().unwrap().close(&session_id)?;
+            for _ in 0..100 {
+                if !app_state.ssh_sessions.lock().unwrap().contains(&session_id) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+    }
     {
         let manager = app_state.ssh_sessions.lock().unwrap();
         if manager.contains(&session_id) {
+            log::warn!("[ssh] start rejected phase=reservation code=ssh_session_already_exists");
             return Err("ssh_session_already_exists".to_string());
         }
     }
@@ -43,7 +69,14 @@ pub async fn ssh_session_start(
         .ssh_sessions
         .lock()
         .unwrap()
-        .insert(session_id.clone(), handle)?;
+        .insert(session_id.clone(), handle)
+        .map_err(|error| {
+            log::warn!(
+                "[ssh] start rejected phase=reservation code={}",
+                sanitize_diagnostic_code(&error)
+            );
+            error
+        })?;
     let resolve = connection_resolver::resolve_connection(
         app_state.inner(),
         ConnectionIntent {
@@ -54,10 +87,12 @@ pub async fn ssh_session_start(
             reuse_cloud_binding: request.reuse_cloud_binding,
             route_policy: request.route_policy,
             preferred_region: request.preferred_region.clone(),
+            network_route_preferences: request.network_route_preferences.clone(),
         },
     );
     let lease = tokio::select! {
         _ = cancellation.cancelled() => {
+            log::warn!("[ssh] start rejected phase=route code=ssh_session_cancelled");
             app_state.ssh_sessions.lock().unwrap().remove(&session_id);
             connection_resolver::release_session_route(
                 app_state.inner(),
@@ -69,22 +104,55 @@ pub async fn ssh_session_start(
         result = resolve => match result {
             Ok(lease) => lease,
             Err(error) => {
+                log::warn!(
+                    "[ssh] start rejected phase=route code={}",
+                    sanitize_diagnostic_code(&error)
+                );
                 app_state.ssh_sessions.lock().unwrap().remove(&session_id);
                 connection_resolver::release_session_route(
                     app_state.inner(),
                     ServiceKind::Ssh,
                     &session_id,
                 );
+                let mut outcome = ConnectionOutcomeInput::new(
+                    session_id.clone(),
+                    ServiceKind::Ssh,
+                    OutcomeStatus::Failed,
+                    OutcomeStage::Scheduling,
+                );
+                outcome.error_code = Some(sanitize_diagnostic_code(&error));
+                outcome.duration_ms = Some(route_started.elapsed().as_millis() as u64);
+                spawn_report_for_lease(outcome, None);
                 return Err(error);
             }
         }
     };
     let route_label = lease.route_label.clone();
+    let route_diagnostics = lease.route_diagnostics.clone();
+    let network_scope_id = lease.network_scope_id.clone();
+    let attempt_id = format!("ssh-{}-lease-{}", session_id, lease.lease_id);
+    let route_duration_ms = route_started.elapsed().as_millis() as u64;
+    let mut route_outcome = ConnectionOutcomeInput::new(
+        session_id.clone(),
+        ServiceKind::Ssh,
+        OutcomeStatus::Connecting,
+        OutcomeStage::CandidateValidation,
+    );
+    route_outcome.attempt_id = Some(attempt_id);
+    route_outcome.duration_ms = Some(route_duration_ms);
+    route_outcome
+        .stage_durations_ms
+        .insert("scheduling".to_string(), route_duration_ms);
+    route_outcome
+        .stage_durations_ms
+        .insert("candidate_validation".to_string(), 0);
+    spawn_report_for_lease(route_outcome, Some(lease.clone()));
 
     tauri::async_runtime::spawn(session::run_session(
         app,
         request,
         lease,
+        route_duration_ms,
         control_rx,
         on_output,
         on_event,
@@ -94,6 +162,8 @@ pub async fn ssh_session_start(
     Ok(SshStartResponse {
         session_id,
         route_label,
+        route_diagnostics,
+        network_scope_id,
     })
 }
 
@@ -152,6 +222,51 @@ pub fn ssh_session_close(session_id: String, app_state: State<'_, AppState>) -> 
         Err(error) if error == "ssh_session_not_found" => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+#[tauri::command]
+pub async fn ssh_monitor_snapshot(
+    session_id: String,
+    app_state: State<'_, AppState>,
+) -> Result<SshMonitorSnapshot, String> {
+    validate_ssh_session_id(&session_id)?;
+    let sender = app_state
+        .ssh_sessions
+        .lock()
+        .unwrap()
+        .control_sender(&session_id)?;
+    let (reply, result) = tokio::sync::oneshot::channel();
+    sender
+        .send(SshControl::Monitor { reply })
+        .await
+        .map_err(|_| "ssh_session_closed".to_string())?;
+    result
+        .await
+        .map_err(|_| "ssh_monitor_session_closed".to_string())?
+}
+
+fn sanitize_diagnostic_code(value: &str) -> String {
+    let candidate = value.split(':').next().unwrap_or_default().trim();
+    let allowed_prefix = candidate.starts_with("ssh_")
+        || candidate.starts_with("cloud_")
+        || candidate.starts_with("credential_");
+    let allowed_chars = candidate.chars().all(|character| {
+        character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+    });
+    if allowed_prefix && allowed_chars && candidate.len() <= 96 {
+        candidate.to_string()
+    } else {
+        "ssh_start_failed".to_string()
+    }
+}
+
+#[tauri::command]
+pub fn ssh_log_start_failure(code: String) -> Result<(), String> {
+    log::warn!(
+        "[ssh] frontend start failed code={}",
+        sanitize_diagnostic_code(&code)
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -216,6 +331,26 @@ pub fn ssh_trust_host_key(request: SshHostKeyTrustRequest) -> Result<(), String>
         &public_key,
         &host_keys::known_hosts_path(),
     )
+}
+
+#[tauri::command]
+pub fn ssh_known_hosts_list() -> Result<Vec<SshKnownHostEntry>, String> {
+    host_keys::list_known_hosts(&host_keys::known_hosts_path())
+}
+
+#[tauri::command]
+pub fn ssh_known_host_remove(host: String) -> Result<(), String> {
+    host_keys::remove_known_host(&host, &host_keys::known_hosts_path())
+}
+
+#[tauri::command]
+pub fn ssh_known_hosts_import(contents: String) -> Result<usize, String> {
+    host_keys::import_known_hosts(&contents, &host_keys::known_hosts_path())
+}
+
+#[tauri::command]
+pub fn ssh_known_hosts_export() -> Result<String, String> {
+    host_keys::export_known_hosts(&host_keys::known_hosts_path())
 }
 
 #[tauri::command]
@@ -431,9 +566,81 @@ pub async fn ssh_sftp_remove(
         .map_err(|_| "sftp_session_closed".to_string())?
 }
 
+#[tauri::command]
+pub async fn ssh_sftp_read_text(
+    request: SftpReadTextRequest,
+    app_state: State<'_, AppState>,
+) -> Result<SftpReadTextResponse, String> {
+    request.validate()?;
+    let sender = app_state
+        .ssh_sessions
+        .lock()
+        .unwrap()
+        .control_sender(&request.session_id)?;
+    let (reply, result) = tokio::sync::oneshot::channel();
+    sender
+        .send(SshControl::Sftp(sftp::SftpControl::ReadText {
+            request,
+            reply,
+        }))
+        .await
+        .map_err(|_| "ssh_session_closed".to_string())?;
+    result
+        .await
+        .map_err(|_| "sftp_session_closed".to_string())?
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_write_text(
+    request: SftpWriteTextRequest,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    request.validate()?;
+    let sender = app_state
+        .ssh_sessions
+        .lock()
+        .unwrap()
+        .control_sender(&request.session_id)?;
+    let (reply, result) = tokio::sync::oneshot::channel();
+    sender
+        .send(SshControl::Sftp(sftp::SftpControl::WriteText {
+            request,
+            reply,
+        }))
+        .await
+        .map_err(|_| "ssh_session_closed".to_string())?;
+    result
+        .await
+        .map_err(|_| "sftp_session_closed".to_string())?
+}
+
+#[tauri::command]
+pub async fn ssh_sftp_set_permissions(
+    request: SftpSetPermissionsRequest,
+    app_state: State<'_, AppState>,
+) -> Result<(), String> {
+    request.validate()?;
+    let sender = app_state
+        .ssh_sessions
+        .lock()
+        .unwrap()
+        .control_sender(&request.session_id)?;
+    let (reply, result) = tokio::sync::oneshot::channel();
+    sender
+        .send(SshControl::Sftp(sftp::SftpControl::SetPermissions {
+            request,
+            reply,
+        }))
+        .await
+        .map_err(|_| "ssh_session_closed".to_string())?;
+    result
+        .await
+        .map_err(|_| "sftp_session_closed".to_string())?
+}
+
 #[cfg(test)]
 mod tests {
-    use super::encode_validated_private_key_credential;
+    use super::{encode_validated_private_key_credential, sanitize_diagnostic_code};
     use russh::keys::decode_secret_key;
 
     const TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
@@ -460,6 +667,22 @@ MC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\n\
                 None,
             ),
             Err("ssh_public_key_invalid".to_string()),
+        );
+    }
+
+    #[test]
+    fn diagnostic_code_keeps_only_a_bounded_ssh_error_identifier() {
+        assert_eq!(
+            sanitize_diagnostic_code("ssh_session_already_exists"),
+            "ssh_session_already_exists"
+        );
+        assert_eq!(
+            sanitize_diagnostic_code("ssh_transport_failed:password=secret"),
+            "ssh_transport_failed"
+        );
+        assert_eq!(
+            sanitize_diagnostic_code("Error: unexpected IPC failure"),
+            "ssh_start_failed"
         );
     }
 }

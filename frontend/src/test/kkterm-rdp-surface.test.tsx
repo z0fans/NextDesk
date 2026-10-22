@@ -32,6 +32,10 @@ const server: ServerEntry = {
   groupId: 'default',
   isFavorite: false,
   colorTag: '',
+  routePolicy: 'auto',
+  networkRoutePreferences: {
+    '0123456789abcdef0123456789abcdef': 'cloud_only',
+  },
 };
 
 describe('KktermRdpSurface', () => {
@@ -103,9 +107,47 @@ describe('KktermRdpSurface', () => {
           desktopWidth: 1600,
           desktopHeight: 900,
           scaleFactor: window.devicePixelRatio || 1,
+          routePolicy: 'auto',
+          networkRoutePreferences: server.networkRoutePreferences,
         }),
       });
     });
+  });
+
+  it('preserves structured startup report ownership through its error callback', async () => {
+    const failure = { message: 'authentication rejected', outcomeReported: true };
+    const onError = vi.fn();
+    invokeMock.mockImplementation((command: string) => command === 'kkterm_rdp_start'
+      ? Promise.reject(failure) : Promise.resolve());
+    render(<KktermRdpSurface tabId="tab-public" server={server} active cadSignal={0}
+      onConnected={vi.fn()} onDisconnected={vi.fn()} onError={onError} />);
+    await waitFor(() => expect(onError).toHaveBeenCalledExactlyOnceWith('tab-public', failure));
+  });
+
+  it('supports a one-attempt direct override without mutating the saved server', async () => {
+    render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1600, height: 900 }}
+        cadSignal={0}
+        routePolicy="direct"
+        onConnected={vi.fn()}
+        onDisconnected={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith('kkterm_rdp_start', {
+        request: expect.objectContaining({
+          routePolicy: 'direct',
+          networkRoutePreferences: undefined,
+        }),
+      });
+    });
+    expect(server.routePolicy).toBe('auto');
   });
 
   it('starts one native RDP session under React StrictMode', async () => {
@@ -1414,6 +1456,52 @@ describe('KktermRdpSurface', () => {
 
     expect(onError).toHaveBeenCalledTimes(1);
     expect(onDisconnected).not.toHaveBeenCalled();
+  });
+
+  it('reports the first rendered bitmap to the parent', async () => {
+    const canvasEventHandlers: Array<(event: { payload: unknown }) => void> = [];
+    listenMock.mockImplementation((_eventName: string, handler: (event: { payload: unknown }) => void) => {
+      canvasEventHandlers.push(handler);
+      return Promise.resolve(() => undefined);
+    });
+    const onFirstFrame = vi.fn();
+
+    render(
+      <KktermRdpSurface
+        tabId="tab-public"
+        server={server}
+        active={true}
+        desktopSize={{ width: 1280, height: 800 }}
+        cadSignal={0}
+        winSignal={0}
+        textSignal={null}
+        onConnected={vi.fn()}
+        onFirstFrame={onFirstFrame}
+        onDisconnected={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(canvasEventHandlers.length).toBe(1);
+    });
+    const [emitCanvasEvent] = canvasEventHandlers;
+
+    act(() => {
+      emitCanvasEvent({
+        payload: {
+          kind: 'rawImage',
+          sessionId: 'rdp-tab-public',
+          x: 0,
+          y: 0,
+          width: 1,
+          height: 1,
+          rgba: btoa(String.fromCharCode(0, 0, 0, 255)),
+        },
+      });
+    });
+
+    expect(onFirstFrame).toHaveBeenCalledWith('tab-public');
   });
 
   it('applies KKTerm cursor bitmap events to the canvas cursor', async () => {

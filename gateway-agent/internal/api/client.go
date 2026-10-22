@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"nextdesk/gateway-agent/internal/probe"
 )
 
 type Client struct {
@@ -24,16 +26,37 @@ type PollResponse struct {
 }
 
 type Task struct {
-	Action     string   `json:"action"`
-	BindingID  string   `json:"binding_id"`
-	ListenPort int      `json:"listen_port"`
-	TargetHost string   `json:"target_host"`
-	TargetPort int      `json:"target_port"`
-	Protocols  []string `json:"protocols"`
-	ExpiresAt  string   `json:"expires_at"`
+	Action     string      `json:"action"`
+	BindingID  string      `json:"binding_id"`
+	ListenPort int         `json:"listen_port"`
+	TargetHost string      `json:"target_host"`
+	TargetPort int         `json:"target_port"`
+	Protocols  []string    `json:"protocols"`
+	ExpiresAt  string      `json:"expires_at"`
+	Probe      *probe.Task `json:"probe,omitempty"`
 }
 
-const agentVersion = "0.2.0"
+type HeartbeatConfig struct {
+	ProbeTaskKey string `json:"probe_task_key"`
+}
+
+type heartbeatResponse struct {
+	Data struct {
+		Status       string `json:"status"`
+		ProbeTaskKey string `json:"probe_task_key"`
+	} `json:"data"`
+}
+
+const agentVersion = "0.4.0"
+
+func AgentCapabilities() map[string]any {
+	return map[string]any{
+		"schema_version":       1,
+		"task_types":           []string{"create_binding", "delete_binding", "probe_target", "cancel_probe"},
+		"forwarding_protocols": []string{"tcp", "udp"},
+		"features":             []string{"heartbeat_capabilities", "target_probe_v1"},
+	}
+}
 
 func New(baseURL, agentID, agentToken string) Client {
 	return Client{
@@ -44,11 +67,14 @@ func New(baseURL, agentID, agentToken string) Client {
 	}
 }
 
-func (c Client) Heartbeat(metrics map[string]any) error {
-	return c.post("/api/v1/connect/agent/heartbeat", map[string]any{
-		"version": agentVersion,
-		"metrics": metrics,
-	}, nil)
+func (c Client) Heartbeat(metrics map[string]any) (HeartbeatConfig, error) {
+	var response heartbeatResponse
+	err := c.post("/api/v1/connect/agent/heartbeat", map[string]any{
+		"version":      agentVersion,
+		"metrics":      metrics,
+		"capabilities": AgentCapabilities(),
+	}, &response)
+	return HeartbeatConfig{ProbeTaskKey: response.Data.ProbeTaskKey}, err
 }
 
 func (c Client) Poll() ([]Task, error) {
@@ -66,6 +92,10 @@ func (c Client) Ack(bindingID, status, code, message string) error {
 		"error_code":    code,
 		"error_message": message,
 	}, nil)
+}
+
+func (c Client) ProbeResult(result probe.Result) error {
+	return c.post("/api/v1/connect/agent/probe-result", result, nil)
 }
 
 func bindingIDStatus(status string) string {

@@ -3,6 +3,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::sftp::SftpControl;
+use super::types::SshMonitorSnapshot;
 
 pub enum SshControl {
     Input(Vec<u8>),
@@ -13,6 +14,9 @@ pub enum SshControl {
         pixel_height: u16,
     },
     Sftp(SftpControl),
+    Monitor {
+        reply: tokio::sync::oneshot::Sender<Result<SshMonitorSnapshot, String>>,
+    },
     Close,
 }
 

@@ -16,6 +16,8 @@ pub struct ActiveCloudBinding {
     pub renew_at_ms: u128,
     pub renew_after_seconds: u64,
     pub reconnect_until_ms: u128,
+    pub policy_revision: Option<String>,
+    pub route_diagnostics: Option<crate::cloud_gateway::CloudRouteDiagnostics>,
 }
 
 impl ActiveCloudBinding {
@@ -48,6 +50,8 @@ impl ActiveCloudBinding {
             renew_at_ms,
             renew_after_seconds: response.renew_after_seconds,
             reconnect_until_ms: now + u128::from(response.reconnect_grace_seconds) * 1000,
+            policy_revision: response.policy_revision.clone(),
+            route_diagnostics: response.route_diagnostics.clone(),
         }
     }
 
@@ -59,6 +63,19 @@ impl ActiveCloudBinding {
             route_label: "cloud".to_string(),
             force_direct: true,
             route_lease_id: 0,
+            policy_revision: self.policy_revision.clone(),
+            route_diagnostics: self.route_diagnostics.clone(),
+            network_scope_id: self
+                .route_diagnostics
+                .as_ref()
+                .map(|diagnostics| {
+                    diagnostics
+                        .client_network
+                        .network_scope_id
+                        .trim()
+                        .to_string()
+                })
+                .filter(|scope| !scope.is_empty()),
         }
     }
 }
@@ -132,7 +149,9 @@ mod tests {
             expires_at: expires_at.format(&Rfc3339).unwrap(),
             renew_after_seconds: 60,
             reconnect_grace_seconds: 120,
+            policy_revision: Some("routing-test-v1".to_string()),
             status: Some("active".to_string()),
+            route_diagnostics: None,
         };
 
         let binding = ActiveCloudBinding::from_response("203.0.113.10", 3389, &response);

@@ -1,7 +1,8 @@
+import { readRdpFailure } from '@/rdp/connection-outcomes';
 import { listen } from '@tauri-apps/api/event';
 import { readText as readClipboardText } from '@tauri-apps/plugin-clipboard-manager';
 import { useEffect, useRef } from 'react';
-import type { ServerEntry } from '@/lib/rdp-types';
+import type { RdpRoutePolicy, ServerEntry } from '@/lib/rdp-types';
 import type { ConnectionRoute } from '@/api';
 import { cn } from '@/lib/utils';
 import { rdpLog } from '@/lib/rdp-logger';
@@ -77,10 +78,13 @@ type KktermRdpSurfaceProps = {
   textSignal?: KktermTextSignal | null;
   desktopSize?: { width: number; height: number } | null;
   reuseCloudBinding?: boolean;
+  routePolicy?: RdpRoutePolicy;
+  networkRoutePreferences?: Record<string, RdpRoutePolicy>;
   onConnected: (tabId: string, width?: number, height?: number) => void;
+  onFirstFrame?: (tabId: string) => void;
   onDisconnected: (tabId: string) => void;
-  onError: (tabId: string, message: string) => void;
-  onRouteSelected?: (tabId: string, routeLabel: ConnectionRoute, routeLeaseId: number) => void;
+  onError: (tabId: string, error: unknown) => void;
+  onRouteSelected?: (tabId: string, routeLabel: ConnectionRoute, routeLeaseId: number, networkScopeId?: string) => void;
   onCanvasRef?: (tabId: string, canvas: HTMLCanvasElement | null) => void;
 };
 
@@ -185,7 +189,10 @@ export function KktermRdpSurface({
   textSignal = null,
   desktopSize,
   reuseCloudBinding = false,
+  routePolicy,
+  networkRoutePreferences,
   onConnected,
+  onFirstFrame,
   onDisconnected,
   onError,
   onRouteSelected,
@@ -198,7 +205,7 @@ export function KktermRdpSurface({
   const sessionIdRef = useRef<string | null>(null);
   const buttonMaskRef = useRef(0);
   const composingRef = useRef(false);
-  const callbacksRef = useRef({ onConnected, onDisconnected, onError, onRouteSelected });
+  const callbacksRef = useRef({ onConnected, onFirstFrame, onDisconnected, onError, onRouteSelected });
   const lastCadSignalRef = useRef(cadSignal);
   const lastWinSignalRef = useRef(winSignal);
   const lastTextSignalSequenceRef = useRef(textSignal?.sequence ?? 0);
@@ -237,8 +244,8 @@ export function KktermRdpSurface({
   };
 
   useEffect(() => {
-    callbacksRef.current = { onConnected, onDisconnected, onError, onRouteSelected };
-  }, [onConnected, onDisconnected, onError, onRouteSelected]);
+    callbacksRef.current = { onConnected, onFirstFrame, onDisconnected, onError, onRouteSelected };
+  }, [onConnected, onFirstFrame, onDisconnected, onError, onRouteSelected]);
 
   useEffect(() => {
     keyboardModeRef.current = keyboardMode;
@@ -337,12 +344,13 @@ export function KktermRdpSurface({
       return delay;
     };
 
-    const failWithMessage = (message: string) => {
+    const failWithMessage = (error: unknown) => {
       if (disposed || connectFinished || timedOut) return;
       connectFinished = true;
       terminalErrorReported = true;
       clearConnectTimeout();
-      callbacksRef.current.onError(tabId, message);
+      const failure = readRdpFailure(error);
+      callbacksRef.current.onError(tabId, failure.outcomeReported ? failure : failure.message);
     };
 
     const startSession = async () => {
@@ -359,6 +367,10 @@ export function KktermRdpSurface({
             ...(desktopHeight ? { desktopHeight } : {}),
             scaleFactor: window.devicePixelRatio || 1,
             reuseCloudBinding,
+            routePolicy: routePolicy ?? server.routePolicy ?? 'auto',
+            networkRoutePreferences: routePolicy
+              ? networkRoutePreferences
+              : server.networkRoutePreferences,
           });
           routeLeaseId = response.routeLeaseId;
           if (disposed) {
@@ -366,16 +378,21 @@ export function KktermRdpSurface({
             return;
           }
           if (response?.routeLabel) {
-            callbacksRef.current.onRouteSelected?.(tabId, response.routeLabel, routeLeaseId);
+            callbacksRef.current.onRouteSelected?.(
+              tabId,
+              response.routeLabel,
+              routeLeaseId,
+              response.networkScopeId,
+            );
           }
           startCloudKeepalive();
           recoverKeyboardTargetSoon();
           return;
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
+          const { message } = readRdpFailure(error);
           const delay = nextStartupRetryDelay();
           if (delay === null || !isRetryableKktermStartupError(message)) {
-            failWithMessage(message);
+            failWithMessage(error);
             return;
           }
           await kktermRdpDisconnect({ tabId, routeLeaseId }).catch(() => undefined);
@@ -431,6 +448,7 @@ export function KktermRdpSurface({
       const clamped = new Uint8ClampedArray(expected);
       clamped.set(bytes.subarray(0, expected));
       ctx.putImageData(new ImageData(clamped, event.width, event.height), event.x, event.y);
+      callbacksRef.current.onFirstFrame?.(tabId);
     };
 
     void listen<KktermCanvasEvent>('kkterm-rdp-canvas-event', event => {
@@ -511,9 +529,13 @@ export function KktermRdpSurface({
     server.host,
     server.password,
     server.port,
+    server.networkRoutePreferences,
+    server.routePolicy,
     server.username,
     tabId,
+    networkRoutePreferences,
     reuseCloudBinding,
+    routePolicy,
   ]);
 
   useEffect(() => {

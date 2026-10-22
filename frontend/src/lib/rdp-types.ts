@@ -1,6 +1,7 @@
 import type { ConnectionRoute } from '@/api';
 
 export type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error' | 'reconnecting';
+export type RdpRoutePolicy = 'auto' | 'direct' | 'cloud_only';
 
 export interface ServerEntry {
   id: string;
@@ -14,6 +15,9 @@ export interface ServerEntry {
   groupId: string;
   isFavorite: boolean;
   colorTag: string;
+  routePolicy?: RdpRoutePolicy;
+  networkRoutePreferences?: Record<string, RdpRoutePolicy>;
+  lastNetworkScopeId?: string;
 }
 
 export interface ServerGroup {

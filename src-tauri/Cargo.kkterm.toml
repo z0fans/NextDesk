@@ -1,6 +1,6 @@
 [package]
 name = "nextdesk"
-version = "1.0.128"
+version = "1.0.135"
 edition = "2021"
 
 [features]
@@ -56,6 +56,7 @@ rustls = { version = "0.23", features = ["ring"] }
 # Keep this in lockstep with Cargo.toml so KKTerm release builds expose the
 # same unified russh engine and OS credential-vault behavior.
 russh = { version = "=0.56.0", default-features = false, features = ["ring"] }
+russh-sftp = "=2.3.0"
 keyring-core = "1.0.0"
 
 [lints.rust]

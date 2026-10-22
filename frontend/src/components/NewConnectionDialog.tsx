@@ -3,7 +3,7 @@ import { Monitor, X, ChevronDown, Check, Eye, EyeOff } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import type { SessionStore } from '@/lib/useSessionStore';
-import type { ServerEntry } from '@/lib/rdp-types';
+import type { RdpRoutePolicy, ServerEntry } from '@/lib/rdp-types';
 import { useTranslation } from '@/i18n/useTranslation';
 
 interface Props {
@@ -25,6 +25,12 @@ export function NewConnectionDialog({ store, open, onClose, onSaved, editServer 
   const [password, setPassword] = useState(editServer?.password || '');
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [domain, setDomain] = useState(editServer?.domain || '');
+  const currentNetworkScope = editServer?.lastNetworkScopeId;
+  const [routePolicy, setRoutePolicy] = useState<RdpRoutePolicy>(
+    (currentNetworkScope ? editServer?.networkRoutePreferences?.[currentNetworkScope] : undefined)
+      ?? editServer?.routePolicy
+      ?? 'auto',
+  );
 
   const [groupId, setGroupId] = useState(editServer?.groupId || 'default');
   const [colorTag, setColorTag] = useState(editServer?.colorTag || COLOR_TAGS[0]);
@@ -34,13 +40,18 @@ export function NewConnectionDialog({ store, open, onClose, onSaved, editServer 
 
   const handleSave = (connect: boolean) => {
     if (!host || !username) return;
+    const networkRoutePreferences = currentNetworkScope
+      ? { ...editServer?.networkRoutePreferences, [currentNetworkScope]: routePolicy }
+      : editServer?.networkRoutePreferences;
+    const savedRoutePolicy = currentNetworkScope ? (editServer?.routePolicy ?? 'auto') : routePolicy;
     if (isEdit) {
       store.updateServer(editServer.id, {
         name: name || host, host,
         port: parseInt(port) || 3389,
         username, password, domain,
 
-        groupId, colorTag,
+        groupId, colorTag, routePolicy: savedRoutePolicy, networkRoutePreferences,
+        lastNetworkScopeId: currentNetworkScope,
       });
       onSaved(editServer.id, connect);
     } else {
@@ -50,7 +61,8 @@ export function NewConnectionDialog({ store, open, onClose, onSaved, editServer 
         username, password, domain,
 
 
-        groupId, isFavorite: false, colorTag,
+        groupId, isFavorite: false, colorTag, routePolicy: savedRoutePolicy,
+        networkRoutePreferences, lastNetworkScopeId: currentNetworkScope,
       });
       onSaved(server.id, connect);
     }
@@ -113,6 +125,21 @@ export function NewConnectionDialog({ store, open, onClose, onSaved, editServer 
               </div>
             </Field>
           </div>
+
+          <Field label={t('rdpRoutePolicy')}>
+            <select
+              value={routePolicy}
+              onChange={event => setRoutePolicy(event.target.value as RdpRoutePolicy)}
+              className="h-8 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring/50"
+            >
+              <option value="auto">{t('rdpRouteAuto')}</option>
+              <option value="direct">{t('rdpRouteDirect')}</option>
+              <option value="cloud_only">{t('rdpRouteCloudOnly')}</option>
+            </select>
+            {currentNetworkScope && (
+              <span className="mt-1 block text-[11px] text-muted-foreground">{t('rdpRouteCurrentNetworkHint')}</span>
+            )}
+          </Field>
           <div className="grid grid-cols-2 gap-3">
             <Field label={t('rdpDomain')}>
               <Input placeholder={t('rdpOptional')} value={domain} onChange={e => setDomain(e.target.value)} className="h-8 text-sm" />
@@ -174,6 +201,11 @@ function GroupSelect({ groups, value, onChange }: {
   }, [open]);
 
   const selected = groups.find(g => g.id === value);
+  const selectedName = selected
+    ? selected.id === 'default'
+      ? t('rdpServers')
+      : selected.name
+    : t('rdpSelect');
 
   return (
     <div ref={ref} className="relative">
@@ -182,7 +214,7 @@ function GroupSelect({ groups, value, onChange }: {
         onClick={() => setOpen(o => !o)}
         className="flex h-8 w-full items-center justify-between rounded-md border border-input bg-transparent px-3 text-sm transition-colors hover:border-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-ring"
       >
-        <span className="truncate">{selected?.name ?? t('rdpSelect')}</span>
+        <span className="truncate">{selectedName}</span>
         <ChevronDown className={`h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform ${open ? 'rotate-180' : ''}`} />
       </button>
       {open && (
@@ -196,7 +228,7 @@ function GroupSelect({ groups, value, onChange }: {
                 className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm transition-colors hover:bg-accent hover:text-accent-foreground ${g.id === value ? 'text-foreground' : 'text-muted-foreground'}`}
               >
                 <Check className={`h-3.5 w-3.5 shrink-0 ${g.id === value ? 'opacity-100' : 'opacity-0'}`} />
-                <span className="truncate">{g.name}</span>
+                <span className="truncate">{g.id === 'default' ? t('rdpServers') : g.name}</span>
               </button>
             ))}
           </div>

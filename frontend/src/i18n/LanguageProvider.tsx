@@ -14,8 +14,18 @@ interface LanguageProviderProps {
   children: ReactNode;
 }
 
+function initialLanguage(): Language {
+  try {
+    const savedLang = localStorage.getItem('nextdesk-language') as Language | null;
+    if (savedLang === 'zh-CN' || savedLang === 'en-US') return savedLang;
+  } catch {
+    // Fall back to the browser locale when storage is unavailable.
+  }
+  return navigator.language.startsWith('zh') ? 'zh-CN' : 'en-US';
+}
+
 export function LanguageProvider({ children }: LanguageProviderProps) {
-  const [language, setLanguageState] = useState<Language>('en-US');
+  const [language, setLanguageState] = useState<Language>(initialLanguage);
 
   useEffect(() => {
     const initLanguage = async () => {

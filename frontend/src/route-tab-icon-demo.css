@@ -1,0 +1,34 @@
+body { background: #f7f9fc; color: #0f172a; }
+#root { height: auto; min-height: 100vh; overflow: auto; }
+main { width: 920px; margin: 0 auto; padding: 52px 40px; }
+header { margin-bottom: 28px; }
+h1 { font-size: 24px; line-height: 1.25; letter-spacing: -0.02em; }
+header p { margin-top: 8px; color: #64748b; font-size: 14px; }
+section { margin-top: 16px; padding: 22px; border: 1px solid #e2e8f0; border-radius: 14px; background: #fff; }
+section.recommended { border-color: #bfdbfe; box-shadow: 0 8px 28px rgba(59, 130, 246, 0.08); }
+.heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 18px; }
+.heading strong { font-size: 14px; }
+.heading p { max-width: 360px; color: #64748b; font-size: 12px; text-align: right; }
+.badge { margin-left: 8px; padding: 2px 7px; border-radius: 999px; background: #eff6ff; color: #2563eb; font-size: 10px; font-weight: 600; }
+.tabbar { display: flex; align-items: center; gap: 4px; height: 54px; padding: 6px 8px; border-bottom: 2px solid #dbeafe; background: #fff; }
+.tabbar.wide .tab { min-width: 235px; }
+.tab { display: flex; align-items: center; max-width: 260px; height: 40px; padding: 0 9px 0 11px; border-radius: 11px; color: #64748b; }
+.tab.active { background: #f1f5f9; color: #0f172a; }
+.route-icon { display: grid; place-items: center; flex: 0 0 auto; width: 22px; height: 22px; margin-right: 8px; border-radius: 7px; }
+.route-icon.lan { background: #ecfdf5; color: #059669; }
+.route-icon.direct { background: #f0fdf4; color: #16a34a; }
+.route-icon.cloud { background: #eef2ff; color: #6366f1; }
+.icon { width: 14px; height: 14px; }
+.name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
+.route-label { flex: 0 0 auto; margin-left: 8px; padding: 2px 6px; border-radius: 999px; font-size: 9px; font-weight: 600; }
+.route-label.lan { background: #ecfdf5; color: #047857; }
+.route-label.direct { background: #f0fdf4; color: #15803d; }
+.route-label.cloud { background: #eef2ff; color: #4f46e5; }
+button { display: grid; place-items: center; margin-left: 9px; border: 0; background: transparent; color: #94a3b8; }
+.close { width: 14px; height: 14px; }
+.legend { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.legend > div { display: grid; grid-template-columns: auto 1fr; grid-template-rows: auto auto; align-items: center; padding: 14px; border-radius: 10px; background: #f8fafc; }
+.legend .route-icon { grid-row: 1 / 3; }
+.legend b { font-size: 13px; }
+.legend small { margin-top: 2px; color: #64748b; font-size: 10px; }
+footer { padding: 18px 4px 0; color: #64748b; font-size: 12px; text-align: center; }

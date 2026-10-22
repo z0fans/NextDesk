@@ -5,14 +5,22 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { useTranslation } from '@/i18n/useTranslation';
 import { cn } from '@/lib/utils';
+import { SSH_DEFAULT_GROUP_ID } from './connection-store';
 import { sshApi } from './ssh-api';
-import type { SshAuthMethod, SshConnection, SshRoutePolicy } from './types';
+import type {
+  SshAuthMethod,
+  SshConnection,
+  SshConnectionGroup,
+  SshProxyType,
+  SshRoutePolicy,
+} from './types';
 
 interface NewSshConnectionDialogProps {
   open: boolean;
   onClose: () => void;
   onCreated: (connection: SshConnection) => void;
   onUpdated: (connection: SshConnection) => void;
+  groups: SshConnectionGroup[];
   editConnection?: SshConnection | null;
 }
 
@@ -26,6 +34,7 @@ export function NewSshConnectionDialog({
   onClose,
   onCreated,
   onUpdated,
+  groups,
   editConnection,
 }: NewSshConnectionDialogProps) {
   const { t } = useTranslation();
@@ -33,6 +42,7 @@ export function NewSshConnectionDialog({
   const [host, setHost] = useState(editConnection?.host ?? '');
   const [port, setPort] = useState(String(editConnection?.port ?? 22));
   const [username, setUsername] = useState(editConnection?.username ?? 'root');
+  const [groupId, setGroupId] = useState(editConnection?.groupId ?? SSH_DEFAULT_GROUP_ID);
   const [authMethod, setAuthMethod] = useState<SshAuthMethod>(editConnection?.authMethod ?? 'password');
   const [secret, setSecret] = useState('');
   const [privateKeyLabel, setPrivateKeyLabel] = useState(
@@ -41,7 +51,18 @@ export function NewSshConnectionDialog({
   );
   const [privateKey, setPrivateKey] = useState('');
   const [publicKey, setPublicKey] = useState(editConnection?.publicKey ?? '');
-  const [routePolicy, setRoutePolicy] = useState<SshRoutePolicy>(editConnection?.routePolicy ?? 'auto');
+  const [notes, setNotes] = useState(editConnection?.notes ?? '');
+  const [proxyType, setProxyType] = useState<SshProxyType>(editConnection?.proxyType ?? 'none');
+  const [proxyHost, setProxyHost] = useState(editConnection?.proxyHost ?? '');
+  const [proxyPort, setProxyPort] = useState(String(editConnection?.proxyPort ?? 1080));
+  const [proxyUsername, setProxyUsername] = useState(editConnection?.proxyUsername ?? '');
+  const [proxyPassword, setProxyPassword] = useState('');
+  const currentNetworkScope = editConnection?.lastNetworkScopeId;
+  const [routePolicy, setRoutePolicy] = useState<SshRoutePolicy>(
+    (currentNetworkScope ? editConnection?.networkRoutePreferences?.[currentNetworkScope] : undefined)
+      ?? editConnection?.routePolicy
+      ?? 'auto',
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const isEdit = Boolean(editConnection);
@@ -66,6 +87,20 @@ export function NewSshConnectionDialog({
       parsedPort > 65535
     ) {
       setError(t('sshFormInvalid'));
+      return;
+    }
+    const parsedProxyPort = Number(proxyPort);
+    if (
+      proxyType !== 'none'
+      && (
+        !proxyHost.trim()
+        || proxyHost.trim().split('').some((character) => /\s/.test(character))
+        || !Number.isInteger(parsedProxyPort)
+        || parsedProxyPort < 1
+        || parsedProxyPort > 65535
+      )
+    ) {
+      setError(t('sshProxyInvalid'));
       return;
     }
     if (authMethod === 'password' && !secret && !canReuseCredential) {
@@ -131,6 +166,16 @@ export function NewSshConnectionDialog({
           }
         }
       }
+      let proxyCredentialReference = proxyType === 'none'
+        ? undefined
+        : editConnection?.proxyCredentialReference;
+      if (proxyType !== 'none' && proxyPassword) {
+        proxyCredentialReference = `ssh-proxy-${id}-${newConnectionId()}`;
+        await sshApi.storeCredential(proxyCredentialReference, proxyPassword);
+      }
+      const networkRoutePreferences = currentNetworkScope
+        ? { ...editConnection?.networkRoutePreferences, [currentNetworkScope]: routePolicy }
+        : editConnection?.networkRoutePreferences;
       const savedConnection: SshConnection = {
         id,
         name: name.trim() || host.trim(),
@@ -138,14 +183,24 @@ export function NewSshConnectionDialog({
         port: parsedPort,
         username: username.trim(),
         authMethod,
+        groupId,
         credentialReference,
         privateKeyLabel: authMethod === 'private_key' ? privateKeyLabel.trim() : undefined,
         publicKey: authMethod === 'private_key' && publicKey.trim() ? publicKey.trim() : undefined,
         privateKeyPath: authMethod === 'private_key' && !privateKey.trim()
           ? editConnection?.privateKeyPath
           : undefined,
-        routePolicy,
+        routePolicy: currentNetworkScope ? (editConnection?.routePolicy ?? 'auto') : routePolicy,
+        networkRoutePreferences,
+        lastNetworkScopeId: currentNetworkScope,
         preferredRegion: editConnection?.preferredRegion,
+        notes: notes.trim() || undefined,
+        detectedOs: editConnection?.detectedOs,
+        proxyType,
+        proxyHost: proxyType === 'none' ? undefined : proxyHost.trim(),
+        proxyPort: proxyType === 'none' ? undefined : parsedProxyPort,
+        proxyUsername: proxyType === 'none' ? undefined : proxyUsername.trim() || undefined,
+        proxyCredentialReference,
       };
       if (editConnection) {
         onUpdated(savedConnection);
@@ -182,6 +237,25 @@ export function NewSshConnectionDialog({
           <label className="space-y-1.5 sm:col-span-2">
             <span className="text-xs font-medium text-muted-foreground">{t('sshName')}</span>
             <Input value={name} onChange={(event) => setName(event.target.value)} placeholder={t('sshNamePlaceholder')} />
+          </label>
+          <label className="space-y-1.5 sm:col-span-2">
+            <span className="text-xs font-medium text-muted-foreground">{t('sshGroup')}</span>
+            <select
+              value={groupId}
+              onChange={(event) => setGroupId(event.target.value)}
+              className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring/50"
+            >
+              {groups.map((group) => (
+                <option key={group.id} value={group.id}>
+                  {group.id === SSH_DEFAULT_GROUP_ID ? t('sshDefaultGroup') : group.name}
+                </option>
+              ))}
+            </select>
+            {currentNetworkScope && (
+              <span className="block text-[11px] text-muted-foreground">
+                {t('sshRouteCurrentNetworkHint')}
+              </span>
+            )}
           </label>
           <label className="space-y-1.5">
             <span className="text-xs font-medium text-muted-foreground">{t('sshHost')}</span>
@@ -301,6 +375,16 @@ export function NewSshConnectionDialog({
           )}
 
           <label className="space-y-1.5 sm:col-span-2">
+            <span className="text-xs font-medium text-muted-foreground">{t('sshNotes')}</span>
+            <textarea
+              value={notes}
+              onChange={(event) => setNotes(event.target.value.slice(0, 2000))}
+              placeholder={t('sshNotesPlaceholder')}
+              className="min-h-20 w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground shadow-xs outline-none transition-[color,box-shadow] placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+            />
+          </label>
+
+          <label className="space-y-1.5 sm:col-span-2">
             <span className="text-xs font-medium text-muted-foreground">{t('sshRoutePolicy')}</span>
             <select
               value={routePolicy}
@@ -311,7 +395,54 @@ export function NewSshConnectionDialog({
               <option value="direct">{t('sshRouteDirect')}</option>
               <option value="cloud_only">{t('sshRouteCloudOnly')}</option>
             </select>
+            {currentNetworkScope && (
+              <span className="block text-[11px] text-muted-foreground">
+                {t('sshRouteCurrentNetworkHint')}
+              </span>
+            )}
           </label>
+
+          <fieldset className="grid gap-3 rounded-lg border border-border bg-muted/15 p-4 sm:col-span-2 sm:grid-cols-2">
+            <legend className="px-1 text-xs font-medium text-muted-foreground">{t('sshProxy')}</legend>
+            <label className="space-y-1.5 sm:col-span-2">
+              <span className="text-xs font-medium text-muted-foreground">{t('sshProxyType')}</span>
+              <select
+                value={proxyType}
+                onChange={(event) => {
+                  const nextType = event.target.value as SshProxyType;
+                  setProxyType(nextType);
+                  if (nextType === 'http' && (!editConnection?.proxyPort || editConnection.proxyType !== 'http')) setProxyPort('8080');
+                  if (nextType === 'socks5' && (!editConnection?.proxyPort || editConnection.proxyType !== 'socks5')) setProxyPort('1080');
+                }}
+                className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground outline-none focus:ring-2 focus:ring-ring/50"
+              >
+                <option value="none">{t('sshProxyNone')}</option>
+                <option value="socks5">SOCKS5</option>
+                <option value="http">HTTP CONNECT</option>
+              </select>
+            </label>
+            {proxyType !== 'none' && (
+              <>
+                <label className="space-y-1.5">
+                  <span className="text-xs font-medium text-muted-foreground">{t('sshProxyHost')}</span>
+                  <Input value={proxyHost} onChange={(event) => setProxyHost(event.target.value)} placeholder="127.0.0.1" />
+                </label>
+                <label className="space-y-1.5">
+                  <span className="text-xs font-medium text-muted-foreground">{t('port')}</span>
+                  <Input type="number" min={1} max={65535} value={proxyPort} onChange={(event) => setProxyPort(event.target.value)} />
+                </label>
+                <label className="space-y-1.5">
+                  <span className="text-xs font-medium text-muted-foreground">{t('sshProxyUsername')}</span>
+                  <Input value={proxyUsername} onChange={(event) => setProxyUsername(event.target.value)} autoComplete="off" />
+                </label>
+                <label className="space-y-1.5">
+                  <span className="text-xs font-medium text-muted-foreground">{t('sshProxyPassword')}</span>
+                  <Input type="password" value={proxyPassword} onChange={(event) => setProxyPassword(event.target.value)} placeholder={editConnection?.proxyCredentialReference ? t('sshKeepSavedCredential') : undefined} autoComplete="new-password" />
+                </label>
+                <p className="text-[11px] leading-5 text-muted-foreground sm:col-span-2">{t('sshProxyHint')}</p>
+              </>
+            )}
+          </fieldset>
 
           <div className="flex items-center gap-2 rounded-md border border-emerald-500/20 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-600 sm:col-span-2 dark:text-emerald-400">
             <ShieldCheck className="h-4 w-4 shrink-0" />

@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, type SetStateAction } from 'react';
-import type { ServerEntry, ServerGroup, SessionTab, ViewMode, ConnectionState } from './rdp-types';
+import type { ServerEntry, ServerGroup, SessionTab, ViewMode, ConnectionState, RdpRoutePolicy } from './rdp-types';
 
 function uid() {
   return crypto.randomUUID();
@@ -30,6 +30,33 @@ function saveToStorage<T>(key: string, data: T) {
   } catch (e) {
     console.warn('[store] failed to save:', e);
   }
+}
+
+function normalizeRoutePolicy(value: unknown): RdpRoutePolicy {
+  return value === 'direct' || value === 'cloud_only' ? value : 'auto';
+}
+
+function normalizeServers(value: unknown): ServerEntry[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((server): server is ServerEntry => Boolean(server && typeof server === 'object'))
+    .map((server) => {
+      const preferences = Object.fromEntries(
+        Object.entries(server.networkRoutePreferences ?? {})
+          .filter(([scope, policy]) => /^[a-f0-9]{16,64}$/i.test(scope)
+            && (policy === 'auto' || policy === 'direct' || policy === 'cloud_only'))
+          .slice(0, 32),
+      ) as Record<string, RdpRoutePolicy>;
+      return {
+        ...server,
+        routePolicy: normalizeRoutePolicy(server.routePolicy),
+        networkRoutePreferences: Object.keys(preferences).length > 0 ? preferences : undefined,
+        lastNetworkScopeId: typeof server.lastNetworkScopeId === 'string'
+          && /^[a-f0-9]{16,64}$/i.test(server.lastNetworkScopeId)
+          ? server.lastNetworkScopeId
+          : undefined,
+      };
+    });
 }
 
 export function useFolderSharingSetting() {
@@ -82,7 +109,7 @@ export function useFolderSharingSetting() {
 
 export function useSessionStore() {
   const [groups, setGroups] = useState<ServerGroup[]>(() => loadFromStorage(GROUPS_KEY, DEFAULT_GROUPS));
-  const [servers, setServers] = useState<ServerEntry[]>(() => loadFromStorage(STORAGE_KEY, []));
+  const [servers, setServers] = useState<ServerEntry[]>(() => normalizeServers(loadFromStorage(STORAGE_KEY, [])));
   const [tabs, setTabs] = useState<SessionTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('tab');

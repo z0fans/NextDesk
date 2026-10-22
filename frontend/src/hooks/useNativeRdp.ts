@@ -187,7 +187,7 @@ interface UseNativeRdpOptions {
   tabId: string | null;
   canvas: HTMLCanvasElement | null;
   onFrame?: (frame?: NativeBitmapFrameInfo) => void;
-  onStatus?: (tabId: string, status: string, message?: string) => void;
+  onStatus?: (event: RdpStatusEvent) => void;
 }
 
 interface NativeFrameDebugContext {
@@ -743,7 +743,7 @@ export function useNativeRdp({
     const setupStatusListener = async () => {
       const unStatus = await listen<RdpStatusEvent>('rdp://status', (e) => {
         const s = e.payload;
-        onStatusRef.current?.(s.tab_id, s.status, s.message ?? undefined);
+        onStatusRef.current?.(s);
       });
       if (disposed) {
         unStatus();

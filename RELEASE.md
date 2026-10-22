@@ -103,7 +103,8 @@ The tag push triggers `.github/workflows/build.yml` (`Build & Release`). The wor
 5. publishes artifacts to the matching GitHub Release.
 
 Use `workflow_dispatch` for packaging tests without creating a tag. It can target all
-platforms, macOS universal, macOS Intel, or Windows.
+platforms, macOS universal, macOS Intel, or Windows. Manual runs upload candidate
+installers as workflow artifacts; only tag pushes create or update a GitHub Release.
 
 ## 5. Verify Published Assets
 

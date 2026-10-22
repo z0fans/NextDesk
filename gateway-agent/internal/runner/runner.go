@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"runtime"
@@ -11,6 +12,7 @@ import (
 
 	"nextdesk/gateway-agent/internal/api"
 	"nextdesk/gateway-agent/internal/config"
+	"nextdesk/gateway-agent/internal/probe"
 	"nextdesk/gateway-agent/internal/realm"
 )
 
@@ -18,6 +20,7 @@ type Runner struct {
 	Config  config.Config
 	Client  api.Client
 	Profile realm.Profile
+	Probes  *probe.Executor
 }
 
 func New(cfg config.Config, dryRun bool) (Runner, error) {
@@ -29,10 +32,17 @@ func New(cfg config.Config, dryRun bool) (Runner, error) {
 		Config:  cfg,
 		Client:  api.New(cfg.BaseURL, cfg.AgentID, cfg.AgentToken),
 		Profile: profile,
+		Probes: probe.NewExecutor(cfg.AgentID, probe.Policy{
+			AllowedPorts:      cfg.ProbeAllowedPortSet(),
+			MaxConcurrency:    cfg.ProbeMaxConcurrency,
+			Timeout:           time.Duration(cfg.ProbeTimeoutSeconds) * time.Second,
+			MinTargetInterval: time.Duration(cfg.ProbeTargetMinIntervalMillis) * time.Millisecond,
+			CacheTTL:          time.Duration(cfg.ProbeCacheSeconds) * time.Second,
+		}),
 	}, nil
 }
 
-func (r Runner) Run(ctx context.Context) error {
+func (r *Runner) Run(ctx context.Context) error {
 	ticker := time.NewTicker(r.Config.PollInterval())
 	defer ticker.Stop()
 	for {
@@ -47,7 +57,7 @@ func (r Runner) Run(ctx context.Context) error {
 	}
 }
 
-func (r Runner) Once() error {
+func (r *Runner) Once() error {
 	removed, err := realm.CleanupExpired(r.Profile, time.Now())
 	if err != nil {
 		log.Printf("gateway-agent local expiry cleanup failed: %v", err)
@@ -58,7 +68,8 @@ func (r Runner) Once() error {
 	if err := realm.Reconcile(r.Profile); err != nil {
 		log.Printf("gateway-agent reconcile failed: %v", err)
 	}
-	if err := r.Client.Heartbeat(r.metrics()); err != nil {
+	heartbeat, err := r.Client.Heartbeat(r.metrics())
+	if err != nil {
 		return err
 	}
 	tasks, err := r.Client.Poll()
@@ -66,6 +77,24 @@ func (r Runner) Once() error {
 		return err
 	}
 	for _, task := range tasks {
+		if task.Action == "probe_target" {
+			if task.Probe == nil {
+				log.Printf("gateway-agent rejected malformed probe task")
+				continue
+			}
+			r.Probes.Submit(*task.Probe, heartbeat.ProbeTaskKey, func(result probe.Result) {
+				if err := r.Client.ProbeResult(result); err != nil {
+					log.Printf("gateway-agent probe result %s delivery failed: %v", result.ProbeID, err)
+				}
+			})
+			continue
+		}
+		if task.Action == "cancel_probe" {
+			if task.Probe != nil && !r.Probes.Cancel(task.Probe.ProbeID) {
+				log.Printf("gateway-agent probe %s was not active when cancellation arrived", task.Probe.ProbeID)
+			}
+			continue
+		}
 		if err := r.apply(task); err != nil {
 			if task.Action == "delete_binding" {
 				log.Printf("gateway-agent delete binding %s failed: %v", task.BindingID, err)
@@ -84,7 +113,7 @@ func (r Runner) Once() error {
 	return nil
 }
 
-func (r Runner) metrics() map[string]any {
+func (r *Runner) metrics() map[string]any {
 	metrics := map[string]any{
 		"profile":         r.Profile.Name,
 		"active_bindings": realm.CountRules(r.Profile),
@@ -119,9 +148,12 @@ func (r Runner) metrics() map[string]any {
 	return metrics
 }
 
-func (r Runner) apply(task api.Task) error {
+func (r *Runner) apply(task api.Task) error {
 	if task.Action == "delete_binding" {
 		return realm.Delete(r.Profile, task.BindingID)
+	}
+	if task.Action != "create_binding" {
+		return fmt.Errorf("unsupported binding action %q", task.Action)
 	}
 	return realm.Apply(r.Profile, realm.Rule{
 		BindingID:  task.BindingID,

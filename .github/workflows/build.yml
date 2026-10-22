@@ -127,12 +127,25 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           args: --target universal-apple-darwin --features kkterm-rdp --config src-tauri/tauri.macos.conf.json
-          tagName: ${{ github.ref_name }}
+          tagName: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
           releaseName: "NextDesk ${{ github.ref_name }}"
           releaseBody: "See the assets below for download."
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
+
+      - name: Upload candidate installers
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextdesk-macos-universal-${{ github.sha }}
+          path: |
+            src-tauri/target/**/bundle/**/*.dmg
+            src-tauri/target/**/bundle/**/*.app.tar.gz
+            src-tauri/target/**/bundle/**/*.exe
+            src-tauri/target/**/bundle/**/*.sig
+          if-no-files-found: error
+
 
   build-macos-intel:
     needs: quality-gate
@@ -193,12 +206,25 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           args: --target x86_64-apple-darwin --features kkterm-rdp --config src-tauri/tauri.macos.conf.json
-          tagName: ${{ github.ref_name }}
+          tagName: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
           releaseName: "NextDesk ${{ github.ref_name }}"
           releaseBody: "See the assets below for download."
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
+
+      - name: Upload candidate installers
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextdesk-macos-intel-${{ github.sha }}
+          path: |
+            src-tauri/target/**/bundle/**/*.dmg
+            src-tauri/target/**/bundle/**/*.app.tar.gz
+            src-tauri/target/**/bundle/**/*.exe
+            src-tauri/target/**/bundle/**/*.sig
+          if-no-files-found: error
+
 
   build-windows:
     needs: [quality-gate, build-macos]
@@ -281,9 +307,21 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           args: --features kkterm-rdp --config src-tauri/tauri.windows.conf.json
-          tagName: ${{ github.ref_name }}
+          tagName: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
           releaseName: "NextDesk ${{ github.ref_name }}"
           releaseBody: "See the assets below for download."
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: ${{ env.HAS_TAURI_SIGNING_KEY == 'true' }}
+
+      - name: Upload candidate installers
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextdesk-windows-${{ github.sha }}
+          path: |
+            src-tauri/target/**/bundle/**/*.dmg
+            src-tauri/target/**/bundle/**/*.app.tar.gz
+            src-tauri/target/**/bundle/**/*.exe
+            src-tauri/target/**/bundle/**/*.sig
+          if-no-files-found: error

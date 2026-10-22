@@ -1,11 +1,22 @@
+use crate::cloud_gateway::CloudRouteDiagnostics;
 use crate::connection_resolver::RoutePolicy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SshAuthMethod {
     Password,
     PrivateKey,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SshProxyType {
+    #[default]
+    None,
+    Socks5,
+    Http,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,7 +133,21 @@ pub struct SshStartRequest {
     #[serde(default)]
     pub preferred_region: Option<String>,
     #[serde(default)]
+    pub network_route_preferences: HashMap<String, RoutePolicy>,
+    #[serde(default)]
     pub reuse_cloud_binding: bool,
+    #[serde(default)]
+    pub replace_existing: bool,
+    #[serde(default)]
+    pub proxy_type: SshProxyType,
+    #[serde(default)]
+    pub proxy_host: Option<String>,
+    #[serde(default)]
+    pub proxy_port: Option<u16>,
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    #[serde(default)]
+    pub proxy_credential_reference: Option<String>,
 }
 
 impl SshStartRequest {
@@ -182,11 +207,46 @@ impl SshStartRequest {
         {
             return Err("ssh_password_required".to_string());
         }
+        if self.proxy_type != SshProxyType::None {
+            let proxy_host = self
+                .proxy_host
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "ssh_proxy_host_required".to_string())?;
+            if proxy_host.len() > 255 || proxy_host.chars().any(char::is_whitespace) {
+                return Err("ssh_proxy_host_invalid".to_string());
+            }
+            if self.proxy_port.is_none_or(|port| port == 0) {
+                return Err("ssh_proxy_port_invalid".to_string());
+            }
+            if self
+                .proxy_username
+                .as_deref()
+                .is_some_and(|value| value.len() > 255)
+            {
+                return Err("ssh_proxy_username_invalid".to_string());
+            }
+            if self
+                .proxy_credential_reference
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty() || value.len() > 128)
+            {
+                return Err("ssh_proxy_credential_invalid".to_string());
+            }
+        }
         Ok(())
     }
 
     pub fn resolve_secret(&self) -> Result<Option<String>, String> {
         self.credential_reference
+            .as_deref()
+            .map(crate::credential_vault::load)
+            .transpose()
+    }
+
+    pub fn resolve_proxy_secret(&self) -> Result<Option<String>, String> {
+        self.proxy_credential_reference
             .as_deref()
             .map(crate::credential_vault::load)
             .transpose()
@@ -198,6 +258,46 @@ impl SshStartRequest {
 pub struct SshStartResponse {
     pub session_id: String,
     pub route_label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_diagnostics: Option<CloudRouteDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_scope_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SshMonitorProcess {
+    pub memory_bytes: u64,
+    pub cpu_percent: f64,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SshMonitorDisk {
+    pub path: String,
+    pub available_bytes: u64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SshMonitorSnapshot {
+    pub supported: bool,
+    pub platform: String,
+    pub uptime_seconds: u64,
+    pub load_average: [f64; 3],
+    pub cpu_percent: f64,
+    pub memory_used_bytes: u64,
+    pub memory_total_bytes: u64,
+    pub swap_used_bytes: u64,
+    pub swap_total_bytes: u64,
+    pub processes: Vec<SshMonitorProcess>,
+    pub network_interface: Option<String>,
+    pub network_receive_bytes_per_second: f64,
+    pub network_transmit_bytes_per_second: f64,
+    pub latency_ms: f64,
+    pub disks: Vec<SshMonitorDisk>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,8 +311,21 @@ pub struct SshHostKeyPreview {
     pub public_key: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SshKnownHostEntry {
+    pub host: String,
+    pub algorithm: String,
+    pub fingerprint: String,
+    pub public_key: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum SshEvent {
     State {
         session_id: String,
@@ -250,8 +363,19 @@ pub struct SshHostKeyTrustRequest {
     pub public_key: String,
 }
 
+fn session_id_is_valid(session_id: &str) -> bool {
+    !session_id.trim().is_empty() && session_id.len() <= 128
+}
+
+pub fn validate_ssh_session_id(session_id: &str) -> Result<(), String> {
+    if !session_id_is_valid(session_id) {
+        return Err("ssh_session_id_invalid".to_string());
+    }
+    Ok(())
+}
+
 pub fn validate_sftp_session_id(session_id: &str) -> Result<(), String> {
-    if session_id.trim().is_empty() || session_id.len() > 128 {
+    if !session_id_is_valid(session_id) {
         return Err("sftp_session_id_invalid".to_string());
     }
     Ok(())
@@ -391,6 +515,71 @@ pub struct SftpRemoveRequest {
     pub recursive: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpReadTextRequest {
+    pub session_id: String,
+    pub path: String,
+}
+
+impl SftpReadTextRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_sftp_session_id(&self.session_id)?;
+        validate_sftp_mutation_path(&self.path)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpReadTextResponse {
+    pub path: String,
+    pub content: String,
+    pub modified: Option<u64>,
+    pub permissions: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpWriteTextRequest {
+    pub session_id: String,
+    pub operation_id: String,
+    pub path: String,
+    pub content: String,
+}
+
+impl SftpWriteTextRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_sftp_session_id(&self.session_id)?;
+        validate_sftp_operation_id(&self.operation_id)?;
+        validate_sftp_mutation_path(&self.path)?;
+        if self.content.len() > 2 * 1024 * 1024 {
+            return Err("sftp_text_file_too_large".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpSetPermissionsRequest {
+    pub session_id: String,
+    pub operation_id: String,
+    pub path: String,
+    pub permissions: u32,
+}
+
+impl SftpSetPermissionsRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_sftp_session_id(&self.session_id)?;
+        validate_sftp_operation_id(&self.operation_id)?;
+        validate_sftp_mutation_path(&self.path)?;
+        if self.permissions > 0o7777 {
+            return Err("sftp_permissions_invalid".to_string());
+        }
+        Ok(())
+    }
+}
+
 impl SftpRemoveRequest {
     pub fn validate(&self) -> Result<(), String> {
         validate_sftp_session_id(&self.session_id)?;
@@ -407,6 +596,8 @@ pub struct SftpTransferRequest {
     pub local_path: String,
     pub remote_path: String,
     pub overwrite: bool,
+    #[serde(default)]
+    pub recursive: bool,
 }
 
 impl SftpTransferRequest {
@@ -471,9 +662,11 @@ mod tests {
     use super::{
         SftpCreateDirectoryRequest, SftpEntry, SftpEntryKind, SftpListRequest, SftpRemoveRequest,
         SftpRenameRequest, SftpTransferDirection, SftpTransferEvent, SftpTransferRequest,
-        SftpTransferState, SshAuthMethod, SshStartRequest,
+        SftpTransferState, SshAuthMethod, SshEvent, SshHostKeyPreview, SshMonitorDisk,
+        SshMonitorProcess, SshMonitorSnapshot, SshProxyType, SshStartRequest,
     };
     use crate::connection_resolver::RoutePolicy;
+    use std::collections::HashMap;
 
     #[test]
     fn inline_private_key_auth_uses_a_vault_reference_without_a_file_path() {
@@ -491,7 +684,14 @@ mod tests {
             pixel_height: 0,
             route_policy: RoutePolicy::Direct,
             preferred_region: None,
+            network_route_preferences: HashMap::new(),
             reuse_cloud_binding: false,
+            replace_existing: false,
+            proxy_type: SshProxyType::None,
+            proxy_host: None,
+            proxy_port: None,
+            proxy_username: None,
+            proxy_credential_reference: None,
         };
 
         assert!(request.validate().is_ok());
@@ -502,6 +702,108 @@ mod tests {
             missing_key.validate(),
             Err("ssh_private_key_required".to_string())
         );
+    }
+
+    #[test]
+    fn proxy_settings_require_a_valid_endpoint_without_embedding_credentials() {
+        let mut request = SshStartRequest {
+            session_id: "ssh-proxy".to_string(),
+            host: "server.example.com".to_string(),
+            port: 22,
+            username: "deploy".to_string(),
+            auth_method: SshAuthMethod::Password,
+            credential_reference: Some("ssh-proxy-main".to_string()),
+            private_key_path: None,
+            cols: 80,
+            rows: 24,
+            pixel_width: 0,
+            pixel_height: 0,
+            route_policy: RoutePolicy::Direct,
+            preferred_region: None,
+            network_route_preferences: HashMap::new(),
+            reuse_cloud_binding: false,
+            replace_existing: false,
+            proxy_type: SshProxyType::Socks5,
+            proxy_host: Some("127.0.0.1".to_string()),
+            proxy_port: Some(1080),
+            proxy_username: Some("proxy-user".to_string()),
+            proxy_credential_reference: Some("ssh-proxy-secret".to_string()),
+        };
+        assert!(request.validate().is_ok());
+
+        request.proxy_host = Some("invalid proxy".to_string());
+        assert_eq!(
+            request.validate(),
+            Err("ssh_proxy_host_invalid".to_string())
+        );
+    }
+
+    #[test]
+    fn ssh_events_use_frontend_camel_case_field_names() {
+        let state = serde_json::to_value(SshEvent::state(
+            "tab-1",
+            "connecting_transport",
+            Some("direct"),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(state["kind"], "state");
+        assert_eq!(state["sessionId"], "tab-1");
+        assert_eq!(state["routeLabel"], "direct");
+        assert!(state.get("session_id").is_none());
+
+        let host_key = serde_json::to_value(SshEvent::HostKey {
+            session_id: "tab-1".to_string(),
+            preview: SshHostKeyPreview {
+                host: "server.example.com".to_string(),
+                port: 22,
+                status: "unknown".to_string(),
+                algorithm: "ssh-ed25519".to_string(),
+                fingerprint: "SHA256:test".to_string(),
+                public_key: "ssh-ed25519 test".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(host_key["kind"], "host_key");
+        assert_eq!(host_key["sessionId"], "tab-1");
+        assert!(host_key.get("session_id").is_none());
+    }
+
+    #[test]
+    fn monitor_snapshots_use_the_frontend_camel_case_contract() {
+        let value = serde_json::to_value(SshMonitorSnapshot {
+            supported: true,
+            platform: "linux".to_string(),
+            uptime_seconds: 60,
+            load_average: [0.1, 0.2, 0.3],
+            cpu_percent: 12.5,
+            memory_used_bytes: 1024,
+            memory_total_bytes: 4096,
+            swap_used_bytes: 0,
+            swap_total_bytes: 0,
+            processes: vec![SshMonitorProcess {
+                memory_bytes: 512,
+                cpu_percent: 1.0,
+                command: "sshd".to_string(),
+            }],
+            network_interface: Some("eth0".to_string()),
+            network_receive_bytes_per_second: 2048.0,
+            network_transmit_bytes_per_second: 1024.0,
+            latency_ms: 10.5,
+            disks: vec![SshMonitorDisk {
+                path: "/".to_string(),
+                available_bytes: 8192,
+                total_bytes: 16384,
+            }],
+        })
+        .unwrap();
+
+        assert_eq!(value["uptimeSeconds"], 60);
+        assert_eq!(value["platform"], "linux");
+        assert_eq!(value["processes"][0]["memoryBytes"], 512);
+        assert_eq!(value["networkInterface"], "eth0");
+        assert_eq!(value["disks"][0]["availableBytes"], 8192);
+        assert!(value.get("uptime_seconds").is_none());
     }
 
     #[test]
@@ -546,6 +848,7 @@ mod tests {
             local_path: "/tmp/notes.txt".to_string(),
             remote_path: "/home/root/notes.txt".to_string(),
             overwrite: false,
+            recursive: false,
         };
         assert!(valid.validate().is_ok());
         assert!(SftpTransferRequest {

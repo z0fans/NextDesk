@@ -1,11 +1,13 @@
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use ironrdp_rdcleanpath::RDCleanPathPdu;
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::Instant;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
@@ -17,6 +19,94 @@ struct RdpRouteReleaseGuard {
     app: AppHandle,
     session_id: Option<String>,
     lease_id: Option<u64>,
+}
+
+fn parse_proxy_outcome_context(
+    proxy_auth: &str,
+) -> (
+    Option<String>,
+    Option<String>,
+    crate::connection_resolver::RoutePolicy,
+    HashMap<String, crate::connection_resolver::RoutePolicy>,
+) {
+    let Some(raw) = proxy_auth.strip_prefix("nextdesk-local:").map(str::trim) else {
+        return (
+            None,
+            None,
+            crate::connection_resolver::RoutePolicy::Auto,
+            HashMap::new(),
+        );
+    };
+    if raw.is_empty() {
+        return (
+            None,
+            None,
+            crate::connection_resolver::RoutePolicy::Auto,
+            HashMap::new(),
+        );
+    }
+    let mut parts = raw.splitn(4, '|');
+    let session_id = parts.next().unwrap_or_default().trim();
+    let attempt_id = parts.next().map(str::trim);
+    let route_policy = match parts.next().map(str::trim) {
+        Some("direct") => crate::connection_resolver::RoutePolicy::Direct,
+        Some("cloud_only") => crate::connection_resolver::RoutePolicy::CloudOnly,
+        _ => crate::connection_resolver::RoutePolicy::Auto,
+    };
+    let session_id = (!session_id.is_empty()).then(|| session_id.to_string());
+    let attempt_id = attempt_id
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let network_route_preferences = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|encoded| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded)
+                .ok()
+        })
+        .and_then(|json| {
+            serde_json::from_slice::<HashMap<String, crate::connection_resolver::RoutePolicy>>(
+                &json,
+            )
+            .ok()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(scope, _)| {
+            (16..=64).contains(&scope.len()) && scope.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .take(32)
+        .collect();
+    (
+        session_id,
+        attempt_id,
+        route_policy,
+        network_route_preferences,
+    )
+}
+
+fn emit_route_status(
+    app: &AppHandle,
+    session_id: Option<&str>,
+    attempt_id: Option<&str>,
+    route_lease_id: u64,
+    status: &str,
+) {
+    let (Some(tab_id), Some(attempt_id)) = (session_id, attempt_id) else {
+        return;
+    };
+    let _ = app.emit(
+        "rdp://status",
+        crate::rdp_session::RdpStatusEvent {
+            tab_id: tab_id.to_string(),
+            status: status.to_string(),
+            message: None,
+            route_lease_id,
+            attempt_id: attempt_id.to_string(),
+        },
+    );
 }
 
 impl Drop for RdpRouteReleaseGuard {
@@ -210,30 +300,50 @@ async fn handle_inner(
         .ok_or_else(|| format!("invalid destination: {dest}"))?;
     let dest_port: u16 = dest_port_text.parse()?;
     let app_state = app_handle.state::<crate::state::AppState>();
-    let session_id = proxy_auth
-        .strip_prefix("nextdesk-local:")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
+    let (session_id, attempt_id, route_policy, network_route_preferences) =
+        parse_proxy_outcome_context(&proxy_auth);
     let mut route_release = RdpRouteReleaseGuard {
         app: app_handle.clone(),
         session_id: session_id.clone(),
         lease_id: None,
     };
-    let resolved = crate::connection_resolver::resolve_connection_target(
+    let resolved = crate::connection_resolver::resolve_connection(
         app_state.inner(),
-        dest_host.to_string(),
-        dest_port,
-        false,
-        session_id,
+        crate::connection_resolver::ConnectionIntent {
+            service_kind: crate::connection_resolver::ServiceKind::Rdp,
+            session_id: session_id.clone(),
+            host: dest_host.to_string(),
+            port: dest_port,
+            reuse_cloud_binding: false,
+            route_policy,
+            preferred_region: None,
+            network_route_preferences,
+        },
     )
     .await?;
-    route_release.lease_id = Some(resolved.route_lease_id);
-    let resolved_dest = format!("{}:{}", resolved.host, resolved.port);
+    route_release.lease_id = Some(resolved.lease_id);
+    let resolved_dest = format!(
+        "{}:{}",
+        resolved.dial_target.host, resolved.dial_target.port
+    );
     log::info!(
         "[rdp_proxy] route target={dest_host}:{dest_port} resolved={resolved_dest} label={} binding={:?}",
         resolved.route_label,
         resolved.binding_id
+    );
+    emit_route_status(
+        &app_handle,
+        session_id.as_deref(),
+        attempt_id.as_deref(),
+        resolved.lease_id,
+        "candidate_validation",
+    );
+    emit_route_status(
+        &app_handle,
+        session_id.as_deref(),
+        attempt_id.as_deref(),
+        resolved.lease_id,
+        "transport",
     );
     let mut tcp = TcpStream::connect(&resolved_dest)
         .await
@@ -265,6 +375,13 @@ async fn handle_inner(
         format!("tls: {e}")
     })?;
     eprintln!("[rdp_proxy] TLS handshake OK");
+    emit_route_status(
+        &app_handle,
+        session_id.as_deref(),
+        attempt_id.as_deref(),
+        resolved.lease_id,
+        "protocol_handshake",
+    );
     let chain: Vec<Vec<u8>> = tls
         .get_ref()
         .peer_certificate()
@@ -284,8 +401,67 @@ async fn handle_inner(
         resp_bytes.len()
     );
     tx.send(Message::Binary(resp_bytes.into())).await?;
+    emit_route_status(
+        &app_handle,
+        session_id.as_deref(),
+        attempt_id.as_deref(),
+        resolved.lease_id,
+        "authentication",
+    );
     eprintln!("[rdp_proxy] Response sent, entering relay phase");
     log::info!("[rdp_proxy] Response sent, relay");
 
     relay_tls_to_websocket(tls, &dest, "normal", &mut tx, &mut rx).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_proxy_outcome_context;
+    use base64::Engine as _;
+
+    #[test]
+    fn proxy_auth_carries_the_tab_and_attempt_without_breaking_legacy_tokens() {
+        assert_eq!(
+            parse_proxy_outcome_context("nextdesk-local:tab-7|rdp-tab-7-42"),
+            (
+                Some("tab-7".to_string()),
+                Some("rdp-tab-7-42".to_string()),
+                crate::connection_resolver::RoutePolicy::Auto,
+                std::collections::HashMap::new(),
+            )
+        );
+        assert_eq!(
+            parse_proxy_outcome_context("nextdesk-local:legacy-tab"),
+            (
+                Some("legacy-tab".to_string()),
+                None,
+                crate::connection_resolver::RoutePolicy::Auto,
+                std::collections::HashMap::new(),
+            )
+        );
+        assert_eq!(
+            parse_proxy_outcome_context("nextdesk-local:tab-8|attempt-8|cloud_only"),
+            (
+                Some("tab-8".to_string()),
+                Some("attempt-8".to_string()),
+                crate::connection_resolver::RoutePolicy::CloudOnly,
+                std::collections::HashMap::new(),
+            )
+        );
+    }
+
+    #[test]
+    fn proxy_auth_carries_sanitized_network_route_preferences() {
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"0123456789abcdef0123456789abcdef":"direct","unsafe":"cloud_only"}"#);
+        let (_, _, policy, preferences) =
+            parse_proxy_outcome_context(&format!("nextdesk-local:tab-9|attempt-9|auto|{encoded}"));
+
+        assert_eq!(policy, crate::connection_resolver::RoutePolicy::Auto);
+        assert_eq!(preferences.len(), 1);
+        assert_eq!(
+            preferences.get("0123456789abcdef0123456789abcdef"),
+            Some(&crate::connection_resolver::RoutePolicy::Direct)
+        );
+    }
 }

@@ -57,6 +57,8 @@ function AppContent() {
   const [cloudRefreshing, setCloudRefreshing] = useState(false);
   const [cloudRefreshMessage, setCloudRefreshMessage] = useState('');
   const [cloudStatus, setCloudStatus] = useState<CloudAccountStatus | null>(null);
+  const [anonymousQualityFeedbackEnabled, setAnonymousQualityFeedbackEnabled] = useState(true);
+  const [anonymousQualityFeedbackLoaded, setAnonymousQualityFeedbackLoaded] = useState(false);
   const cloudAuthInFlightRef = useRef(false);
   const cloudAuthTimeoutRef = useRef<number | null>(null);
 
@@ -152,6 +154,32 @@ function AppContent() {
         setCloudStatus(null);
       });
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    api.anonymousQualityFeedbackGet()
+      .then((enabled) => {
+        if (active) setAnonymousQualityFeedbackEnabled(enabled);
+      })
+      .catch((error) => console.error('Failed to load anonymous quality feedback setting', error))
+      .finally(() => {
+        if (active) setAnonymousQualityFeedbackLoaded(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const handleAnonymousQualityFeedbackChange = async (enabled: boolean) => {
+    const previous = anonymousQualityFeedbackEnabled;
+    setAnonymousQualityFeedbackEnabled(enabled);
+    try {
+      await api.anonymousQualityFeedbackSet(enabled);
+    } catch (error) {
+      setAnonymousQualityFeedbackEnabled(previous);
+      console.error('Failed to save anonymous quality feedback setting', error);
+    }
+  };
 
   useEffect(() => {
     let active = true;
@@ -378,7 +406,15 @@ function AppContent() {
           </Button>
         </nav>
 
-        <div className={cn("p-3 border-t border-sidebar-border", sidebarCollapsed ? "px-2" : "px-4")}>
+        <div
+          data-region="app-status-footer"
+          className={cn(
+            "border-t border-sidebar-border",
+            sidebarCollapsed
+              ? "flex h-11 shrink-0 items-center justify-center px-2"
+              : "p-3 px-4",
+          )}
+        >
           {!sidebarCollapsed && (
             <div className="bg-sidebar-accent rounded-lg p-3 border border-sidebar-border mb-3">
               <div className="flex items-center justify-between mb-2">
@@ -394,7 +430,7 @@ function AppContent() {
             </div>
           )}
           {sidebarCollapsed && (
-            <div className="flex justify-center mb-3">
+            <div className="flex justify-center">
               <div className={cn("h-2.5 w-2.5 rounded-full transition-colors", isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-muted-foreground/30')} />
             </div>
           )}
@@ -743,6 +779,33 @@ function AppContent() {
                     <Switch
                       checked={folderSharingEnabled}
                       onCheckedChange={setFolderSharingEnabled}
+                    />
+                  </div>
+                </CardContent>
+              </Card>
+
+              {/* Privacy Card */}
+              <Card className="bg-card border-border flex flex-col md:col-span-2">
+                <CardHeader>
+                  <CardTitle className="text-lg text-foreground">{t('privacySettings')}</CardTitle>
+                  <CardDescription className="text-muted-foreground">{t('privacySettingsDesc')}</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4 flex-1">
+                  <div className="flex items-center justify-between gap-4 py-2">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div className="h-9 w-9 rounded-lg bg-cyan-500/10 flex items-center justify-center shrink-0">
+                        <Activity className="h-4 w-4 text-cyan-500" />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium text-foreground">{t('anonymousQualityFeedback')}</div>
+                        <div className="text-xs text-muted-foreground">{t('anonymousQualityFeedbackDesc')}</div>
+                      </div>
+                    </div>
+                    <Switch
+                      checked={anonymousQualityFeedbackEnabled}
+                      disabled={!anonymousQualityFeedbackLoaded}
+                      onCheckedChange={handleAnonymousQualityFeedbackChange}
+                      aria-label={t('anonymousQualityFeedback')}
                     />
                   </div>
                 </CardContent>

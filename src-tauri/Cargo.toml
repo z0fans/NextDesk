@@ -1,6 +1,6 @@
 [package]
 name = "nextdesk"
-version = "1.0.128"
+version = "1.0.135"
 edition = "2021"
 
 [features]
@@ -53,9 +53,8 @@ ironrdp-core = "0.2"
 ironrdp-tokio = "0.9"
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
-# IronRDP 0.16 pins a RustCrypto pre-release line that conflicts with russh
-# 0.57+. Keep the SSH transport on the ring-only compatible line until the
-# shared crypto graph can be upgraded without vendoring IronRDP.
+# Keep this in lockstep with Cargo.toml so KKTerm release builds expose the
+# same unified russh engine and OS credential-vault behavior.
 russh = { version = "=0.56.0", default-features = false, features = ["ring"] }
 russh-sftp = "=2.3.0"
 keyring-core = "1.0.0"

@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+use crate::connection_resolver::RoutePolicy;
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +37,10 @@ pub struct KktermRdpStartRequest {
     pub scale_factor: Option<f64>,
     #[serde(default)]
     pub reuse_cloud_binding: bool,
+    #[serde(default)]
+    pub route_policy: RoutePolicy,
+    #[serde(default)]
+    pub network_route_preferences: HashMap<String, RoutePolicy>,
 }
 
 #[derive(Serialize)]
@@ -43,6 +50,8 @@ pub struct KktermRdpStartResponse {
     pub session_id: String,
     pub route_label: String,
     pub route_lease_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_scope_id: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]

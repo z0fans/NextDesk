@@ -7,6 +7,7 @@ mod cloud_auth;
 mod cloud_gateway;
 mod cloud_probe;
 mod config;
+mod connection_outcome;
 mod connection_resolver;
 mod credential_vault;
 mod diagnostic_logs;
@@ -156,6 +157,8 @@ struct NativeRdpConnectResponse {
     ws_port: u16,
     route_label: String,
     route_lease_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_scope_id: Option<String>,
 }
 
 const RDP_DEBUG_LOG: &str = "nextdesk_rdp_debug.log";
@@ -359,6 +362,15 @@ async fn cloud_keep_binding_alive(
     app_state: State<'_, AppState>,
 ) -> Result<(), String> {
     connection_resolver::keep_binding_alive(app_state.inner(), Some(&session_id), &host, port).await
+}
+
+#[tauri::command]
+async fn connection_route_health_check(
+    service_kind: connection_resolver::ServiceKind,
+    session_id: String,
+    app_state: State<'_, AppState>,
+) -> Result<connection_resolver::RouteHealthAssessment, String> {
+    connection_resolver::assess_route_health(app_state.inner(), service_kind, &session_id).await
 }
 
 #[tauri::command]
@@ -668,20 +680,31 @@ async fn rdp_native_connect(
     height: u16,
     render_profile: Option<String>,
     reuse_cloud_binding: Option<bool>,
+    route_policy: Option<connection_resolver::RoutePolicy>,
+    network_route_preferences: Option<
+        std::collections::HashMap<String, connection_resolver::RoutePolicy>,
+    >,
+    attempt_id: String,
     app_state: State<'_, AppState>,
-) -> Result<NativeRdpConnectResponse, String> {
-    let resolved = connection_resolver::resolve_connection_target(
+) -> Result<NativeRdpConnectResponse, connection_outcome::RdpStartError> {
+    let resolved = connection_resolver::resolve_connection(
         app_state.inner(),
-        host.clone(),
-        port,
-        reuse_cloud_binding.unwrap_or(false),
-        Some(tab_id.clone()),
+        connection_resolver::ConnectionIntent {
+            service_kind: connection_resolver::ServiceKind::Rdp,
+            session_id: Some(tab_id.clone()),
+            host: host.clone(),
+            port,
+            reuse_cloud_binding: reuse_cloud_binding.unwrap_or(false),
+            route_policy: route_policy.unwrap_or_default(),
+            preferred_region: None,
+            network_route_preferences: network_route_preferences.unwrap_or_default(),
+        },
     )
     .await?;
     let route_label = resolved.route_label.clone();
-    let route_lease_id = resolved.route_lease_id;
-    let connect_host = resolved.host;
-    let connect_port = resolved.port;
+    let route_lease_id = resolved.lease_id;
+    let connect_host = resolved.dial_target.host.clone();
+    let connect_port = resolved.dial_target.port;
     log::info!(
         "[rdp-native] target {host}:{port} resolved to {}:{} route={}",
         connect_host,
@@ -695,17 +718,40 @@ async fn rdp_native_connect(
         match frame_ws::start_frame_server(tab_id.clone(), connect_host.clone()).await {
             Ok(server) => server,
             Err(error) => {
+                let lease = connection_resolver::current_route_lease(
+                    app_state.inner(),
+                    connection_resolver::ServiceKind::Rdp,
+                    &tab_id,
+                )
+                .filter(|lease| lease.lease_id == route_lease_id);
+                connection_outcome::spawn_rdp_start_failure(
+                    &tab_id,
+                    &format!("frame server: {error}"),
+                    lease,
+                );
                 connection_resolver::release_session_route_if_current(
                     app_state.inner(),
                     connection_resolver::ServiceKind::Rdp,
                     &tab_id,
                     route_lease_id,
                 );
-                return Err(format!("Failed to start frame WS: {error}"));
+                return Err(connection_outcome::RdpStartError::reported(format!(
+                    "Failed to start frame WS: {error}"
+                )));
             }
         };
     let frame_transport =
         rdp_session::native_frame_transport_from_profile(render_profile.as_deref());
+    let _ = app.emit(
+        "rdp://status",
+        rdp_session::RdpStatusEvent {
+            tab_id: tab_id.clone(),
+            status: "candidate_validation".into(),
+            message: None,
+            route_lease_id,
+            attempt_id: attempt_id.clone(),
+        },
+    );
     log::info!(
         "[rdp-native] connect profile tab={} host={} mode={} transport={}",
         tab_id,
@@ -728,6 +774,8 @@ async fn rdp_native_connect(
         ws_port,
         frame_ws_shutdown,
         frame_transport,
+        route_lease_id,
+        attempt_id,
     );
     let mut mgr = app_state.native_sessions.lock().unwrap();
     mgr.insert(tab_id, handle);
@@ -735,6 +783,7 @@ async fn rdp_native_connect(
         ws_port,
         route_label,
         route_lease_id,
+        network_scope_id: resolved.network_scope_id,
     })
 }
 
@@ -1017,21 +1066,27 @@ async fn kkterm_rdp_start(
     app: tauri::AppHandle,
     mut request: kkterm_rdp::types::KktermRdpStartRequest,
     app_state: State<'_, AppState>,
-) -> Result<kkterm_rdp::types::KktermRdpStartResponse, String> {
+) -> Result<kkterm_rdp::types::KktermRdpStartResponse, connection_outcome::RdpStartError> {
     let tab_id = request.tab_id.clone();
     let host = request.host.trim().to_string();
     let port = request.port;
-    let resolved = connection_resolver::resolve_connection_target(
+    let resolved = connection_resolver::resolve_connection(
         app_state.inner(),
-        host.clone(),
-        port,
-        request.reuse_cloud_binding,
-        Some(tab_id.clone()),
+        connection_resolver::ConnectionIntent {
+            service_kind: connection_resolver::ServiceKind::Rdp,
+            session_id: Some(tab_id.clone()),
+            host: host.clone(),
+            port,
+            reuse_cloud_binding: request.reuse_cloud_binding,
+            route_policy: request.route_policy,
+            preferred_region: None,
+            network_route_preferences: request.network_route_preferences.clone(),
+        },
     )
     .await?;
-    let route_lease_id = resolved.route_lease_id;
-    request.host = resolved.host.clone();
-    request.port = resolved.port;
+    let route_lease_id = resolved.lease_id;
+    request.host = resolved.dial_target.host.clone();
+    request.port = resolved.dial_target.port;
     log::info!(
         "[kkterm-rdp] Windows target {host}:{port} resolved to {}:{} route={}",
         request.host,
@@ -1040,19 +1095,27 @@ async fn kkterm_rdp_start(
     );
     let start_request = kkterm_rdp::windows::StartRdpSessionRequest::from_kkterm_start(request);
     if let Err(error) = kkterm_rdp_windows_manager().start_session(app, start_request) {
+        let lease = connection_resolver::current_route_lease(
+            app_state.inner(),
+            connection_resolver::ServiceKind::Rdp,
+            &tab_id,
+        )
+        .filter(|lease| lease.lease_id == route_lease_id);
+        connection_outcome::spawn_rdp_start_failure(&tab_id, &error, lease);
         connection_resolver::release_session_route_if_current(
             app_state.inner(),
             connection_resolver::ServiceKind::Rdp,
             &tab_id,
             route_lease_id,
         );
-        return Err(error);
+        return Err(connection_outcome::RdpStartError::reported(error));
     }
     Ok(kkterm_rdp::types::KktermRdpStartResponse {
         session_id: tab_id.clone(),
         tab_id,
         route_label: resolved.route_label,
         route_lease_id,
+        network_scope_id: resolved.network_scope_id,
     })
 }
 
@@ -1066,22 +1129,28 @@ async fn kkterm_rdp_start(
     app: tauri::AppHandle,
     mut request: kkterm_rdp::types::KktermRdpStartRequest,
     app_state: State<'_, AppState>,
-) -> Result<kkterm_rdp::types::KktermRdpStartResponse, String> {
+) -> Result<kkterm_rdp::types::KktermRdpStartResponse, connection_outcome::RdpStartError> {
     let tab_id = request.tab_id.clone();
     let session_id = kkterm_rdp::types::session_id_from_tab_id(&tab_id);
     let host = request.host.trim().to_string();
     let port = request.port;
-    let resolved = connection_resolver::resolve_connection_target(
+    let resolved = connection_resolver::resolve_connection(
         app_state.inner(),
-        host.clone(),
-        port,
-        request.reuse_cloud_binding,
-        Some(tab_id.clone()),
+        connection_resolver::ConnectionIntent {
+            service_kind: connection_resolver::ServiceKind::Rdp,
+            session_id: Some(tab_id.clone()),
+            host: host.clone(),
+            port,
+            reuse_cloud_binding: request.reuse_cloud_binding,
+            route_policy: request.route_policy,
+            preferred_region: None,
+            network_route_preferences: request.network_route_preferences.clone(),
+        },
     )
     .await?;
-    let route_lease_id = resolved.route_lease_id;
-    request.host = resolved.host.clone();
-    request.port = resolved.port;
+    let route_lease_id = resolved.lease_id;
+    request.host = resolved.dial_target.host.clone();
+    request.port = resolved.dial_target.port;
     log::info!(
         "[kkterm-rdp] target {host}:{port} resolved to {}:{} route={}",
         request.host,
@@ -1096,19 +1165,27 @@ async fn kkterm_rdp_start(
     .map_err(|error| format!("RDP startup task failed: {error}"))
     .and_then(|result| result);
     if let Err(error) = start_result {
+        let lease = connection_resolver::current_route_lease(
+            app_state.inner(),
+            connection_resolver::ServiceKind::Rdp,
+            &tab_id,
+        )
+        .filter(|lease| lease.lease_id == route_lease_id);
+        connection_outcome::spawn_rdp_start_failure(&tab_id, &error, lease);
         connection_resolver::release_session_route_if_current(
             app_state.inner(),
             connection_resolver::ServiceKind::Rdp,
             &tab_id,
             route_lease_id,
         );
-        return Err(error);
+        return Err(connection_outcome::RdpStartError::reported(error));
     }
     Ok(kkterm_rdp::types::KktermRdpStartResponse {
         tab_id,
         session_id,
         route_label: resolved.route_label,
         route_lease_id,
+        network_scope_id: resolved.network_scope_id,
     })
 }
 
@@ -1589,16 +1666,28 @@ pub fn run() {
             cloud_get_status,
             cloud_refresh_status,
             cloud_keep_binding_alive,
+            connection_route_health_check,
             cloud_disable,
+            config::anonymous_quality_feedback_get,
+            config::anonymous_quality_feedback_set,
+            config::rdp_resolution_get,
+            config::rdp_resolution_set,
+            connection_outcome::connection_outcome_report,
             ssh::ssh_session_start,
             ssh::ssh_session_input,
             ssh::ssh_session_resize,
             ssh::ssh_session_close,
+            ssh::ssh_monitor_snapshot,
+            ssh::ssh_log_start_failure,
             ssh::ssh_credential_store,
             ssh::ssh_private_key_credential_store,
             ssh::ssh_credential_delete,
             ssh::ssh_credential_exists,
             ssh::ssh_trust_host_key,
+            ssh::ssh_known_hosts_list,
+            ssh::ssh_known_host_remove,
+            ssh::ssh_known_hosts_import,
+            ssh::ssh_known_hosts_export,
             ssh::ssh_sftp_open,
             ssh::ssh_sftp_list,
             ssh::ssh_sftp_upload,
@@ -1607,6 +1696,9 @@ pub fn run() {
             ssh::ssh_sftp_create_directory,
             ssh::ssh_sftp_rename,
             ssh::ssh_sftp_remove,
+            ssh::ssh_sftp_read_text,
+            ssh::ssh_sftp_write_text,
+            ssh::ssh_sftp_set_permissions,
             rdp_audio_set_format,
             rdp_audio_push,
             rdp_audio_push_raw,

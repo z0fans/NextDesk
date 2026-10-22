@@ -1157,8 +1157,10 @@ fn native_resize_matches_desktop_size(
 #[derive(Clone, Serialize)]
 pub struct RdpStatusEvent {
     pub tab_id: String,
-    pub status: String, // "connected" | "disconnected" | "error"
+    pub status: String,
     pub message: Option<String>,
+    pub route_lease_id: u64,
+    pub attempt_id: String,
 }
 
 /// Pointer (cursor) event (via `emit`, not Channel).
@@ -1411,6 +1413,8 @@ pub fn spawn_session(
     frame_ws_port: u16,
     frame_ws_shutdown: FrameServerShutdown,
     frame_transport: NativeFrameTransport,
+    route_lease_id: u64,
+    attempt_id: String,
 ) -> SessionHandle {
     let (input_tx, input_rx) = mpsc::unbounded_channel::<NativeRdpInput>();
 
@@ -1440,6 +1444,8 @@ pub fn spawn_session(
                 frame_tx,
                 frame_ws_port,
                 frame_transport,
+                route_lease_id,
+                attempt_id.clone(),
             )
             .await;
 
@@ -1454,6 +1460,8 @@ pub fn spawn_session(
                             tab_id,
                             status: "disconnected".into(),
                             message: Some(format!("{reason:?}")),
+                            route_lease_id,
+                            attempt_id,
                         },
                     );
                 }
@@ -1465,6 +1473,8 @@ pub fn spawn_session(
                             tab_id,
                             status: "error".into(),
                             message: Some(format!("{e}")),
+                            route_lease_id,
+                            attempt_id,
                         },
                     );
                 }
@@ -1500,6 +1510,8 @@ async fn run_session(
     frame_tx: FrameSender,
     frame_ws_port: u16,
     frame_transport: NativeFrameTransport,
+    route_lease_id: u64,
+    attempt_id: String,
 ) -> Result<GracefulDisconnectReason, String> {
     let route = NativeRdpRoute::Direct;
     let render_mode = native_render_mode_for_route(route, width, height);
@@ -1530,6 +1542,16 @@ async fn run_session(
 
     // The shared resolver has already selected either the requested target or
     // a cloud relay endpoint. Both are reached with a direct TCP connection.
+    let _ = app.emit(
+        "rdp://status",
+        RdpStatusEvent {
+            tab_id: tab_id.clone(),
+            status: "transport".into(),
+            message: None,
+            route_lease_id,
+            attempt_id: attempt_id.clone(),
+        },
+    );
     let (connection_result, framed) = connect_tcp(
         &host,
         port,
@@ -1543,6 +1565,8 @@ async fn run_session(
         gfx_error.clone(),
         render_mode,
         app.clone(),
+        route_lease_id,
+        &attempt_id,
     )
     .await
     .map_err(|e| format!("Connect failed: {e}"))?;
@@ -1560,6 +1584,8 @@ async fn run_session(
             tab_id: tab_id.clone(),
             status: "connected".into(),
             message: None,
+            route_lease_id,
+            attempt_id,
         },
     );
 
@@ -1601,8 +1627,21 @@ async fn connect_tcp(
     gfx_error: SharedGfxError,
     render_mode: NativeRenderMode,
     app_handle: tauri::AppHandle,
+    route_lease_id: u64,
+    attempt_id: &str,
 ) -> ConnectorResult<(ConnectionResult, UpgradedFramed)> {
     let stream = connect_rdp_transport(host, port).await?;
+
+    let _ = app_handle.emit(
+        "rdp://status",
+        RdpStatusEvent {
+            tab_id: session_id.to_string(),
+            status: "protocol_handshake".into(),
+            message: None,
+            route_lease_id,
+            attempt_id: attempt_id.to_string(),
+        },
+    );
 
     stream
         .set_nodelay(true)
@@ -1671,6 +1710,17 @@ async fn connect_tcp(
     // Phase 3: NLA/CredSSP + Channel Join + Capabilities
     let server_public_key = ironrdp_tls::extract_tls_server_public_key(&tls_cert)
         .ok_or_else(|| connector::general_err!("extract TLS server public key"))?;
+
+    let _ = app_handle.emit(
+        "rdp://status",
+        RdpStatusEvent {
+            tab_id: session_id.to_string(),
+            status: "authentication".into(),
+            message: None,
+            route_lease_id,
+            attempt_id: attempt_id.to_string(),
+        },
+    );
 
     let connection_result = ironrdp_tokio::connect_finalize(
         upgraded,
