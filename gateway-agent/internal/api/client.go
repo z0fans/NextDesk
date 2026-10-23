@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,7 +48,8 @@ type heartbeatResponse struct {
 	} `json:"data"`
 }
 
-const agentVersion = "0.4.0"
+const Version = "0.4.1"
+const maxResponseBytes = 1 << 20
 
 func AgentCapabilities() map[string]any {
 	return map[string]any{
@@ -67,26 +69,26 @@ func New(baseURL, agentID, agentToken string) Client {
 	}
 }
 
-func (c Client) Heartbeat(metrics map[string]any) (HeartbeatConfig, error) {
+func (c Client) Heartbeat(ctx context.Context, metrics map[string]any) (HeartbeatConfig, error) {
 	var response heartbeatResponse
-	err := c.post("/api/v1/connect/agent/heartbeat", map[string]any{
-		"version":      agentVersion,
+	err := c.post(ctx, "/api/v1/connect/agent/heartbeat", map[string]any{
+		"version":      Version,
 		"metrics":      metrics,
 		"capabilities": AgentCapabilities(),
 	}, &response)
 	return HeartbeatConfig{ProbeTaskKey: response.Data.ProbeTaskKey}, err
 }
 
-func (c Client) Poll() ([]Task, error) {
+func (c Client) Poll(ctx context.Context) ([]Task, error) {
 	var out PollResponse
-	if err := c.post("/api/v1/connect/agent/poll", map[string]any{}, &out); err != nil {
+	if err := c.post(ctx, "/api/v1/connect/agent/poll", map[string]any{}, &out); err != nil {
 		return nil, err
 	}
 	return out.Data.Tasks, nil
 }
 
-func (c Client) Ack(bindingID, status, code, message string) error {
-	return c.post("/api/v1/connect/agent/ack", map[string]any{
+func (c Client) Ack(ctx context.Context, bindingID, status, code, message string) error {
+	return c.post(ctx, "/api/v1/connect/agent/ack", map[string]any{
 		"binding_id":    bindingID,
 		"status":        bindingIDStatus(status),
 		"error_code":    code,
@@ -94,8 +96,8 @@ func (c Client) Ack(bindingID, status, code, message string) error {
 	}, nil)
 }
 
-func (c Client) ProbeResult(result probe.Result) error {
-	return c.post("/api/v1/connect/agent/probe-result", result, nil)
+func (c Client) ProbeResult(ctx context.Context, result probe.Result) error {
+	return c.post(ctx, "/api/v1/connect/agent/probe-result", result, nil)
 }
 
 func bindingIDStatus(status string) string {
@@ -105,12 +107,15 @@ func bindingIDStatus(status string) string {
 	return status
 }
 
-func (c Client) post(path string, payload any, out any) error {
+func (c Client) post(ctx context.Context, path string, payload any, out any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.BaseURL+path, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+path, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -123,7 +128,13 @@ func (c Client) post(path string, payload any, out any) error {
 		return err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return fmt.Errorf("read connect gateway %s response: %w", path, err)
+	}
+	if len(raw) > maxResponseBytes {
+		return fmt.Errorf("connect gateway %s response exceeds %d bytes", path, maxResponseBytes)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("connect gateway %s returned %d: %s", path, resp.StatusCode, string(raw))
 	}

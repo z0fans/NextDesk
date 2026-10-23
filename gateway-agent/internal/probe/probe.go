@@ -18,6 +18,7 @@ import (
 )
 
 const SignatureVersion = "hmac-sha256-v1"
+const maxSSHBannerBytes = 8 * 1024
 
 var rdpX224ConnectionRequest = []byte{
 	0x03, 0x00, 0x00, 0x13, 0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x03,
@@ -240,12 +241,12 @@ func Execute(parent context.Context, task Task, timeout time.Duration) Result {
 }
 
 func probeSSH(conn net.Conn) error {
-	reader := bufio.NewReaderSize(conn, 8*1024)
+	reader := bufio.NewReaderSize(io.LimitReader(conn, maxSSHBannerBytes+1), maxSSHBannerBytes)
 	total := 0
 	for lineCount := 0; lineCount < 50; lineCount++ {
 		line, err := reader.ReadString('\n')
 		total += len(line)
-		if total > 8*1024 {
+		if total > maxSSHBannerBytes {
 			return errors.New("ssh_banner_too_large")
 		}
 		if err != nil {
@@ -359,6 +360,8 @@ type Executor struct {
 	policy  Policy
 	sem     chan struct{}
 	mu      sync.Mutex
+	wg      sync.WaitGroup
+	closed  bool
 	active  map[string]*activeProbe
 	byID    map[string]*activeProbe
 	cache   map[string]cachedResult
@@ -375,14 +378,34 @@ func NewExecutor(agentID string, policy Policy) *Executor {
 	}
 }
 
-func (executor *Executor) Submit(task Task, signingKey string, report func(Result)) {
+func (executor *Executor) Submit(parent context.Context, task Task, signingKey string, report func(Result)) error {
+	executor.mu.Lock()
+	if err := parent.Err(); err != nil {
+		executor.mu.Unlock()
+		return err
+	}
+	if executor.closed {
+		executor.mu.Unlock()
+		return context.Canceled
+	}
+	executor.wg.Add(1)
+	executor.mu.Unlock()
+	defer executor.wg.Done()
 	now := time.Now().UTC()
 	if err := VerifyTask(task, executor.agentID, signingKey, executor.policy.AllowedPorts, now); err != nil {
 		report(RejectedResult(task.ProbeID, err))
-		return
+		return nil
 	}
 	key := taskKey(task)
 	executor.mu.Lock()
+	if err := parent.Err(); err != nil {
+		executor.mu.Unlock()
+		return err
+	}
+	if executor.closed {
+		executor.mu.Unlock()
+		return context.Canceled
+	}
 	for cacheKey, cached := range executor.cache {
 		if !cached.expiresAt.After(now) {
 			delete(executor.cache, cacheKey)
@@ -393,38 +416,44 @@ func (executor *Executor) Submit(task Task, signingKey string, report func(Resul
 		result := cached.result
 		result.ProbeID = task.ProbeID
 		report(result)
-		return
+		return nil
 	}
 	if active, ok := executor.active[key]; ok {
 		active.aliases[task.ProbeID] = struct{}{}
 		executor.byID[task.ProbeID] = active
 		executor.mu.Unlock()
-		return
+		return nil
 	}
 	if last := executor.lastRun[key]; !last.IsZero() && now.Sub(last) < executor.policy.MinTargetInterval {
 		executor.mu.Unlock()
 		report(RejectedResult(task.ProbeID, errors.New("probe_rate_limited")))
-		return
+		return nil
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	active := &activeProbe{task: task, cancel: cancel, aliases: map[string]struct{}{task.ProbeID: {}}}
 	executor.active[key] = active
 	executor.byID[task.ProbeID] = active
 	executor.lastRun[key] = now
+	executor.wg.Add(1)
 	executor.mu.Unlock()
 
 	go executor.run(ctx, key, active, report)
+	return nil
 }
 
 func (executor *Executor) run(ctx context.Context, key string, active *activeProbe, report func(Result)) {
+	defer executor.wg.Done()
+	defer active.cancel()
 	deadline, _ := time.Parse(time.RFC3339, active.task.DeadlineAt)
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	select {
 	case executor.sem <- struct{}{}:
 		defer func() { <-executor.sem }()
 	case <-ctx.Done():
 		executor.complete(key, active, finishFailure(Result{ProbeID: active.task.ProbeID, Status: "failed", OutcomeCategory: "cancelled", StartedAt: time.Now().UTC().Format(time.RFC3339Nano), StageDurationsMS: map[string]int64{}}, ctx.Err(), "probe_cancelled"), report)
 		return
-	case <-time.After(time.Until(deadline)):
+	case <-timer.C:
 		executor.complete(key, active, RejectedResult(active.task.ProbeID, errors.New("probe_concurrency_limited")), report)
 		return
 	}
@@ -450,6 +479,23 @@ func (executor *Executor) complete(key string, active *activeProbe, result Resul
 		aliasResult.ProbeID = probeID
 		report(aliasResult)
 	}
+}
+
+// Wait includes result delivery. The caller must finish submitting before waiting.
+func (executor *Executor) Wait() {
+	executor.wg.Wait()
+}
+
+// Close rejects further submissions and cancels and joins all accepted work.
+// Report callbacks must honor the parent context and use bounded I/O.
+func (executor *Executor) Close() {
+	executor.mu.Lock()
+	executor.closed = true
+	for _, active := range executor.active {
+		active.cancel()
+	}
+	executor.mu.Unlock()
+	executor.wg.Wait()
 }
 
 func (executor *Executor) Cancel(probeID string) bool {

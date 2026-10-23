@@ -2,7 +2,9 @@ package realm
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -36,128 +38,250 @@ type configFile struct {
 
 var bindingIDPattern = regexp.MustCompile(`\A[A-Za-z0-9_.-]+\z`)
 
-func Apply(profile Profile, rule Rule) error {
-	if err := validateRule(rule); err != nil {
+func Apply(ctx context.Context, profile Profile, rule Rule) (resultErr error) {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(profile.RulesDir, 0750); err != nil {
+	if err := validateRule(rule); err != nil {
 		return err
 	}
 	raw, err := json.MarshalIndent(rule, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := writeAtomic(rulePath(profile, rule.BindingID), raw, 0640); err != nil {
-		return err
-	}
-
-	cfg := configForRule(rule)
-	cfgRaw, err := json.MarshalIndent(cfg, "", "  ")
+	cfgRaw, err := json.MarshalIndent(configForRule(rule), "", "  ")
 	if err != nil {
 		return err
 	}
-	instanceDir := instanceDir(profile, rule.BindingID)
-	if err := os.MkdirAll(instanceDir, 0750); err != nil {
+	configPath := filepath.Join(instanceDir(profile, rule.BindingID), "config.json")
+	previous, err := os.ReadFile(configPath)
+	hadConfig := err == nil
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read previous instance config: %w", err)
+	}
+	changed := !hadConfig || !bytes.Equal(previous, cfgRaw)
+	service := serviceName(profile, rule.BindingID)
+	wasActive := false
+	if !profile.DryRun {
+		wasActive, err = serviceIsActive(ctx, service)
+		if err != nil {
+			return err
+		}
+		if wasActive && !hadConfig {
+			return fmt.Errorf("cannot update active %s without its previous config", service)
+		}
+	}
+	configWritten, serviceTouched := false, false
+	defer func() {
+		if resultErr == nil {
+			return
+		}
+		// Rollback must survive shutdown, but must not delay exit indefinitely.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+		defer cancel()
+		if serviceTouched && !wasActive {
+			if err := runSystemctl(cleanupCtx, "stop", service); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("stop failed new instance %s: %w", service, err))
+			}
+		}
+		var restoreErr error
+		if configWritten {
+			if hadConfig {
+				restoreErr = writeAtomic(configPath, previous, 0640)
+			} else {
+				restoreErr = os.Remove(configPath)
+				if os.IsNotExist(restoreErr) {
+					restoreErr = nil
+				}
+			}
+			if restoreErr != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("restore instance config %s: %w", service, restoreErr))
+			}
+		}
+		if serviceTouched && wasActive && restoreErr == nil {
+			if err := runSystemctl(cleanupCtx, "restart", service); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("restore instance %s: %w", service, err))
+			} else if active, err := serviceIsActive(cleanupCtx, service); err != nil || !active {
+				resultErr = errors.Join(resultErr, fmt.Errorf("restored instance %s is not active: %v", service, err))
+			}
+		}
+	}()
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	configPath := filepath.Join(instanceDir, "config.json")
-	previous, _ := os.ReadFile(configPath)
-	changed := !bytes.Equal(previous, cfgRaw)
+	if err := os.MkdirAll(profile.RulesDir, 0750); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(instanceDir(profile, rule.BindingID), 0750); err != nil {
+		return err
+	}
 	if changed {
 		if err := writeAtomic(configPath, cfgRaw, 0640); err != nil {
 			return err
 		}
+		configWritten = true
 	}
-	if profile.DryRun {
-		return nil
+	if !profile.DryRun && (changed || !wasActive) {
+		action := "start"
+		if wasActive {
+			action = "restart"
+		}
+		serviceTouched = true
+		if err := runSystemctl(ctx, action, service); err != nil {
+			return fmt.Errorf("systemctl %s %s: %w", action, service, err)
+		}
+		if active, err := serviceIsActive(ctx, service); err != nil {
+			return err
+		} else if !active {
+			return fmt.Errorf("systemctl %s did not activate %s", action, service)
+		}
 	}
-
-	service := serviceName(profile, rule.BindingID)
-	if !changed && exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
-		return nil
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	action := "start"
-	if exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
-		action = "restart"
-	}
-	if err := exec.Command("systemctl", action, service).Run(); err != nil {
-		return fmt.Errorf("systemctl %s %s: %w", action, service, err)
-	}
-	return exec.Command("systemctl", "is-active", "--quiet", service).Run()
+	// Commit the desired rule only after the instance accepts its configuration.
+	return writeAtomic(rulePath(profile, rule.BindingID), raw, 0640)
 }
 
-func Delete(profile Profile, bindingID string) error {
-	if !bindingIDPattern.MatchString(bindingID) {
-		return fmt.Errorf("invalid binding id %q", bindingID)
+const systemctlTimeout = 10 * time.Second
+const rollbackTimeout = 15 * time.Second
+
+func runSystemctl(parent context.Context, args ...string) error {
+	ctx, cancel := context.WithTimeout(parent, systemctlTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemctl", args...)
+	cmd.WaitDelay = time.Second
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
-	var stopErr error
+	return err
+}
+
+func serviceIsActive(ctx context.Context, service string) (bool, error) {
+	err := runSystemctl(ctx, "is-active", "--quiet", service)
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && (exitErr.ExitCode() == 3 || exitErr.ExitCode() == 4) {
+		return false, nil
+	}
+	return false, fmt.Errorf("systemctl is-active %s: %w", service, err)
+}
+
+func Delete(ctx context.Context, profile Profile, bindingID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validateBindingID(bindingID); err != nil {
+		return err
+	}
 	if !profile.DryRun {
 		service := serviceName(profile, bindingID)
-		if exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
-			if err := exec.Command("systemctl", "stop", service).Run(); err != nil {
-				stopErr = fmt.Errorf("systemctl stop %s: %w", service, err)
+		active, err := serviceIsActive(ctx, service)
+		if err != nil {
+			return err
+		}
+		if active {
+			if err := runSystemctl(ctx, "stop", service); err != nil {
+				return fmt.Errorf("systemctl stop %s: %w", service, err)
 			}
 		}
-		_ = exec.Command("systemctl", "reset-failed", service).Run()
+		_ = runSystemctl(ctx, "reset-failed", service)
 	}
-	if stopErr != nil {
-		return stopErr
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	_ = os.Remove(rulePath(profile, bindingID))
-	_ = os.RemoveAll(instanceDir(profile, bindingID))
+	if err := os.RemoveAll(instanceDir(profile, bindingID)); err != nil {
+		return err
+	}
+	if err := os.Remove(rulePath(profile, bindingID)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	return nil
 }
 
-func CleanupExpired(profile Profile, now time.Time) ([]string, error) {
+func readRule(profile Profile, path string) (Rule, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return Rule{}, err
+	}
+	var rule Rule
+	if err := json.Unmarshal(raw, &rule); err != nil {
+		return Rule{}, fmt.Errorf("decode %s: %w", path, err)
+	}
+	if err := validateRule(rule); err != nil {
+		return Rule{}, fmt.Errorf("invalid rule %s: %w", path, err)
+	}
+	if path != rulePath(profile, rule.BindingID) {
+		return Rule{}, fmt.Errorf("binding id does not match rule file %s", path)
+	}
+	return rule, nil
+}
+
+func CleanupExpired(ctx context.Context, profile Profile, now time.Time) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	files, err := filepath.Glob(filepath.Join(profile.RulesDir, "cg-*.json"))
 	if err != nil {
 		return nil, err
 	}
 	var removed []string
+	var errs []error
 	for _, file := range files {
-		raw, err := os.ReadFile(file)
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		rule, err := readRule(profile, file)
 		if err != nil {
-			return removed, err
+			errs = append(errs, err)
+			continue
 		}
-		var rule Rule
-		if err := json.Unmarshal(raw, &rule); err != nil {
-			return removed, fmt.Errorf("decode %s: %w", file, err)
-		}
-		expiresAt, err := time.Parse(time.RFC3339, rule.ExpiresAt)
-		if err != nil {
-			return removed, fmt.Errorf("invalid expiry for %s: %w", rule.BindingID, err)
-		}
+		expiresAt, _ := time.Parse(time.RFC3339, rule.ExpiresAt)
 		if now.Before(expiresAt) {
 			continue
 		}
-		if err := Delete(profile, rule.BindingID); err != nil {
-			return removed, err
+		if err := Delete(ctx, profile, rule.BindingID); err != nil {
+			errs = append(errs, fmt.Errorf("delete expired %s: %w", rule.BindingID, err))
+			continue
 		}
 		removed = append(removed, rule.BindingID)
 	}
 	sort.Strings(removed)
-	return removed, nil
+	return removed, errors.Join(errs...)
 }
 
-func Reconcile(profile Profile) error {
+func Reconcile(ctx context.Context, profile Profile) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	files, err := filepath.Glob(filepath.Join(profile.RulesDir, "cg-*.json"))
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, file := range files {
-		raw, err := os.ReadFile(file)
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		rule, err := readRule(profile, file)
 		if err != nil {
-			return err
+			errs = append(errs, err)
+			continue
 		}
-		var rule Rule
-		if err := json.Unmarshal(raw, &rule); err != nil {
-			return fmt.Errorf("decode %s: %w", file, err)
+		expiresAt, _ := time.Parse(time.RFC3339, rule.ExpiresAt)
+		if !time.Now().Before(expiresAt) {
+			continue
 		}
-		if err := Apply(profile, rule); err != nil {
-			return err
+		if err := Apply(ctx, profile, rule); err != nil {
+			errs = append(errs, fmt.Errorf("reconcile %s: %w", rule.BindingID, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func CountRules(profile Profile) int {
@@ -185,9 +309,16 @@ func containsProtocol(protocols []string, wanted string) bool {
 	return false
 }
 
+func validateBindingID(bindingID string) error {
+	if bindingID == "." || bindingID == ".." || !bindingIDPattern.MatchString(bindingID) {
+		return fmt.Errorf("invalid binding id %q", bindingID)
+	}
+	return nil
+}
+
 func validateRule(rule Rule) error {
-	if !bindingIDPattern.MatchString(rule.BindingID) {
-		return fmt.Errorf("invalid binding id %q", rule.BindingID)
+	if err := validateBindingID(rule.BindingID); err != nil {
+		return err
 	}
 	if rule.ListenPort < 1 || rule.ListenPort > 65535 || rule.TargetPort < 1 || rule.TargetPort > 65535 {
 		return fmt.Errorf("invalid port for binding %s", rule.BindingID)
@@ -209,8 +340,8 @@ func writeAtomic(path string, raw []byte, mode os.FileMode) error {
 	if err := os.WriteFile(tmp, raw, mode); err != nil {
 		return err
 	}
+	defer os.Remove(tmp)
 	if err := os.Chmod(tmp, mode); err != nil {
-		_ = os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, path)

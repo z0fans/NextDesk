@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -11,12 +12,61 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
 const testSigningKey = "test-derived-probe-key"
+
+type bannerConn struct {
+	net.Conn
+	reader    io.Reader
+	readBytes int
+	written   bytes.Buffer
+}
+
+func (conn *bannerConn) Read(p []byte) (int, error) {
+	n, err := conn.reader.Read(p)
+	conn.readBytes += n
+	return n, err
+}
+
+func (conn *bannerConn) Write(p []byte) (int, error) { return conn.written.Write(p) }
+
+func TestSSHBannerReadIsBounded(t *testing.T) {
+	const identification = "SSH-2.0-TestServer\r\n"
+	for _, tc := range []struct {
+		name    string
+		payload string
+		tooBig  bool
+	}{
+		{"normal", identification, false},
+		{"unterminated_line", strings.Repeat("x", 2*maxSSHBannerBytes), true},
+		{"cumulative_lines", strings.Repeat(strings.Repeat("x", 349)+"\n", 30) + identification, true},
+		{"exact_limit", strings.Repeat("x", maxSSHBannerBytes-len(identification)-1) + "\n" + identification, false},
+		{"one_over_limit", strings.Repeat("x", maxSSHBannerBytes-len(identification)) + "\n" + identification, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := &bannerConn{reader: strings.NewReader(tc.payload)}
+			err := probeSSH(conn)
+			if conn.readBytes > maxSSHBannerBytes+1 {
+				t.Errorf("read %d bytes before rejecting the banner", conn.readBytes)
+			}
+			if tc.tooBig {
+				if err == nil || err.Error() != "ssh_banner_too_large" {
+					t.Errorf("expected size-limit error, got %v", err)
+				}
+				if conn.written.Len() != 0 {
+					t.Error("sent identification after rejecting an oversized banner")
+				}
+			} else if err != nil || conn.written.String() != "SSH-2.0-NextDeskGatewayProbe_1.0\r\n" {
+				t.Errorf("valid identification failed: %v", err)
+			}
+		})
+	}
+}
 
 func signedTask(t *testing.T, service string, port int) Task {
 	t.Helper()
@@ -177,8 +227,8 @@ func TestExecutorSharesInflightAndShortCache(t *testing.T) {
 	second := first
 	second.ProbeID = "prb_test_02"
 	second.Signature = SignTask("agt_test", testSigningKey, second)
-	executor.Submit(first, testSigningKey, func(result Result) { results <- result })
-	executor.Submit(second, testSigningKey, func(result Result) { results <- result })
+	executor.Submit(context.Background(), first, testSigningKey, func(result Result) { results <- result })
+	executor.Submit(context.Background(), second, testSigningKey, func(result Result) { results <- result })
 	seen := map[string]bool{}
 	for len(seen) < 2 {
 		select {
@@ -191,7 +241,7 @@ func TestExecutorSharesInflightAndShortCache(t *testing.T) {
 	third := first
 	third.ProbeID = "prb_test_03"
 	third.Signature = SignTask("agt_test", testSigningKey, third)
-	executor.Submit(third, testSigningKey, func(result Result) { results <- result })
+	executor.Submit(context.Background(), third, testSigningKey, func(result Result) { results <- result })
 	select {
 	case result := <-results:
 		if result.Status != "success" || result.ProbeID != third.ProbeID {
@@ -229,7 +279,7 @@ func TestExecutorCancellationInterruptsActiveProbe(t *testing.T) {
 	})
 	task := signedTask(t, "ssh", port)
 	results := make(chan Result, 1)
-	executor.Submit(task, testSigningKey, func(result Result) { results <- result })
+	executor.Submit(context.Background(), task, testSigningKey, func(result Result) { results <- result })
 	select {
 	case <-accepted:
 	case <-time.After(time.Second):
@@ -271,7 +321,7 @@ func TestExecutorEnforcesPerTargetRateLimitWithoutNetworkRetry(t *testing.T) {
 	})
 	results := make(chan Result, 2)
 	first := signedTask(t, "ssh", port)
-	executor.Submit(first, testSigningKey, func(result Result) { results <- result })
+	executor.Submit(context.Background(), first, testSigningKey, func(result Result) { results <- result })
 	select {
 	case result := <-results:
 		if result.Status != "success" {
@@ -283,7 +333,7 @@ func TestExecutorEnforcesPerTargetRateLimitWithoutNetworkRetry(t *testing.T) {
 	second := first
 	second.ProbeID = "prb_rate_02"
 	second.Signature = SignTask("agt_test", testSigningKey, second)
-	executor.Submit(second, testSigningKey, func(result Result) { results <- result })
+	executor.Submit(context.Background(), second, testSigningKey, func(result Result) { results <- result })
 	select {
 	case result := <-results:
 		if result.DiagnosticCode != "probe_rate_limited" || result.OutcomeCategory != "resource_limited" {
@@ -333,7 +383,7 @@ func TestExecutorEnforcesConcurrencyBeforeDialingSecondTarget(t *testing.T) {
 	})
 	results := make(chan Result, 2)
 	first := signedTask(t, "ssh", firstPort)
-	executor.Submit(first, testSigningKey, func(result Result) { results <- result })
+	executor.Submit(context.Background(), first, testSigningKey, func(result Result) { results <- result })
 	select {
 	case <-firstAccepted:
 	case <-time.After(time.Second):
@@ -346,7 +396,7 @@ func TestExecutorEnforcesConcurrencyBeforeDialingSecondTarget(t *testing.T) {
 	second.DeadlineAt = now.Add(250 * time.Millisecond).Format(time.RFC3339Nano)
 	second.ExpiresAt = now.Add(time.Second).Format(time.RFC3339Nano)
 	second.Signature = SignTask("agt_test", testSigningKey, second)
-	executor.Submit(second, testSigningKey, func(result Result) { results <- result })
+	executor.Submit(context.Background(), second, testSigningKey, func(result Result) { results <- result })
 	select {
 	case result := <-results:
 		if result.ProbeID != second.ProbeID || result.DiagnosticCode != "probe_concurrency_limited" || result.OutcomeCategory != "resource_limited" {

@@ -2,12 +2,14 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"nextdesk/gateway-agent/internal/api"
@@ -42,11 +44,19 @@ func New(cfg config.Config, dryRun bool) (Runner, error) {
 	}, nil
 }
 
-func (r *Runner) Run(ctx context.Context) error {
+func (r *Runner) Run(parent context.Context) error {
+	ctx, cancel := context.WithCancel(parent)
+	defer func() {
+		cancel()
+		r.Probes.Close()
+	}()
 	ticker := time.NewTicker(r.Config.PollInterval())
 	defer ticker.Stop()
 	for {
-		if err := r.Once(); err != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := r.cycle(ctx, func(result probe.Result) { _ = r.report(ctx, result) }); err != nil {
 			log.Printf("gateway-agent cycle failed: %v", err)
 		}
 		select {
@@ -57,60 +67,110 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 }
 
-func (r *Runner) Once() error {
-	removed, err := realm.CleanupExpired(r.Profile, time.Now())
+func (r *Runner) Once(parent context.Context) error {
+	ctx, cancel := context.WithCancel(parent)
+	defer func() {
+		cancel()
+		r.Probes.Close()
+	}()
+	var mu sync.Mutex
+	var deliveryErr error
+	cycleErr := r.cycle(ctx, func(result probe.Result) {
+		if err := r.report(ctx, result); err != nil {
+			mu.Lock()
+			if deliveryErr == nil {
+				deliveryErr = err
+			}
+			mu.Unlock()
+		}
+	})
+	r.Probes.Wait()
+	return errors.Join(cycleErr, ctx.Err(), deliveryErr)
+}
+
+func (r *Runner) report(ctx context.Context, result probe.Result) error {
+	if err := r.Client.ProbeResult(ctx, result); err != nil {
+		err = fmt.Errorf("probe result %s delivery failed: %w", result.ProbeID, err)
+		log.Printf("gateway-agent %v", err)
+		return err
+	}
+	return nil
+}
+
+func (r *Runner) cycle(ctx context.Context, report func(probe.Result)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	removed, err := realm.CleanupExpired(ctx, r.Profile, time.Now())
 	if err != nil {
 		log.Printf("gateway-agent local expiry cleanup failed: %v", err)
 	}
 	if len(removed) > 0 {
 		log.Printf("gateway-agent removed %d expired bindings", len(removed))
 	}
-	if err := realm.Reconcile(r.Profile); err != nil {
+	if err := realm.Reconcile(ctx, r.Profile); err != nil {
 		log.Printf("gateway-agent reconcile failed: %v", err)
 	}
-	heartbeat, err := r.Client.Heartbeat(r.metrics())
+	heartbeat, err := r.Client.Heartbeat(ctx, r.metrics())
 	if err != nil {
 		return err
 	}
-	tasks, err := r.Client.Poll()
+	tasks, err := r.Client.Poll(ctx)
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, task := range tasks {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
 		if task.Action == "probe_target" {
 			if task.Probe == nil {
 				log.Printf("gateway-agent rejected malformed probe task")
 				continue
 			}
-			r.Probes.Submit(*task.Probe, heartbeat.ProbeTaskKey, func(result probe.Result) {
-				if err := r.Client.ProbeResult(result); err != nil {
-					log.Printf("gateway-agent probe result %s delivery failed: %v", result.ProbeID, err)
-				}
-			})
+			if err := r.Probes.Submit(ctx, *task.Probe, heartbeat.ProbeTaskKey, report); err != nil {
+				return errors.Join(append(errs, err)...)
+			}
 			continue
 		}
 		if task.Action == "cancel_probe" {
 			if task.Probe != nil && !r.Probes.Cancel(task.Probe.ProbeID) {
-				log.Printf("gateway-agent probe %s was not active when cancellation arrived", task.Probe.ProbeID)
+				// A restarted Agent has no task to cancel; still acknowledge the requested terminal state.
+				now := time.Now().UTC().Format(time.RFC3339Nano)
+				report(probe.Result{
+					ProbeID: task.Probe.ProbeID, Status: "cancelled", OutcomeCategory: "cancelled",
+					StartedAt: now, CompletedAt: now, StageDurationsMS: map[string]int64{},
+					DiagnosticCode: "probe_cancelled",
+				})
 			}
 			continue
 		}
-		if err := r.apply(task); err != nil {
+		if task.Action != "create_binding" && task.Action != "delete_binding" {
+			log.Printf("gateway-agent ignored unsupported task action %q", task.Action)
+			continue
+		}
+		status, code, message := "active", "", ""
+		if err := r.apply(ctx, task); err != nil {
+			log.Printf("gateway-agent %s %s failed: %v", task.Action, task.BindingID, err)
+			if ctx.Err() != nil {
+				return errors.Join(append(errs, err)...)
+			}
 			if task.Action == "delete_binding" {
-				log.Printf("gateway-agent delete binding %s failed: %v", task.BindingID, err)
+				errs = append(errs, err)
 				continue
 			}
-			_ = realm.Delete(r.Profile, task.BindingID)
-			_ = r.Client.Ack(task.BindingID, "failed", "apply_failed", err.Error())
-			continue
+			status, code, message = "failed", "apply_failed", err.Error()
+		} else if task.Action == "delete_binding" {
+			status = "closed"
 		}
-		if task.Action == "delete_binding" {
-			_ = r.Client.Ack(task.BindingID, "closed", "", "")
-		} else {
-			_ = r.Client.Ack(task.BindingID, "active", "", "")
+		if err := r.Client.Ack(ctx, task.BindingID, status, code, message); err != nil {
+			err = fmt.Errorf("ack %s delivery failed: %w", task.BindingID, err)
+			log.Printf("gateway-agent %v", err)
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (r *Runner) metrics() map[string]any {
@@ -148,14 +208,14 @@ func (r *Runner) metrics() map[string]any {
 	return metrics
 }
 
-func (r *Runner) apply(task api.Task) error {
+func (r *Runner) apply(ctx context.Context, task api.Task) error {
 	if task.Action == "delete_binding" {
-		return realm.Delete(r.Profile, task.BindingID)
+		return realm.Delete(ctx, r.Profile, task.BindingID)
 	}
 	if task.Action != "create_binding" {
 		return fmt.Errorf("unsupported binding action %q", task.Action)
 	}
-	return realm.Apply(r.Profile, realm.Rule{
+	return realm.Apply(ctx, r.Profile, realm.Rule{
 		BindingID:  task.BindingID,
 		ListenPort: task.ListenPort,
 		TargetHost: task.TargetHost,
