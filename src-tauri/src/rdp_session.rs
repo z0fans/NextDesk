@@ -1449,7 +1449,7 @@ pub fn spawn_session(
             )
             .await;
 
-            let _ = frame_ws_shutdown.send(());
+            frame_ws_shutdown.shutdown().await;
 
             match &result {
                 Ok(reason) => {

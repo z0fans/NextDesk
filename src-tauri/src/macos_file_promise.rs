@@ -108,6 +108,7 @@ impl NextDeskFilePromiseDelegate {
 pub fn write_files_with_native_file_promise(
     files: &[VirtualClipboardFile],
 ) -> Result<Option<VirtualClipboardWriteResult>, String> {
+    crate::virtual_file_clipboard::validate_clipboard_files(files)?;
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| "NSFilePromiseProvider must be created on the main thread".to_string())?;
 

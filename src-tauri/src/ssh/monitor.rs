@@ -1,4 +1,3 @@
-use super::session::NextDeskSshClient;
 use super::types::{SshMonitorDisk, SshMonitorProcess, SshMonitorSnapshot};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
@@ -198,7 +197,7 @@ impl MonitorRuntime {
 }
 
 async fn open_monitor_channel(
-    ssh: &client::Handle<NextDeskSshClient>,
+    ssh: &client::Handle<impl client::Handler>,
 ) -> Result<russh::Channel<client::Msg>, String> {
     let channel = tokio::time::timeout(MONITOR_CHANNEL_OPEN_TIMEOUT, ssh.channel_open_session())
         .await
@@ -208,7 +207,7 @@ async fn open_monitor_channel(
 }
 
 pub async fn collect_monitor_snapshot(
-    ssh: Arc<client::Handle<NextDeskSshClient>>,
+    ssh: Arc<client::Handle<impl client::Handler>>,
     runtime: Arc<Mutex<MonitorRuntime>>,
 ) -> Result<SshMonitorSnapshot, String> {
     let latency_ms = measure_ssh_latency(ssh.as_ref()).await?;
@@ -232,7 +231,7 @@ pub async fn collect_monitor_snapshot(
     Ok(runtime.lock().unwrap().materialize(raw, latency_ms))
 }
 
-async fn measure_ssh_latency(ssh: &client::Handle<NextDeskSshClient>) -> Result<f64, String> {
+async fn measure_ssh_latency(ssh: &client::Handle<impl client::Handler>) -> Result<f64, String> {
     tokio::time::timeout(MONITOR_LATENCY_TIMEOUT, async {
         let started_at = Instant::now();
         let mut channel = ssh

@@ -83,6 +83,17 @@ describe('friendlyRdpError', () => {
     expect(friendlyRdpError('cloud_prepare_unsupported', t)).toBe(testTranslations.rdpErrCloudGatewayOutdated);
   });
 
+  it('maps the stable gateway rate limit before unrelated URL digits', () => {
+    expect(friendlyRdpError('cloud_rate_limited: https://gateway.example:403/renew', t))
+      .toBe('cloudRateLimited');
+  });
+
+  it('requires a stable cloud authorization marker instead of scanning URL digits', () => {
+    expect(friendlyRdpError('cloud_authorization_expired', t)).toBe(testTranslations.rdpErrCloudAuth);
+    expect(friendlyRdpError('cloud request to https://gateway.example:401/renew failed', t))
+      .toBe(testTranslations.rdpErrUnknown);
+  });
+
   it('maps native login-finalization timeout to an actionable authentication hint', () => {
     const raw = 'RDP connect_finalize timed out after 25s: credential_check_timeout: server did not complete RDP login finalization';
     expect(friendlyRdpError(raw, t)).toBe(testTranslations.rdpErrLoginTimeout);

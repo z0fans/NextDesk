@@ -1,4 +1,3 @@
-use super::session::NextDeskSshClient;
 use super::types::{
     SftpCreateDirectoryRequest, SftpEntry, SftpEntryKind, SftpListRequest, SftpListResponse,
     SftpOpenResponse, SftpReadTextRequest, SftpReadTextResponse, SftpRemoveRequest,
@@ -15,17 +14,17 @@ use std::time::Duration;
 use tauri::ipc::Channel;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 const SFTP_CHANNEL_TIMEOUT: Duration = Duration::from_secs(15);
-const SFTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+pub(super) const SFTP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const SFTP_TRANSFER_CHUNK_SIZE: usize = 256 * 1024;
 const SFTP_TEXT_FILE_LIMIT: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone)]
 struct ActiveTransfer {
     cancellation: CancellationToken,
-    completed: CancellationToken,
 }
 
 pub enum SftpControl {
@@ -82,10 +81,27 @@ pub struct SftpRuntime {
     home_path: Option<String>,
     transfers: Arc<Mutex<HashMap<String, ActiveTransfer>>>,
     mutations: Arc<tokio::sync::Mutex<()>>,
+    tasks: JoinSet<()>,
+    closing: CancellationToken,
 }
 
 impl SftpRuntime {
-    pub async fn handle(&mut self, control: SftpControl, ssh: &client::Handle<NextDeskSshClient>) {
+    pub fn new(closing: CancellationToken) -> Self {
+        Self {
+            closing,
+            ..Self::default()
+        }
+    }
+
+    pub async fn handle(
+        &mut self,
+        control: SftpControl,
+        ssh: &client::Handle<impl client::Handler>,
+    ) {
+        if self.closing.is_cancelled() {
+            return;
+        }
+        while self.tasks.try_join_next().is_some() {}
         match control {
             SftpControl::Open { reply } => {
                 let result = self.open(ssh).await;
@@ -96,10 +112,18 @@ impl SftpRuntime {
                     let _ = reply.send(Err("sftp_session_not_open".to_string()));
                     return;
                 };
-                tauri::async_runtime::spawn(async move {
-                    let result = list_directory(session, request).await;
-                    let _ = reply.send(result);
-                });
+                let closing = self.closing.clone();
+                self.tasks.spawn_on(
+                    async move {
+                        let result = tokio::select! {
+                            biased;
+                            _ = closing.cancelled() => Err("sftp_session_closed".to_string()),
+                            result = list_directory(session, request) => result,
+                        };
+                        let _ = reply.send(result);
+                    },
+                    tauri::async_runtime::handle().inner(),
+                );
             }
             SftpControl::Upload {
                 request,
@@ -123,11 +147,19 @@ impl SftpRuntime {
                     return;
                 };
                 let mutations = Arc::clone(&self.mutations);
-                tauri::async_runtime::spawn(async move {
-                    let _guard = mutations.lock().await;
-                    let result = create_directory(&session, request).await;
-                    let _ = reply.send(result);
-                });
+                let closing = self.closing.clone();
+                self.tasks.spawn_on(
+                    async move {
+                        let _guard = tokio::select! {
+                            biased;
+                            _ = closing.cancelled() => return,
+                            guard = mutations.lock() => guard,
+                        };
+                        let result = create_directory(&session, request).await;
+                        let _ = reply.send(result);
+                    },
+                    tauri::async_runtime::handle().inner(),
+                );
             }
             SftpControl::Rename { request, reply } => {
                 let Some(session) = self.session.clone() else {
@@ -135,11 +167,19 @@ impl SftpRuntime {
                     return;
                 };
                 let mutations = Arc::clone(&self.mutations);
-                tauri::async_runtime::spawn(async move {
-                    let _guard = mutations.lock().await;
-                    let result = rename_remote_path(&session, request).await;
-                    let _ = reply.send(result);
-                });
+                let closing = self.closing.clone();
+                self.tasks.spawn_on(
+                    async move {
+                        let _guard = tokio::select! {
+                            biased;
+                            _ = closing.cancelled() => return,
+                            guard = mutations.lock() => guard,
+                        };
+                        let result = rename_remote_path(&session, request).await;
+                        let _ = reply.send(result);
+                    },
+                    tauri::async_runtime::handle().inner(),
+                );
             }
             SftpControl::Remove { request, reply } => {
                 let Some(session) = self.session.clone() else {
@@ -147,21 +187,37 @@ impl SftpRuntime {
                     return;
                 };
                 let mutations = Arc::clone(&self.mutations);
-                tauri::async_runtime::spawn(async move {
-                    let _guard = mutations.lock().await;
-                    let result = remove_remote_request(&session, request).await;
-                    let _ = reply.send(result);
-                });
+                let closing = self.closing.clone();
+                self.tasks.spawn_on(
+                    async move {
+                        let _guard = tokio::select! {
+                            biased;
+                            _ = closing.cancelled() => return,
+                            guard = mutations.lock() => guard,
+                        };
+                        let result = remove_remote_request(&session, request).await;
+                        let _ = reply.send(result);
+                    },
+                    tauri::async_runtime::handle().inner(),
+                );
             }
             SftpControl::ReadText { request, reply } => {
                 let Some(session) = self.session.clone() else {
                     let _ = reply.send(Err("sftp_session_not_open".to_string()));
                     return;
                 };
-                tauri::async_runtime::spawn(async move {
-                    let result = read_text_file(&session, request).await;
-                    let _ = reply.send(result);
-                });
+                let closing = self.closing.clone();
+                self.tasks.spawn_on(
+                    async move {
+                        let result = tokio::select! {
+                            biased;
+                            _ = closing.cancelled() => Err("sftp_session_closed".to_string()),
+                            result = read_text_file(&session, request) => result,
+                        };
+                        let _ = reply.send(result);
+                    },
+                    tauri::async_runtime::handle().inner(),
+                );
             }
             SftpControl::WriteText { request, reply } => {
                 let Some(session) = self.session.clone() else {
@@ -169,11 +225,19 @@ impl SftpRuntime {
                     return;
                 };
                 let mutations = Arc::clone(&self.mutations);
-                tauri::async_runtime::spawn(async move {
-                    let _guard = mutations.lock().await;
-                    let result = write_text_file(&session, request).await;
-                    let _ = reply.send(result);
-                });
+                let closing = self.closing.clone();
+                self.tasks.spawn_on(
+                    async move {
+                        let _guard = tokio::select! {
+                            biased;
+                            _ = closing.cancelled() => return,
+                            guard = mutations.lock() => guard,
+                        };
+                        let result = write_text_file(&session, request).await;
+                        let _ = reply.send(result);
+                    },
+                    tauri::async_runtime::handle().inner(),
+                );
             }
             SftpControl::SetPermissions { request, reply } => {
                 let Some(session) = self.session.clone() else {
@@ -181,17 +245,25 @@ impl SftpRuntime {
                     return;
                 };
                 let mutations = Arc::clone(&self.mutations);
-                tauri::async_runtime::spawn(async move {
-                    let _guard = mutations.lock().await;
-                    let result = set_permissions(&session, request).await;
-                    let _ = reply.send(result);
-                });
+                let closing = self.closing.clone();
+                self.tasks.spawn_on(
+                    async move {
+                        let _guard = tokio::select! {
+                            biased;
+                            _ = closing.cancelled() => return,
+                            guard = mutations.lock() => guard,
+                        };
+                        let result = set_permissions(&session, request).await;
+                        let _ = reply.send(result);
+                    },
+                    tauri::async_runtime::handle().inner(),
+                );
             }
         }
     }
 
     fn start_transfer(
-        &self,
+        &mut self,
         direction: SftpTransferDirection,
         request: SftpTransferRequest,
         on_progress: Channel<SftpTransferEvent>,
@@ -205,8 +277,7 @@ impl SftpRuntime {
             let _ = reply.send(Err("sftp_session_not_open".to_string()));
             return;
         };
-        let cancellation = CancellationToken::new();
-        let completed = CancellationToken::new();
+        let cancellation = self.closing.child_token();
         {
             let mut transfers = self.transfers.lock().unwrap();
             if transfers.contains_key(&request.transfer_id) {
@@ -217,7 +288,6 @@ impl SftpRuntime {
                 request.transfer_id.clone(),
                 ActiveTransfer {
                     cancellation: cancellation.clone(),
-                    completed: completed.clone(),
                 },
             );
         }
@@ -225,93 +295,99 @@ impl SftpRuntime {
         let mutations = Arc::clone(&self.mutations);
         let transferred_bytes = Arc::new(AtomicU64::new(0));
         let total_bytes = Arc::new(AtomicU64::new(0));
-        tauri::async_runtime::spawn(async move {
-            emit_transfer(
-                &on_progress,
-                &request,
-                direction,
-                SftpTransferState::Queued,
-                0,
-                0,
-                None,
-            );
-            let result = match direction {
-                SftpTransferDirection::Upload => {
-                    if request.recursive {
-                        upload_directory(
-                            &session,
-                            &request,
-                            &cancellation,
-                            &on_progress,
-                            &transferred_bytes,
-                            &total_bytes,
-                            &mutations,
-                        )
-                        .await
-                    } else {
-                        upload_file(
-                            &session,
-                            &request,
-                            &cancellation,
-                            &on_progress,
-                            &transferred_bytes,
-                            &total_bytes,
-                            &mutations,
-                        )
-                        .await
+        self.tasks.spawn_on(
+            async move {
+                emit_transfer(
+                    &on_progress,
+                    &request,
+                    direction,
+                    SftpTransferState::Queued,
+                    0,
+                    0,
+                    None,
+                );
+                let result = if cancellation.is_cancelled() {
+                    Err("sftp_transfer_cancelled".to_string())
+                } else {
+                    match direction {
+                        SftpTransferDirection::Upload => {
+                            if request.recursive {
+                                upload_directory(
+                                    &session,
+                                    &request,
+                                    &cancellation,
+                                    &on_progress,
+                                    &transferred_bytes,
+                                    &total_bytes,
+                                    &mutations,
+                                )
+                                .await
+                            } else {
+                                upload_file(
+                                    &session,
+                                    &request,
+                                    &cancellation,
+                                    &on_progress,
+                                    &transferred_bytes,
+                                    &total_bytes,
+                                    &mutations,
+                                )
+                                .await
+                            }
+                        }
+                        SftpTransferDirection::Download => {
+                            if request.recursive {
+                                download_directory(
+                                    &session,
+                                    &request,
+                                    &cancellation,
+                                    &on_progress,
+                                    &transferred_bytes,
+                                    &total_bytes,
+                                    &mutations,
+                                )
+                                .await
+                            } else {
+                                download_file(
+                                    &session,
+                                    &request,
+                                    &cancellation,
+                                    &on_progress,
+                                    &transferred_bytes,
+                                    &total_bytes,
+                                    &mutations,
+                                )
+                                .await
+                            }
+                        }
                     }
-                }
-                SftpTransferDirection::Download => {
-                    if request.recursive {
-                        download_directory(
-                            &session,
-                            &request,
-                            &cancellation,
-                            &on_progress,
-                            &transferred_bytes,
-                            &total_bytes,
-                            &mutations,
-                        )
-                        .await
-                    } else {
-                        download_file(
-                            &session,
-                            &request,
-                            &cancellation,
-                            &on_progress,
-                            &transferred_bytes,
-                            &total_bytes,
-                            &mutations,
-                        )
-                        .await
+                };
+                let (state, message) = match &result {
+                    Ok(()) => (SftpTransferState::Completed, None),
+                    Err(error) if error == "sftp_transfer_cancelled" => {
+                        (SftpTransferState::Cancelled, Some(error.clone()))
                     }
-                }
-            };
-            let (state, message) = match &result {
-                Ok(()) => (SftpTransferState::Completed, None),
-                Err(error) if error == "sftp_transfer_cancelled" => {
-                    (SftpTransferState::Cancelled, Some(error.clone()))
-                }
-                Err(error) => (SftpTransferState::Failed, Some(error.clone())),
-            };
-            emit_transfer(
-                &on_progress,
-                &request,
-                direction,
-                state,
-                transferred_bytes.load(Ordering::Relaxed),
-                total_bytes.load(Ordering::Relaxed),
-                message,
-            );
-            transfers.lock().unwrap().remove(&request.transfer_id);
-            completed.cancel();
-            let _ = reply.send(result);
-        });
+                    Err(error) => (SftpTransferState::Failed, Some(error.clone())),
+                };
+                emit_transfer(
+                    &on_progress,
+                    &request,
+                    direction,
+                    state,
+                    transferred_bytes.load(Ordering::Relaxed),
+                    total_bytes.load(Ordering::Relaxed),
+                    message,
+                );
+                transfers.lock().unwrap().remove(&request.transfer_id);
+                let _ = reply.send(result);
+            },
+            tauri::async_runtime::handle().inner(),
+        );
     }
 
     async fn open(
         &mut self,
-        ssh: &client::Handle<NextDeskSshClient>,
+        ssh: &client::Handle<impl client::Handler>,
     ) -> Result<SftpOpenResponse, String> {
         if let (Some(_), Some(path)) = (&self.session, &self.home_path) {
             return Ok(SftpOpenResponse { path: path.clone() });
@@ -335,37 +411,33 @@ impl SftpRuntime {
         .await
         .map_err(|_| "sftp_handshake_timeout".to_string())?
         .map_err(|_| "sftp_handshake_failed".to_string())?;
+        self.session = Some(Arc::new(session));
+        let session = self.session.as_ref().unwrap();
         let path = tokio::time::timeout(SFTP_CHANNEL_TIMEOUT, session.canonicalize("."))
             .await
             .map_err(|_| "sftp_home_timeout".to_string())?
             .map_err(|_| "sftp_home_unavailable".to_string())?;
         self.home_path = Some(path.clone());
-        self.session = Some(Arc::new(session));
         Ok(SftpOpenResponse { path })
     }
 
     pub async fn shutdown(&mut self) {
-        let transfers = self
-            .transfers
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for transfer in &transfers {
-            transfer.cancellation.cancel();
-        }
-        let wait_for_cleanup = async {
-            for transfer in &transfers {
-                transfer.completed.cancelled().await;
-            }
-        };
-        if tokio::time::timeout(SFTP_SHUTDOWN_TIMEOUT, wait_for_cleanup)
-            .await
-            .is_err()
+        self.shutdown_with_timeout(SFTP_SHUTDOWN_TIMEOUT).await;
+    }
+
+    async fn shutdown_with_timeout(&mut self, timeout: Duration) {
+        self.closing.cancel();
+        // Keep the transport alive while transfers clean up their temporary files.
+        if tokio::time::timeout(timeout, async {
+            while self.tasks.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
         {
-            log::warn!("[ssh] timed out waiting for SFTP transfers to stop cleanly");
+            log::warn!("[ssh] timed out waiting for SFTP operations to stop cleanly");
+            self.tasks.shutdown().await;
         }
+        self.transfers.lock().unwrap().clear();
         if let Some(session) = self.session.take() {
             let _ = session.close().await;
         }
@@ -458,6 +530,8 @@ async fn write_text_file(
     }
     .await;
     if result.is_err() {
+        let _ = remote.shutdown().await;
+        drop(remote);
         let _ = session.remove_file(temporary).await;
     }
     result
@@ -587,6 +661,8 @@ async fn upload_file(
     }
     .await;
     if result.is_err() {
+        let _ = remote.shutdown().await;
+        drop(remote);
         let _ = session.remove_file(temporary).await;
     }
     result
@@ -673,13 +749,27 @@ async fn download_file(
         if cancellation.is_cancelled() {
             return Err("sftp_transfer_cancelled".to_string());
         }
-        let _guard = tokio::select! {
-            _ = cancellation.cancelled() => return Err("sftp_transfer_cancelled".to_string()),
-            guard = mutations.lock() => guard,
-        };
-        commit_local_file(&temporary, &target, request.overwrite, &request.transfer_id).await
+        Ok(())
     }
     .await;
+    drop(local);
+    drop(remote);
+    let result = match result {
+        Ok(()) => {
+            let guard = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => None,
+                guard = mutations.lock() => Some(guard),
+            };
+            if let Some(_guard) = guard {
+                commit_local_file(&temporary, &target, request.overwrite, &request.transfer_id)
+                    .await
+            } else {
+                Err("sftp_transfer_cancelled".to_string())
+            }
+        }
+        result => result,
+    };
     if result.is_err() {
         let _ = tokio::fs::remove_file(&temporary).await;
     }
@@ -1238,9 +1328,9 @@ fn remote_side_path(target: &str, suffix: &str) -> Result<String, String> {
         return Err("sftp_remote_path_invalid".to_string());
     }
     let generated = format!(".{name}.{suffix}");
-    Ok(if parent.is_empty() {
+    Ok(if parent.is_empty() && !target.starts_with('/') {
         generated
-    } else if parent == "/" {
+    } else if parent.is_empty() || parent == "/" {
         format!("/{generated}")
     } else {
         format!("{parent}/{generated}")
@@ -1438,6 +1528,22 @@ mod tests {
         assert!(remote_join_path("/home/root", Path::new("../escape")).is_err());
     }
 
+    #[test]
+    fn temporary_remote_paths_stay_beside_root_and_relative_targets() {
+        assert_eq!(
+            super::remote_side_path("/file", "part").unwrap(),
+            "/.file.part"
+        );
+        assert_eq!(
+            super::remote_side_path("file", "part").unwrap(),
+            ".file.part"
+        );
+        assert_eq!(
+            super::remote_side_path("/dir/file", "part").unwrap(),
+            "/dir/.file.part"
+        );
+    }
+
     #[tokio::test]
     async fn scans_local_directory_trees_for_recursive_uploads() {
         let suffix = SystemTime::now()
@@ -1461,6 +1567,131 @@ mod tests {
             .iter()
             .any(|file| file.relative_path == PathBuf::from("logs/app.log")));
         assert_eq!(total, 5);
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
+
+    async fn open_runtime(fixture: &crate::ssh::test_support::Fixture) -> super::SftpRuntime {
+        let mut runtime = super::SftpRuntime::default();
+        let (reply, response) = tokio::sync::oneshot::channel();
+        runtime
+            .handle(super::SftpControl::Open { reply }, &fixture.ssh)
+            .await;
+        response.await.unwrap().unwrap();
+        runtime
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_running_mutation_but_drops_queued_mutations() {
+        use crate::ssh::test_support::{within, Block, Fixture};
+        for force_abort in [false, true] {
+            let block = Block::new("mkdir");
+            let fixture = Fixture::new(true, Some(block.clone())).await;
+            let mut runtime = open_runtime(&fixture).await;
+            let (first_reply, first_result) = tokio::sync::oneshot::channel();
+            let (second_reply, second_result) = tokio::sync::oneshot::channel();
+            for (path, reply) in [("/running", first_reply), ("/queued", second_reply)] {
+                runtime
+                    .handle(
+                        super::SftpControl::CreateDirectory {
+                            request: super::SftpCreateDirectoryRequest {
+                                operation_id: "mkdir".into(),
+                                session_id: "test".into(),
+                                path: path.into(),
+                            },
+                            reply,
+                        },
+                        &fixture.ssh,
+                    )
+                    .await;
+                if path == "/running" {
+                    within(block.started.cancelled()).await;
+                }
+            }
+            let closing = runtime.closing.clone();
+            let shutdown = tokio::spawn(async move {
+                runtime
+                    .shutdown_with_timeout(std::time::Duration::from_millis(100))
+                    .await;
+                runtime
+            });
+            within(closing.cancelled()).await;
+            if !force_abort {
+                block.release.cancel();
+            }
+            let mut runtime = within(shutdown).await.unwrap();
+            if force_abort {
+                assert!(within(first_result).await.is_err());
+            } else {
+                within(first_result).await.unwrap().unwrap();
+            }
+            assert!(within(second_result).await.is_err());
+            assert!(runtime.tasks.is_empty());
+            assert!(runtime.transfers.lock().unwrap().is_empty());
+            let (reply, response) = tokio::sync::oneshot::channel();
+            runtime
+                .handle(super::SftpControl::Open { reply }, &fixture.ssh)
+                .await;
+            assert!(within(response).await.is_err());
+            block.release.cancel();
+            within(fixture.sftp_closed.cancelled()).await;
+            assert!(!fixture
+                .files
+                .lock()
+                .unwrap()
+                .operations
+                .contains(&"mkdir:/queued".to_string()));
+            fixture.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_transfers_complete_a_real_sftp_round_trip_before_shutdown() {
+        use crate::ssh::test_support::{within, Fixture};
+        let fixture = Fixture::new(true, None).await;
+        let mut runtime = open_runtime(&fixture).await;
+        let root =
+            std::env::temp_dir().join(format!("nextdesk-sftp-roundtrip-{}", rand::random::<u64>()));
+        tokio::fs::create_dir(&root).await.unwrap();
+        let source = root.join("source");
+        let target = root.join("target");
+        let data = b"round trip through the SSH/SFTP transport";
+        tokio::fs::write(&source, data).await.unwrap();
+        for (direction, local) in [
+            (super::SftpTransferDirection::Upload, &source),
+            (super::SftpTransferDirection::Download, &target),
+        ] {
+            let (reply, response) = tokio::sync::oneshot::channel();
+            runtime.start_transfer(
+                direction,
+                super::SftpTransferRequest {
+                    session_id: "test".into(),
+                    transfer_id: "roundtrip".into(),
+                    local_path: local.to_str().unwrap().into(),
+                    remote_path: "/roundtrip".into(),
+                    overwrite: false,
+                    recursive: false,
+                },
+                tauri::ipc::Channel::new(|_| Ok(())),
+                reply,
+            );
+            within(response).await.unwrap().unwrap();
+        }
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), data);
+        within(runtime.shutdown()).await;
+        assert!(runtime.tasks.is_empty());
+        assert!(runtime.transfers.lock().unwrap().is_empty());
+        within(fixture.sftp_closed.cancelled()).await;
+        assert_eq!(
+            fixture
+                .files
+                .lock()
+                .unwrap()
+                .contents
+                .get("/roundtrip")
+                .unwrap(),
+            data
+        );
+        fixture.finish().await;
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

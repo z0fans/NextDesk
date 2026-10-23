@@ -339,6 +339,21 @@ fn token_rejection(status: reqwest::StatusCode, body: &str) -> (String, String) 
     (client_error.to_string(), server_code)
 }
 
+pub const AUTHORIZATION_EXPIRED: &str = "cloud_authorization_expired";
+pub const RATE_LIMITED: &str = "cloud_rate_limited";
+pub const BINDING_GONE: &str = "cloud_binding_gone";
+
+// Interpret HTTP status before errors cross the gateway seam as command strings.
+fn rejection(operation: &str, error: reqwest::Error) -> String {
+    match error.status().map(|status| status.as_u16()) {
+        Some(401 | 403) => AUTHORIZATION_EXPIRED.to_string(),
+        Some(429) => RATE_LIMITED.to_string(),
+        Some(410) if operation == "renew" => BINDING_GONE.to_string(),
+        Some(404) if operation == "prepare" => "cloud_prepare_unsupported".to_string(),
+        _ => format!("cloud {operation} rejected: {}", error.without_url()),
+    }
+}
+
 fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -459,6 +474,92 @@ mod tests {
     use crate::cloud_probe::CloudProbeResult;
     use crate::connection_resolver::ServiceKind;
     use reqwest::StatusCode;
+
+    async fn gateway_with_status(status: u16) -> String {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                if stream.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            stream
+                .get_mut()
+                .write_all(
+                    format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        // Digits in a URL must never determine authorization or retry policy.
+        format!("http://{address}/401/403/429/410")
+    }
+
+    #[tokio::test]
+    async fn gateway_status_is_classified_before_crossing_the_command_seam() {
+        for (status, expected) in [
+            (401, super::AUTHORIZATION_EXPIRED),
+            (403, super::AUTHORIZATION_EXPIRED),
+            (429, super::RATE_LIMITED),
+        ] {
+            let url = gateway_with_status(status).await;
+            assert_eq!(
+                super::me(&url, "test-device", "test-token")
+                    .await
+                    .unwrap_err(),
+                expected
+            );
+        }
+        let url = gateway_with_status(500).await;
+        let error = super::me(&url, "test-device", "test-token")
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("cloud status rejected:"));
+        assert!(!error.contains(&url));
+        assert_ne!(error, super::AUTHORIZATION_EXPIRED);
+        assert_ne!(error, super::RATE_LIMITED);
+    }
+
+    #[tokio::test]
+    async fn gateway_route_errors_remain_operation_specific() {
+        let url = gateway_with_status(404).await;
+        assert_eq!(
+            super::prepare(
+                &url,
+                "device",
+                "token",
+                "target",
+                22,
+                "",
+                false,
+                None,
+                ServiceKind::Ssh
+            )
+            .await
+            .unwrap_err(),
+            "cloud_prepare_unsupported"
+        );
+        let url = gateway_with_status(410).await;
+        assert_eq!(
+            super::renew(&url, "device", "token", "binding")
+                .await
+                .unwrap_err(),
+            super::BINDING_GONE
+        );
+        let url = gateway_with_status(410).await;
+        assert_ne!(
+            super::me(&url, "device", "token").await.unwrap_err(),
+            super::BINDING_GONE
+        );
+    }
 
     #[test]
     fn token_rejection_identifies_device_limit() {
@@ -764,7 +865,7 @@ pub async fn me(
         .await
         .map_err(|e| format!("cloud status request failed: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("cloud status rejected: {e}"))?
+        .map_err(|e| rejection("status", e))?
         .json::<MeResponse>()
         .await
         .map_err(|e| format!("cloud status parse failed: {e}"))?;
@@ -805,7 +906,7 @@ pub async fn bind(
         .await
         .map_err(|e| format!("cloud bind request failed: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("cloud bind rejected: {e}"))?
+        .map_err(|e| rejection("bind", e))?
         .json::<CloudBindingResponse>()
         .await
         .map_err(|e| format!("cloud bind parse failed: {e}"))
@@ -838,13 +939,7 @@ pub async fn prepare(
         .await
         .map_err(|e| format!("cloud prepare request failed: {e}"))?
         .error_for_status()
-        .map_err(|e| {
-            if e.status().map(|status| status.as_u16()) == Some(404) {
-                "cloud_prepare_unsupported".to_string()
-            } else {
-                format!("cloud prepare rejected: {e}")
-            }
-        })?
+        .map_err(|e| rejection("prepare", e))?
         .json::<CloudPrepareResponse>()
         .await
         .map_err(|e| format!("cloud prepare parse failed: {e}"))
@@ -866,7 +961,7 @@ pub async fn network_context(
         .await
         .map_err(|e| format!("cloud network context request failed: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("cloud network context rejected: {e}"))?
+        .map_err(|e| rejection("network context", e))?
         .json::<CloudNetworkContextResponse>()
         .await
         .map(|response| response.data)
@@ -923,7 +1018,7 @@ pub async fn commit(
         .await
         .map_err(|e| format!("cloud commit request failed: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("cloud commit rejected: {e}"))?
+        .map_err(|e| rejection("commit", e))?
         .json::<CloudBindingResponse>()
         .await
         .map_err(|e| format!("cloud commit parse failed: {e}"))
@@ -1006,7 +1101,7 @@ pub async fn renew(
         .await
         .map_err(|e| format!("cloud renew request failed: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("cloud renew rejected: {e}"))?
+        .map_err(|e| rejection("renew", e))?
         .json::<CloudBindingResponse>()
         .await
         .map_err(|e| format!("cloud renew parse failed: {e}"))
@@ -1040,7 +1135,7 @@ pub async fn report_connection_outcome<T: Serialize + ?Sized>(
         .await
         .map_err(|error| format!("cloud connection report request failed: {error}"))?
         .error_for_status()
-        .map_err(|error| format!("cloud connection report rejected: {error}"))?;
+        .map_err(|error| rejection("connection report", error))?;
     Ok(())
 }
 
@@ -1053,6 +1148,6 @@ pub async fn revoke(panel_url: &str, device_id: &str, token: &str) -> Result<(),
         .await
         .map_err(|e| format!("cloud revoke request failed: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("cloud revoke rejected: {e}"))?;
+        .map_err(|e| rejection("revoke", e))?;
     Ok(())
 }

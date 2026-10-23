@@ -1166,7 +1166,10 @@ describe("SSH workspace", () => {
     )[0].routePolicy).toBe("cloud_only");
   });
 
-  it("renders session failures as an opaque in-flow alert with a specific message", () => {
+  it.each([
+    ["ssh_session_already_exists", "sshErrorSessionBusy"],
+    ["cloud_rate_limited", "cloudRateLimited"],
+  ])("renders %s as an opaque in-flow alert with a specific message", (message, expected) => {
     render(<SshWorkspace isVisible />);
     fireEvent.doubleClick(
       screen.getByRole("button", { name: "sshConnect Alpha" }),
@@ -1178,12 +1181,12 @@ describe("SSH workspace", () => {
         kind: "state",
         sessionId: session.sessionId,
         state: "error",
-        message: "ssh_session_already_exists",
+        message,
       });
     });
 
     const alert = screen.getByRole("alert");
-    expect(alert).toHaveTextContent("sshErrorSessionBusy");
+    expect(alert).toHaveTextContent(expected);
     expect(alert).toHaveClass("bg-popover");
     expect(alert).not.toHaveClass("absolute", "bg-destructive/10");
   });

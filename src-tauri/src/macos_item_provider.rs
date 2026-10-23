@@ -1,9 +1,13 @@
 use crate::virtual_file_clipboard::{VirtualClipboardFile, VirtualClipboardWriteResult};
 
 #[cfg(target_os = "macos")]
+use crate::virtual_file_clipboard::{
+    session_stage_root, validate_clipboard_files, write_unique_file_in_dir,
+};
+#[cfg(target_os = "macos")]
 use std::cell::RefCell;
 #[cfg(target_os = "macos")]
-use std::{env, fs, path::Path};
+use std::fs;
 
 #[cfg(target_os = "macos")]
 use objc2::rc::Retained;
@@ -29,6 +33,7 @@ thread_local! {
 pub fn write_files_with_item_provider(
     files: &[VirtualClipboardFile],
 ) -> Result<Option<VirtualClipboardWriteResult>, String> {
+    validate_clipboard_files(files)?;
     let _mtm = MainThreadMarker::new()
         .ok_or_else(|| "NSItemProvider must be created on the main thread".to_string())?;
 
@@ -41,16 +46,14 @@ pub fn write_files_with_item_provider(
         files.len()
     );
 
-    let stage_root = item_provider_stage_root();
+    let stage_root = session_stage_root(Some("native-item-provider"));
     fs::create_dir_all(&stage_root)
         .map_err(|e| format!("[item-provider] cannot create staging dir: {}", e))?;
 
     let mut providers = Vec::with_capacity(files.len());
 
     for file in files {
-        let dest = unique_path_in_dir(&stage_root, &file.name);
-        fs::write(&dest, &file.data)
-            .map_err(|e| format!("[item-provider] stage write failed: {}", e))?;
+        let dest = write_unique_file_in_dir(&stage_root, &file.name, &file.data)?;
 
         let path_str = dest.to_string_lossy().to_string();
         let ns_path = NSString::from_str(&path_str);
@@ -95,42 +98,6 @@ pub fn write_files_with_item_provider(
 
     // Return None — NSItemProvider is not for general pasteboard clipboard paste.
     Ok(None)
-}
-
-#[cfg(target_os = "macos")]
-fn item_provider_stage_root() -> std::path::PathBuf {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    env::temp_dir()
-        .join("nextdesk-item-provider-stage")
-        .join(format!("{}-{}", std::process::id(), millis))
-}
-
-#[cfg(target_os = "macos")]
-fn unique_path_in_dir(dir: &Path, file_name: &str) -> std::path::PathBuf {
-    let dest = dir.join(file_name);
-    if !dest.exists() {
-        return dest;
-    }
-    let stem = dest
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(file_name);
-    let ext = dest
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|e| format!(".{}", e))
-        .unwrap_or_default();
-    let mut counter = 1u32;
-    loop {
-        let candidate = dir.join(format!("{} ({}){}", stem, counter, ext));
-        if !candidate.exists() {
-            return candidate;
-        }
-        counter += 1;
-    }
 }
 
 /// Returns the active NSItemProvider instances for drag-and-drop integration.

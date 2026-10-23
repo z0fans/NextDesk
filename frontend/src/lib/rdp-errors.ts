@@ -96,10 +96,10 @@ export function friendlyRdpError(raw: string, t: RdpErrorTranslator): string {
   if (!r.trim()) {
     return t('rdpErrUnknown');
   }
-  if (
-    r.includes('cloud_authorization_expired')
-    || (r.includes('cloud') && (r.includes('401') || r.includes('403') || r.includes('unauthorized')))
-  ) {
+  if (r.includes('cloud_rate_limited')) {
+    return t('cloudRateLimited');
+  }
+  if (r.includes('cloud_authorization_expired')) {
     return t('rdpErrCloudAuth');
   }
   if (r.includes('cloud_prepare_unsupported')) {

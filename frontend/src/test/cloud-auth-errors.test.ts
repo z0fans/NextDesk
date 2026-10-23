@@ -11,4 +11,8 @@ describe('cloudAuthErrorKey', () => {
     expect(cloudAuthErrorKey('cloud_auth_rate_limited (HTTP 429)'))
       .toBe('cloudAuthorizationRateLimited');
   });
+
+  it('maps the authenticated gateway rate limit without requiring HTTP text', () => {
+    expect(cloudAuthErrorKey('cloud_rate_limited')).toBe('cloudRateLimited');
+  });
 });

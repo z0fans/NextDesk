@@ -8,6 +8,9 @@ export function cloudAuthErrorKey(error?: string): TranslationKey {
   if (error.includes('cloud_auth_rate_limited')) {
     return 'cloudAuthorizationRateLimited';
   }
+  if (error.includes('cloud_rate_limited')) {
+    return 'cloudRateLimited';
+  }
   if (error.includes('cloud_auth_invalid_or_expired')) {
     return 'cloudAuthorizationExpired';
   }

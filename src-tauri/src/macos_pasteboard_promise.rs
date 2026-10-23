@@ -1,7 +1,11 @@
+#[cfg(target_os = "macos")]
+use crate::virtual_file_clipboard::{
+    session_stage_root, validate_clipboard_files, write_unique_file_in_dir,
+};
 use crate::virtual_file_clipboard::{VirtualClipboardFile, VirtualClipboardWriteResult};
 
 #[cfg(target_os = "macos")]
-use std::{cell::RefCell, env, fs, path::Path, path::PathBuf, time::SystemTime};
+use std::{cell::RefCell, env, fs, path::Path};
 
 #[cfg(target_os = "macos")]
 use objc2::{
@@ -386,57 +390,12 @@ fn promised_file_name_from_source(source_name: &str) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn promise_stage_root() -> PathBuf {
-    let millis = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    env::temp_dir()
-        .join("nextdesk-pasteboard-promise-stage")
-        .join(format!("{}-{}", std::process::id(), millis))
-}
-
-#[cfg(target_os = "macos")]
-fn unique_path_in_dir(dir: &Path, file_name: &str) -> PathBuf {
-    let dest = dir.join(file_name);
-    if !dest.exists() {
-        return dest;
-    }
-
-    let stem = dest
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(file_name);
-    let ext = dest
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|e| format!(".{}", e))
-        .unwrap_or_default();
-
-    let mut counter = 1u32;
-    loop {
-        let candidate = dir.join(format!("{} ({}){}", stem, counter, ext));
-        if !candidate.exists() {
-            return candidate;
-        }
-        counter += 1;
-    }
-}
-
-#[cfg(target_os = "macos")]
 fn stage_virtual_file_for_file_url_payload(
     stage_root: &Path,
     promised_file_name: &str,
     file_data: &[u8],
 ) -> Result<String, String> {
-    let dest = unique_path_in_dir(stage_root, promised_file_name);
-    fs::write(&dest, file_data).map_err(|e| {
-        format!(
-            "Failed to stage promise source file '{}': {}",
-            dest.display(),
-            e
-        )
-    })?;
+    let dest = write_unique_file_in_dir(stage_root, promised_file_name, file_data)?;
     Ok(dest.to_string_lossy().to_string())
 }
 
@@ -472,6 +431,7 @@ fn promised_file_url_payload_from_path(path: &str) -> Option<Retained<NSString>>
 pub fn write_files_with_pasteboard_item_provider(
     files: &[VirtualClipboardFile],
 ) -> Result<Option<VirtualClipboardWriteResult>, String> {
+    validate_clipboard_files(files)?;
     let mtm = MainThreadMarker::new().ok_or_else(|| {
         "NSPasteboardItemDataProvider must be created on the main thread".to_string()
     })?;
@@ -485,7 +445,7 @@ pub fn write_files_with_pasteboard_item_provider(
         files.len()
     );
 
-    let stage_root = promise_stage_root();
+    let stage_root = session_stage_root(Some("native-pasteboard-promise"));
     let stage_root_ready = match fs::create_dir_all(&stage_root) {
         Ok(()) => {
             log::info!(

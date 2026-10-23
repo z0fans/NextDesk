@@ -677,6 +677,7 @@ export const translations = {
       "This account has reached its authorized device limit. Remove an old device, then sign in again.",
     cloudAuthorizationRateLimited:
       "Too many authorization requests. Please wait and sign in again.",
+    cloudRateLimited: "Too many cloud requests. Please wait and try again.",
     cloudAuthorizationExpired:
       "This authorization request has expired. Please sign in again.",
     accountStatusUpdated: "Account status updated",
@@ -1314,6 +1315,7 @@ export const translations = {
     cloudAuthorizationTooManyDevices:
       "此账号已达到授权设备上限，请移除旧设备后重新登录。",
     cloudAuthorizationRateLimited: "授权请求过于频繁，请稍后重新登录。",
+    cloudRateLimited: "云端请求过于频繁，请稍后重试。",
     cloudAuthorizationExpired: "本次授权请求已失效，请重新登录。",
     accountStatusUpdated: "账户状态已更新",
     accountStatusRefreshFailed: "账户状态刷新失败，请稍后重试",

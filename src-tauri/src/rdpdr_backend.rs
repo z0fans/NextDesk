@@ -12,7 +12,8 @@ use tauri::{AppHandle, State};
 
 use crate::state::{AppState, ClipboardSessionState};
 use crate::virtual_file_clipboard::{
-    session_stage_root, unique_path_in_dir, write_staged_paths_to_clipboard,
+    create_unique_file_in_dir, session_stage_root, validate_file_name,
+    write_staged_paths_to_clipboard, write_unique_file_in_dir,
     write_virtual_files_to_local_clipboard, VirtualClipboardFile, VirtualClipboardWriteResult,
 };
 
@@ -327,6 +328,7 @@ pub async fn clipboard_read_file(file_path: String) -> Result<Vec<u8>, String> {
 /// Saves the file to the user's Downloads directory.
 #[tauri::command]
 pub async fn clipboard_write_file(file_name: String, data: Vec<u8>) -> Result<String, String> {
+    validate_file_name(&file_name)?;
     let downloads = dirs::download_dir().unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_else(|| Path::new("/tmp").to_path_buf())
@@ -336,33 +338,7 @@ pub async fn clipboard_write_file(file_name: String, data: Vec<u8>) -> Result<St
     // Ensure directory exists
     fs::create_dir_all(&downloads).map_err(|e| format!("Failed to create Downloads dir: {}", e))?;
 
-    let dest = downloads.join(&file_name);
-
-    // Handle duplicate filenames
-    let final_path = if dest.exists() {
-        let stem = dest
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&file_name);
-        let ext = dest
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|e| format!(".{}", e))
-            .unwrap_or_default();
-
-        let mut counter = 1u32;
-        loop {
-            let candidate = downloads.join(format!("{} ({}){}", stem, counter, ext));
-            if !candidate.exists() {
-                break candidate;
-            }
-            counter += 1;
-        }
-    } else {
-        dest
-    };
-
-    fs::write(&final_path, &data).map_err(|e| format!("Failed to write file: {}", e))?;
+    let final_path = write_unique_file_in_dir(&downloads, &file_name, &data)?;
 
     let path_str = final_path.to_string_lossy().to_string();
     log::info!(
@@ -581,18 +557,17 @@ pub async fn clipboard_read_files_data() -> Result<Vec<ClipboardFileInfo>, Strin
 /// Save a file downloaded from remote RDP session to the user's Downloads directory.
 #[tauri::command]
 pub async fn save_downloaded_file(name: String, data: Vec<u8>) -> Result<String, String> {
+    validate_file_name(&name)?;
     let downloads =
         dirs::download_dir().ok_or_else(|| "Cannot find Downloads directory".to_string())?;
 
-    let dest = downloads.join(&name);
+    let dest = write_unique_file_in_dir(&downloads, &name, &data)?;
     log::info!(
         "[file-transfer] Saving {} ({} bytes) to {:?}",
         name,
         data.len(),
         dest
     );
-
-    fs::write(&dest, &data).map_err(|e| format!("Failed to write file: {}", e))?;
 
     let path_str = dest.to_string_lossy().to_string();
     log::info!("[file-transfer] ✅ Saved: {}", path_str);
@@ -733,11 +708,10 @@ pub async fn clipboard_stage_begin(
     session_id: String,
     file_name: String,
 ) -> Result<String, String> {
+    validate_file_name(&file_name)?;
     let stage_root = session_stage_root(Some(&session_id));
     fs::create_dir_all(&stage_root).map_err(|e| format!("Failed to create staging dir: {}", e))?;
-    let dest = unique_path_in_dir(&stage_root, &file_name);
-    // Create empty file
-    File::create(&dest).map_err(|e| format!("Failed to create staged file: {}", e))?;
+    let (dest, _file) = create_unique_file_in_dir(&stage_root, &file_name)?;
     log::info!(
         "[file-transfer] Stage begin: {} ({})",
         file_name,
@@ -812,4 +786,38 @@ pub async fn clipboard_stage_commit(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod clipboard_staging_tests {
+    use super::{clipboard_stage_begin, clipboard_write_file, save_downloaded_file};
+
+    #[tokio::test]
+    async fn remote_names_are_rejected_before_staging_or_downloads_are_accessed() {
+        for name in [
+            "../outside.txt",
+            "/tmp/outside.txt",
+            "..\\outside.txt",
+            "C:\\outside.txt",
+        ] {
+            assert_eq!(
+                clipboard_stage_begin("../session".into(), name.into())
+                    .await
+                    .unwrap_err(),
+                "Invalid clipboard file name"
+            );
+            assert_eq!(
+                clipboard_write_file(name.into(), vec![1])
+                    .await
+                    .unwrap_err(),
+                "Invalid clipboard file name"
+            );
+            assert_eq!(
+                save_downloaded_file(name.into(), vec![1])
+                    .await
+                    .unwrap_err(),
+                "Invalid clipboard file name"
+            );
+        }
+    }
 }

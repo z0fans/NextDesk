@@ -23,6 +23,7 @@ pub enum SshControl {
 pub struct SshSessionHandle {
     control: mpsc::Sender<SshControl>,
     cancellation: CancellationToken,
+    completed: CancellationToken,
 }
 
 impl SshSessionHandle {
@@ -30,6 +31,7 @@ impl SshSessionHandle {
         Self {
             control,
             cancellation: CancellationToken::new(),
+            completed: CancellationToken::new(),
         }
     }
 
@@ -57,10 +59,7 @@ impl SshSessionManager {
     }
 
     pub fn send(&self, session_id: &str, control: SshControl) -> Result<(), String> {
-        self.sessions
-            .get(session_id)
-            .ok_or_else(|| "ssh_session_not_found".to_string())?
-            .control
+        self.control_sender(session_id)?
             .try_send(control)
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => "ssh_input_backpressure".to_string(),
@@ -69,24 +68,31 @@ impl SshSessionManager {
     }
 
     pub fn control_sender(&self, session_id: &str) -> Result<mpsc::Sender<SshControl>, String> {
-        self.sessions
+        let handle = self
+            .sessions
             .get(session_id)
-            .map(|handle| handle.control.clone())
-            .ok_or_else(|| "ssh_session_not_found".to_string())
+            .ok_or_else(|| "ssh_session_not_found".to_string())?;
+        if handle.cancellation.is_cancelled() {
+            return Err("ssh_session_closed".to_string());
+        }
+        Ok(handle.control.clone())
     }
 
-    pub fn close(&self, session_id: &str) -> Result<(), String> {
+    pub fn close(&self, session_id: &str) -> Result<CancellationToken, String> {
         let handle = self
             .sessions
             .get(session_id)
             .ok_or_else(|| "ssh_session_not_found".to_string())?;
         handle.cancellation.cancel();
         let _ = handle.control.try_send(SshControl::Close);
-        Ok(())
+        Ok(handle.completed.clone())
     }
 
     pub fn remove(&mut self, session_id: &str) {
-        self.sessions.remove(session_id);
+        if let Some(handle) = self.sessions.remove(session_id) {
+            handle.cancellation.cancel();
+            handle.completed.cancel();
+        }
     }
 }
 
@@ -123,5 +129,34 @@ mod tests {
         assert!(matches!(receiver.recv().await, Some(SshControl::Input(data)) if data == vec![1]));
         assert!(blocked.await.unwrap().is_ok());
         assert!(matches!(receiver.recv().await, Some(SshControl::Input(data)) if data == vec![2]));
+    }
+
+    #[tokio::test]
+    async fn replacement_waits_for_removal_and_closing_session_rejects_new_work() {
+        let (control, _receiver) = tokio::sync::mpsc::channel(8);
+        let mut manager = SshSessionManager::default();
+        manager
+            .insert("ssh-tab".into(), SshSessionHandle::new(control))
+            .unwrap();
+        let completed = manager.close("ssh-tab").unwrap();
+        assert!(!completed.is_cancelled());
+        assert!(manager.contains("ssh-tab"));
+        assert_eq!(
+            manager
+                .send("ssh-tab", SshControl::Input(vec![1]))
+                .unwrap_err(),
+            "ssh_session_closed"
+        );
+        assert!(manager.control_sender("ssh-tab").is_err());
+        let (replacement, _receiver) = tokio::sync::mpsc::channel(8);
+        assert!(manager
+            .insert("ssh-tab".into(), SshSessionHandle::new(replacement.clone()))
+            .is_err());
+        manager.remove("ssh-tab");
+        completed.cancelled().await;
+        manager
+            .insert("ssh-tab".into(), SshSessionHandle::new(replacement))
+            .unwrap();
+        assert!(manager.control_sender("ssh-tab").is_ok());
     }
 }

@@ -29,6 +29,7 @@ use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -130,7 +131,6 @@ pub async fn run_session(
     .await;
     let route_label = lease.route_label.clone();
     let state = app.state::<AppState>();
-    state.ssh_sessions.lock().unwrap().remove(&session_id);
 
     let mut emit_disconnected = true;
     let mut release_route = cancellation.is_cancelled();
@@ -156,7 +156,7 @@ pub async fn run_session(
             }
             SessionFailure::Message(message) => {
                 outcome.error_code = Some(super::sanitize_diagnostic_code(&message));
-                release_route = !reconnect_grace_allowed(&message);
+                release_route |= !reconnect_grace_allowed(&message);
                 emit_disconnected = false;
                 log::warn!(
                     "[ssh] session failed code={}",
@@ -206,6 +206,7 @@ pub async fn run_session(
             session_id
         );
     }
+    state.ssh_sessions.lock().unwrap().remove(&session_id);
 }
 
 fn outcome_stage_for_failure(failure: &SessionFailure) -> OutcomeStage {
@@ -524,7 +525,7 @@ async fn run_session_inner(
     app: &AppHandle,
     request: &SshStartRequest,
     lease: &mut RouteLease,
-    mut control_rx: mpsc::Receiver<SshControl>,
+    control_rx: mpsc::Receiver<SshControl>,
     on_output: &Channel<InvokeResponseBody>,
     on_event: &Channel<SshEvent>,
     cancellation: &CancellationToken,
@@ -734,7 +735,6 @@ async fn run_session_inner(
         }
         Err(_) => return Err(SessionFailure::Message("ssh_shell_timeout".to_string())),
     }
-    let (mut read_half, write_half) = channel.split();
     let _ = on_event.send(SshEvent::state(
         &request.session_id,
         "connected",
@@ -756,121 +756,177 @@ async fn run_session_inner(
     connected.stage_durations_ms = stage_durations_ms.clone();
     spawn_report_for_lease(connected, Some(lease.clone()));
 
-    let mut route_tick = tokio::time::interval(ROUTE_KEEPALIVE_INTERVAL);
-    let sftp_runtime = Arc::new(tokio::sync::Mutex::new(SftpRuntime::default()));
-    let monitor_runtime = Arc::new(Mutex::new(MonitorRuntime::default()));
-    let mut first_interactive_reported = false;
     let interactive_started = Instant::now();
-    let mut remote_exit_seen = false;
-    let mut termination_failure = None;
-    route_tick.tick().await;
-    loop {
-        tokio::select! {
-            _ = cancellation.cancelled() => break,
-            message = read_half.wait() => {
-                match message {
-                    Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                        on_output
-                            .send(InvokeResponseBody::Raw(data.to_vec()))
-                            .map_err(|error| SessionFailure::Message(format!("ssh_output_channel_failed:{error}")))?;
-                        if !first_interactive_reported {
-                            first_interactive_reported = true;
-                            let mut interactive = ConnectionOutcomeInput::new(
-                                request.session_id.clone(),
-                                ServiceKind::Ssh,
-                                OutcomeStatus::Connected,
-                                OutcomeStage::FirstInteractiveResult,
-                            );
-                            interactive.attempt_id = Some(outcome_attempt_id.to_string());
-                            interactive.duration_ms = Some(session_started.elapsed().as_millis() as u64);
-                            stage_durations_ms.insert(
-                                "first_interactive_result".to_string(),
-                                interactive_started.elapsed().as_millis() as u64,
-                            );
-                            interactive.stage_durations_ms = stage_durations_ms.clone();
-                            spawn_report_for_lease(interactive, Some(lease.clone()));
-                        }
-                    }
-                    Some(ChannelMsg::ExitStatus { exit_status }) => {
-                        remote_exit_seen = true;
-                        let _ = on_event.send(SshEvent::state(
-                            &request.session_id,
-                            "exited",
-                            Some(&lease.route_label),
-                            Some(exit_status.to_string()),
-                        ));
-                    }
-                    Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
-                        if !remote_exit_seen && !cancellation.is_cancelled() {
-                            termination_failure = Some(SessionFailure::Message(
-                                "ssh_transport_lost".to_string(),
-                            ));
-                        }
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            control = control_rx.recv() => {
-                match control {
-                    Some(SshControl::Input(data)) => {
-                        write_half.data(&data[..]).await.map_err(|error| {
-                            SessionFailure::Message(format!("ssh_input_failed:{error}"))
-                        })?;
-                    }
-                    Some(SshControl::Resize { cols, rows, pixel_width, pixel_height }) => {
-                        write_half.window_change(
-                            u32::from(cols),
-                            u32::from(rows),
-                            u32::from(pixel_width),
-                            u32::from(pixel_height),
-                        ).await.map_err(|error| {
-                            SessionFailure::Message(format!("ssh_resize_failed:{error}"))
-                        })?;
-                    }
-                    Some(SshControl::Sftp(control)) => {
-                        let runtime = Arc::clone(&sftp_runtime);
-                        let ssh = Arc::clone(&ssh);
-                        tauri::async_runtime::spawn(async move {
-                            runtime.lock().await.handle(control, ssh.as_ref()).await;
-                        });
-                    }
-                    Some(SshControl::Monitor { reply }) => {
-                        let ssh = Arc::clone(&ssh);
-                        let runtime = Arc::clone(&monitor_runtime);
-                        tauri::async_runtime::spawn(async move {
-                            let result = collect_monitor_snapshot(ssh, runtime).await;
-                            let _ = reply.send(result);
-                        });
-                    }
-                    Some(SshControl::Close) | None => break,
-                }
-            }
-            _ = route_tick.tick() => {
-                let state = app.state::<AppState>();
-                if let Err(error) = connection_resolver::keep_route_alive(
-                    state.inner(),
+    run_connected_session(
+        ssh,
+        channel.split(),
+        control_rx,
+        on_output,
+        cancellation,
+        |event| match event {
+            ConnectedEvent::FirstOutput => {
+                let mut interactive = ConnectionOutcomeInput::new(
+                    request.session_id.clone(),
                     ServiceKind::Ssh,
-                    Some(&request.session_id),
-                    &lease.identity_target.host,
-                    lease.identity_target.port,
-                ).await {
-                    log::warn!("[ssh] cloud route keepalive failed service=ssh error={error}");
+                    OutcomeStatus::Connected,
+                    OutcomeStage::FirstInteractiveResult,
+                );
+                interactive.attempt_id = Some(outcome_attempt_id.to_string());
+                interactive.duration_ms = Some(session_started.elapsed().as_millis() as u64);
+                stage_durations_ms.insert(
+                    "first_interactive_result".to_string(),
+                    interactive_started.elapsed().as_millis() as u64,
+                );
+                interactive.stage_durations_ms = stage_durations_ms.clone();
+                spawn_report_for_lease(interactive, Some(lease.clone()));
+            }
+            ConnectedEvent::Exit(exit_status) => {
+                let _ = on_event.send(SshEvent::state(
+                    &request.session_id,
+                    "exited",
+                    Some(&lease.route_label),
+                    Some(exit_status.to_string()),
+                ));
+            }
+        },
+        || async {
+            let state = app.state::<AppState>();
+            if let Err(error) = connection_resolver::keep_route_alive(
+                state.inner(),
+                ServiceKind::Ssh,
+                Some(&request.session_id),
+                &lease.identity_target.host,
+                lease.identity_target.port,
+            )
+            .await
+            {
+                log::warn!("[ssh] cloud route keepalive failed service=ssh error={error}");
+            }
+        },
+    )
+    .await
+}
+
+enum ConnectedEvent {
+    FirstOutput,
+    Exit(u32),
+}
+
+async fn run_connected_session<
+    H: client::Handler + Send + 'static,
+    F: std::future::Future<Output = ()>,
+>(
+    ssh: Arc<client::Handle<H>>,
+    channel: (russh::ChannelReadHalf, russh::ChannelWriteHalf<client::Msg>),
+    mut control_rx: mpsc::Receiver<SshControl>,
+    on_output: &Channel<InvokeResponseBody>,
+    cancellation: &CancellationToken,
+    mut on_activity: impl FnMut(ConnectedEvent),
+    mut keep_route_alive: impl FnMut() -> F,
+) -> Result<(), SessionFailure> {
+    let (mut read_half, write_half) = channel;
+    let mut route_tick = tokio::time::interval(ROUTE_KEEPALIVE_INTERVAL);
+    let closing = cancellation.child_token();
+    let sftp_runtime = Arc::new(tokio::sync::Mutex::new(SftpRuntime::new(closing.clone())));
+    let monitor_runtime = Arc::new(Mutex::new(MonitorRuntime::default()));
+    let mut tasks = JoinSet::new();
+    let mut first_interactive_reported = false;
+    let mut remote_exit_seen = false;
+    route_tick.tick().await;
+    // Cancellation also interrupts blocked input, resize and route keepalive awaits.
+    let result = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Ok(()),
+        result = async {
+            loop {
+                tokio::select! {
+                    message = read_half.wait() => {
+                        match message {
+                            Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                                on_output
+                                    .send(InvokeResponseBody::Raw(data.to_vec()))
+                                    .map_err(|error| SessionFailure::Message(format!("ssh_output_channel_failed:{error}")))?;
+                                if !first_interactive_reported {
+                                    first_interactive_reported = true;
+                                    on_activity(ConnectedEvent::FirstOutput);
+                                }
+                            }
+                            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                                remote_exit_seen = true;
+                                on_activity(ConnectedEvent::Exit(exit_status));
+                            }
+                            Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
+                                break if remote_exit_seen {
+                                    Ok(())
+                                } else {
+                                    Err(SessionFailure::Message("ssh_transport_lost".to_string()))
+                                };
+                            }
+                            _ => {}
+                        }
+                    }
+                    control = control_rx.recv() => {
+                        match control {
+                            Some(SshControl::Input(data)) => {
+                                write_half.data(&data[..]).await.map_err(|error| {
+                                    SessionFailure::Message(format!("ssh_input_failed:{error}"))
+                                })?;
+                            }
+                            Some(SshControl::Resize { cols, rows, pixel_width, pixel_height }) => {
+                                write_half.window_change(
+                                    u32::from(cols),
+                                    u32::from(rows),
+                                    u32::from(pixel_width),
+                                    u32::from(pixel_height),
+                                ).await.map_err(|error| {
+                                    SessionFailure::Message(format!("ssh_resize_failed:{error}"))
+                                })?;
+                            }
+                            Some(SshControl::Sftp(control)) => {
+                                let runtime = Arc::clone(&sftp_runtime);
+                                let ssh = Arc::clone(&ssh);
+                                tasks.spawn_on(async move {
+                                    runtime.lock().await.handle(control, ssh.as_ref()).await;
+                                }, tauri::async_runtime::handle().inner());
+                            }
+                            Some(SshControl::Monitor { reply }) => {
+                                let ssh = Arc::clone(&ssh);
+                                let runtime = Arc::clone(&monitor_runtime);
+                                let closing = closing.clone();
+                                tasks.spawn_on(async move {
+                                    let result = tokio::select! {
+                                        biased;
+                                        _ = closing.cancelled() => Err("ssh_monitor_session_closed".to_string()),
+                                        result = collect_monitor_snapshot(ssh, runtime) => result,
+                                    };
+                                    let _ = reply.send(result);
+                                }, tauri::async_runtime::handle().inner());
+                            }
+                            Some(SshControl::Close) | None => break Ok(()),
+                        }
+                    }
+                    _ = tasks.join_next(), if !tasks.is_empty() => {}
+                    _ = route_tick.tick() => keep_route_alive().await,
                 }
             }
-        }
-    }
+        } => result,
+    };
 
+    control_rx.close();
+    while control_rx.try_recv().is_ok() {}
+    closing.cancel();
+    // Join dispatchers before acquiring the runtime lock: an SFTP open may own it.
+    tasks.shutdown().await;
     sftp_runtime.lock().await.shutdown().await;
-    let _ = write_half.eof().await;
-    let _ = write_half.close().await;
-    let _ = ssh
-        .disconnect(Disconnect::ByApplication, "session closed", "en")
-        .await;
-    if let Some(failure) = termination_failure {
-        return Err(failure);
-    }
-    Ok(())
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        let _ = write_half.eof().await;
+        let _ = write_half.close().await;
+        let _ = ssh
+            .disconnect(Disconnect::ByApplication, "session closed", "en")
+            .await;
+    })
+    .await;
+    result
 }
 
 fn expand_private_key_path(path: &str) -> Result<PathBuf, SessionFailure> {
@@ -1120,3 +1176,7 @@ MC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\n\
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "session_lifecycle_tests.rs"]
+mod lifecycle_tests;

@@ -24,7 +24,23 @@ env:
   RUSTFLAGS: --cfg nextdesk_kkterm_rdp
 
 jobs:
+  gateway-agent-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: gateway-agent/go.mod
+          cache: false
+
+      - name: Gateway Agent quality gate
+        working-directory: gateway-agent
+        run: go test ./...
+
   quality-gate:
+    needs: gateway-agent-quality
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -297,9 +313,19 @@ jobs:
           $exitCode = $LASTEXITCODE
           Get-Content windows-tauri-build.log
           if ($exitCode -ne 0) {
-            gh release upload "${{ github.ref_name }}" windows-tauri-build.log --clobber
+            if ("${{ github.event_name }}" -eq "push" -and "${{ github.ref }}" -like "refs/tags/*") {
+              gh release upload "${{ github.ref_name }}" windows-tauri-build.log --clobber
+            }
             exit $exitCode
           }
+
+      - name: Upload failed Windows build log
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextdesk-windows-build-log-${{ github.sha }}
+          path: windows-tauri-build.log
+          if-no-files-found: ignore
 
       - name: Build & Release
         uses: tauri-apps/tauri-action@v0

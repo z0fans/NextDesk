@@ -27,6 +27,7 @@ in a broad public release.
 | Frontend tests | Shared gate | Shared gate | Full Vitest suite in `Build & Release` and Windows verification workflow | Pass when CI is green |
 | Frontend production build | Shared gate | Shared gate | `npm --prefix frontend run build` | Pass when CI is green |
 | Rust formatting and library tests | Native Windows job | macOS quality gate | `cargo fmt --check`; locked `kkterm-rdp` library tests | Pass when CI is green |
+| Gateway Agent tests | Shared gate | Shared gate | `go -C gateway-agent test ./...`, using the version declared in `go.mod` | Pass when CI is green |
 | Packaging configuration | NSIS with embedded WebView2 bootstrapper | Universal Apple app + DMG | `.github/workflows/build.yml`, platform Tauri config files | Pass |
 | Patched IronRDP dependency | Same pinned commit and patch | Same pinned commit and patch | CI checks out `bf694c8a23...` and applies `patches/ironrdp-nextdesk.patch` | Pass |
 | macOS local scaling | Not applicable | Mode exposed; current remote backing size is frozen and CSS scales the canvas without reconnecting | `resolution-modes.test.ts`, `RdpManager.tsx`, `styles.css` | Automated Pass; visual runtime Not Verified |

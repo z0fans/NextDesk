@@ -1,10 +1,11 @@
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Write;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
 
 #[cfg(target_os = "macos")]
 use crate::macos_file_promise::write_files_with_native_file_promise;
@@ -38,6 +39,7 @@ pub fn write_virtual_files_to_local_clipboard(
     mac_strategy: Option<&str>,
     files: &[VirtualClipboardFile],
 ) -> Result<VirtualClipboardWriteResult, String> {
+    validate_clipboard_files(files)?;
     if files.is_empty() {
         return Ok(VirtualClipboardWriteResult {
             strategy: "empty".to_string(),
@@ -127,8 +129,7 @@ fn stage_files(
 
     let mut staged_paths = Vec::with_capacity(files.len());
     for file in files {
-        let dest = unique_path_in_dir(&stage_root, &file.name);
-        fs::write(&dest, &file.data).map_err(|e| format!("Failed to write staged file: {}", e))?;
+        let dest = write_unique_file_in_dir(&stage_root, &file.name, &file.data)?;
         staged_paths.push(dest.to_string_lossy().to_string());
     }
 
@@ -143,42 +144,98 @@ pub fn session_stage_root(session_id: Option<&str>) -> PathBuf {
 
     let session_segment = session_id
         .filter(|id| !id.trim().is_empty())
-        .map(|id| id.to_string())
+        .map(|id| format!("{:x}", Sha256::digest(id.as_bytes())))
         .unwrap_or_else(|| "global".to_string());
 
-    base.join(session_segment).join(format!(
-        "{}",
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    ))
+    base.join(session_segment)
+        .join(format!("{:032x}", rand::random::<u128>()))
 }
 
-pub fn unique_path_in_dir(dir: &Path, file_name: &str) -> PathBuf {
-    let dest = dir.join(file_name);
-    if !dest.exists() {
-        return dest;
+pub(crate) fn valid_file_name(name: &str) -> bool {
+    if name.is_empty()
+        || name.ends_with(['.', ' '])
+        || name
+            .chars()
+            .any(|ch| ch.is_control() || "\\/:<>\"|?*".contains(ch))
+    {
+        return false;
     }
+    // Windows device names are special even when followed by an extension.
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    !matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) && !["COM", "LPT"].iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    })
+}
 
-    let stem = dest
+pub(crate) fn validate_file_name(name: &str) -> Result<(), String> {
+    if valid_file_name(name) {
+        Ok(())
+    } else {
+        Err("Invalid clipboard file name".to_string())
+    }
+}
+
+pub(crate) fn validate_clipboard_files(files: &[VirtualClipboardFile]) -> Result<(), String> {
+    files
+        .iter()
+        .try_for_each(|file| validate_file_name(&file.name))
+}
+
+pub(crate) fn create_unique_file_in_dir(
+    dir: &Path,
+    file_name: &str,
+) -> Result<(PathBuf, fs::File), String> {
+    validate_file_name(file_name)?;
+    let name = Path::new(file_name);
+    let stem = name
         .file_stem()
-        .and_then(|s| s.to_str())
+        .and_then(|stem| stem.to_str())
         .unwrap_or(file_name);
-    let ext = dest
+    let extension = name
         .extension()
-        .and_then(|s| s.to_str())
-        .map(|e| format!(".{}", e))
+        .and_then(|ext| ext.to_str())
+        .map(|ext| format!(".{ext}"))
         .unwrap_or_default();
-
-    let mut counter = 1u32;
-    loop {
-        let candidate = dir.join(format!("{} ({}){}", stem, counter, ext));
-        if !candidate.exists() {
-            return candidate;
+    for counter in 0..u32::MAX {
+        let path = dir.join(if counter == 0 {
+            file_name.to_string()
+        } else {
+            format!("{stem} ({counter}){extension}")
+        });
+        match fs::File::create_new(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Failed to create clipboard file: {error}")),
         }
-        counter += 1;
     }
+    Err("No available clipboard file name".to_string())
+}
+
+pub(crate) fn write_unique_file_in_dir(
+    dir: &Path,
+    name: &str,
+    data: &[u8],
+) -> Result<PathBuf, String> {
+    let (path, mut file) = create_unique_file_in_dir(dir, name)?;
+    if let Err(error) = file.write_all(data) {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(format!("Failed to write clipboard file: {error}"));
+    }
+    Ok(path)
 }
 
 #[cfg(target_os = "macos")]
@@ -278,5 +335,181 @@ pub fn write_staged_paths_to_clipboard(paths: &[String]) -> Result<String, Strin
     {
         let _ = paths;
         Ok("staging-only".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "nextdesk-clipboard-test-{:032x}",
+                rand::random::<u128>()
+            ));
+            fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_names_are_rejected_before_native_provider_dispatch() {
+        let files = [
+            VirtualClipboardFile {
+                name: "valid.txt".into(),
+                data: vec![1],
+            },
+            VirtualClipboardFile {
+                name: "../escape.txt".into(),
+                data: vec![2],
+            },
+        ];
+        assert_eq!(
+            write_virtual_files_to_local_clipboard(
+                Some("../session"),
+                Some("pasteboard-promise"),
+                &files
+            )
+            .unwrap_err(),
+            "Invalid clipboard file name"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                write_files_with_native_file_promise(&files).unwrap_err(),
+                "Invalid clipboard file name"
+            );
+            assert_eq!(
+                write_files_with_item_provider(&files).unwrap_err(),
+                "Invalid clipboard file name"
+            );
+            assert_eq!(
+                write_files_with_pasteboard_item_provider(&files).unwrap_err(),
+                "Invalid clipboard file name"
+            );
+        }
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            write_files_with_native_virtual_data_object(&files).unwrap_err(),
+            "Invalid clipboard file name"
+        );
+    }
+
+    #[test]
+    fn session_ids_are_encoded_beneath_the_clipboard_root() {
+        let global = session_stage_root(None);
+        let base = global.parent().unwrap().parent().unwrap();
+        for id in [
+            "../escape",
+            "/tmp/escape",
+            "C:\\escape",
+            "..\\escape",
+            "session/../../escape",
+            "会话",
+        ] {
+            let path = session_stage_root(Some(id));
+            assert_eq!(path.parent().unwrap().parent().unwrap(), base);
+            let segment = path
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert_eq!(segment.len(), 64);
+            assert!(segment.chars().all(|ch| ch.is_ascii_hexdigit()));
+            assert_ne!(path, session_stage_root(Some(id)));
+        }
+    }
+
+    #[test]
+    fn unsafe_names_cannot_escape_or_change_an_existing_file() {
+        let fixture = TestDirectory::new();
+        let stage = fixture.0.join("stage");
+        fs::create_dir(&stage).unwrap();
+        let outside = fixture.0.join("outside.txt");
+        fs::write(&outside, b"keep").unwrap();
+        for name in [
+            "../outside.txt",
+            "..\\outside.txt",
+            "C:\\outside.txt",
+            "name:stream",
+            "NUL .txt",
+            "COM1.txt",
+            ".",
+            "..",
+            "",
+        ] {
+            assert!(
+                write_unique_file_in_dir(&stage, name, b"replace").is_err(),
+                "{name:?}"
+            );
+        }
+        assert!(write_unique_file_in_dir(&stage, outside.to_str().unwrap(), b"replace").is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"keep");
+        assert_eq!(fs::read_dir(&stage).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn legal_and_duplicate_names_preserve_previous_content() {
+        let fixture = TestDirectory::new();
+        let first = write_unique_file_in_dir(&fixture.0, "文件 (1).txt", b"first").unwrap();
+        let second = write_unique_file_in_dir(&fixture.0, "文件 (1).txt", b"second").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read(first).unwrap(), b"first");
+        assert_eq!(fs::read(second).unwrap(), b"second");
+        for name in ["README", ".env", "空格 file.txt"] {
+            let path = write_unique_file_in_dir(&fixture.0, name, b"valid").unwrap();
+            assert_eq!(path.file_name().unwrap(), name);
+            assert_eq!(fs::read(path).unwrap(), b"valid");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_and_dangling_symlinks_are_never_followed() {
+        let fixture = TestDirectory::new();
+        let stage = fixture.0.join("stage");
+        fs::create_dir(&stage).unwrap();
+        let outside = fixture.0.join("outside.txt");
+        fs::write(&outside, b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, stage.join("file.txt")).unwrap();
+        let path = write_unique_file_in_dir(&stage, "file.txt", b"new").unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"new");
+        assert_eq!(fs::read(outside).unwrap(), b"keep");
+        let absent = fixture.0.join("absent.txt");
+        std::os::unix::fs::symlink(&absent, stage.join("dangling.txt")).unwrap();
+        let path = write_unique_file_in_dir(&stage, "dangling.txt", b"new").unwrap();
+        assert!(path.is_file());
+        assert!(!absent.exists());
+    }
+
+    #[test]
+    fn simultaneous_allocations_of_one_name_create_distinct_files() {
+        let fixture = TestDirectory::new();
+        let start = std::sync::Barrier::new(2);
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                start.wait();
+                write_unique_file_in_dir(&fixture.0, "shared.txt", b"one").unwrap()
+            });
+            let second = scope.spawn(|| {
+                start.wait();
+                write_unique_file_in_dir(&fixture.0, "shared.txt", b"two").unwrap()
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_ne!(first, second);
+        assert_eq!(fs::read(first).unwrap(), b"one");
+        assert_eq!(fs::read(second).unwrap(), b"two");
     }
 }

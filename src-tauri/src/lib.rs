@@ -4,6 +4,7 @@
 ))]
 mod cliprdr;
 mod cloud_auth;
+mod cloud_credentials;
 mod cloud_gateway;
 mod cloud_probe;
 mod config;
@@ -12,7 +13,7 @@ mod connection_resolver;
 mod credential_vault;
 mod diagnostic_logs;
 mod file_transfer_ws;
-#[cfg(feature = "nextdesk-native-rdp")]
+#[cfg(any(feature = "nextdesk-native-rdp", test))]
 mod frame_ws;
 #[cfg(all(feature = "kkterm-rdp", nextdesk_kkterm_rdp))]
 mod kkterm_rdp;
@@ -301,11 +302,16 @@ fn cloud_authorization_base_url_from_state(_app_state: &AppState) -> Result<Stri
     Ok(config::CLOUD_AUTH_BASE_URL.to_string())
 }
 
-fn persist_cloud_authorization_base_url(app_state: &AppState, panel_url: &str) {
+fn persist_cloud_authorization_base_url(
+    app_state: &AppState,
+    panel_url: &str,
+) -> Result<(), String> {
+    config::update_saved_config(|saved| {
+        saved.cloud_authorization_base_url = panel_url.to_string();
+        Ok(())
+    })?;
     *app_state.cloud_authorization_base_url.lock().unwrap() = panel_url.to_string();
-    let mut saved = config::load_saved_config();
-    saved.cloud_authorization_base_url = panel_url.to_string();
-    config::save_config(&saved);
+    Ok(())
 }
 
 #[tauri::command]
@@ -314,7 +320,7 @@ async fn cloud_start_authorization(
     app_state: State<'_, AppState>,
 ) -> Result<cloud_gateway::CloudAuthorizationStart, String> {
     let panel_url = cloud_authorization_base_url_from_state(app_state.inner())?;
-    persist_cloud_authorization_base_url(app_state.inner(), &panel_url);
+    persist_cloud_authorization_base_url(app_state.inner(), &panel_url)?;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .map_err(|e| format!("bind cloud callback listener failed: {e}"))?;
@@ -375,8 +381,10 @@ async fn connection_route_health_check(
 
 #[tauri::command]
 async fn cloud_disable(app_state: State<'_, AppState>) -> Result<bool, String> {
+    let disabled = cloud_auth::disable().await?;
     app_state.cloud_active_bindings.lock().unwrap().clear();
-    cloud_auth::disable().await
+    sync_cloud_config_to_state(app_state.inner());
+    Ok(disabled)
 }
 
 fn sync_cloud_config_to_state(app_state: &AppState) {

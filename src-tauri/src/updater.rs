@@ -1,6 +1,5 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::time::Duration;
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -21,55 +20,52 @@ pub fn get_current_version() -> String {
     CURRENT_VERSION.to_string()
 }
 
+#[derive(Deserialize)]
+struct Release {
+    tag_name: String,
+}
+
 pub async fn check_for_update() -> UpdateInfo {
-    let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap_or_default();
+    check_for_update_at(&format!(
+        "https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    ))
+    .await
+}
 
-    let resp = match client
-        .get(&url)
-        .header("User-Agent", "NextDesk")
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            return UpdateInfo {
-                has_update: false,
+async fn check_for_update_at(url: &str) -> UpdateInfo {
+    let result = async {
+        let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
+        client
+            .get(url)
+            .header("User-Agent", "NextDesk")
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Release>()
+            .await
+    }
+    .await;
+    match result {
+        Ok(release) if !release.tag_name.trim().is_empty() => {
+            let latest = release.tag_name.trim_start_matches('v').to_string();
+            UpdateInfo {
+                has_update: compare_versions(&latest, CURRENT_VERSION) > 0,
                 current_version: CURRENT_VERSION.into(),
-                latest_version: None,
+                latest_version: Some(latest),
                 download_url: None,
-                error: Some(e.to_string()),
-            };
+                error: None,
+            }
         }
-    };
-
-    let data: Value = match resp.json().await {
-        Ok(d) => d,
-        Err(e) => {
-            return UpdateInfo {
-                has_update: false,
-                current_version: CURRENT_VERSION.into(),
-                latest_version: None,
-                download_url: None,
-                error: Some(e.to_string()),
-            };
-        }
-    };
-
-    let tag = data.get("tag_name").and_then(|v| v.as_str()).unwrap_or("");
-    let latest = tag.trim_start_matches('v').to_string();
-
-    let has_update = compare_versions(&latest, CURRENT_VERSION) > 0;
-
-    UpdateInfo {
-        has_update,
-        current_version: CURRENT_VERSION.into(),
-        latest_version: Some(latest),
-        download_url: None,
-        error: None,
+        result => UpdateInfo {
+            has_update: false,
+            current_version: CURRENT_VERSION.into(),
+            latest_version: None,
+            download_url: None,
+            error: Some(match result {
+                Err(error) => error.without_url().to_string(),
+                Ok(_) => "Release response has no version".to_string(),
+            }),
+        },
     }
 }
 
@@ -86,4 +82,41 @@ fn compare_versions(v1: &str, v2: &str) -> i32 {
         }
     }
     (p1.len() as i32) - (p2.len() as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_for_update_at;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn failed_update_checks_are_never_reported_as_up_to_date() {
+        for (status, body, failed) in [
+            (403, r#"{"message":"rate limit"}"#, true),
+            (200, r#"{"message":"missing version"}"#, true),
+            (200, r#"{"tag_name":""}"#, true),
+            (200, r#"{"tag_name":"v999.0.0"}"#, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                loop {
+                    let mut line = String::new();
+                    if stream.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                stream.get_mut().write_all(format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                ).as_bytes()).await.unwrap();
+            });
+            let result = check_for_update_at(&url).await;
+            server.await.unwrap();
+            assert_eq!(result.error.is_some(), failed);
+            assert_eq!(result.has_update, !failed);
+            assert_eq!(result.latest_version.is_none(), failed);
+        }
+    }
 }

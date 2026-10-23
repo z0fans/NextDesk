@@ -3,6 +3,8 @@ pub(crate) mod manager;
 mod monitor;
 mod session;
 mod sftp;
+#[cfg(test)]
+mod test_support;
 mod types;
 
 use crate::connection_outcome::{
@@ -42,15 +44,21 @@ pub async fn ssh_session_start(
     })?;
     let session_id = request.session_id.clone();
     if request.replace_existing {
-        let active = app_state.ssh_sessions.lock().unwrap().contains(&session_id);
-        if active {
-            app_state.ssh_sessions.lock().unwrap().close(&session_id)?;
-            for _ in 0..100 {
-                if !app_state.ssh_sessions.lock().unwrap().contains(&session_id) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let completion = {
+            let manager = app_state.ssh_sessions.lock().unwrap();
+            if manager.contains(&session_id) {
+                Some(manager.close(&session_id)?)
+            } else {
+                None
             }
+        };
+        if let Some(completion) = completion {
+            tokio::time::timeout(
+                sftp::SFTP_SHUTDOWN_TIMEOUT + std::time::Duration::from_secs(5),
+                completion.cancelled(),
+            )
+            .await
+            .map_err(|_| "ssh_session_already_exists".to_string())?;
         }
     }
     {
@@ -93,12 +101,12 @@ pub async fn ssh_session_start(
     let lease = tokio::select! {
         _ = cancellation.cancelled() => {
             log::warn!("[ssh] start rejected phase=route code=ssh_session_cancelled");
-            app_state.ssh_sessions.lock().unwrap().remove(&session_id);
             connection_resolver::release_session_route(
                 app_state.inner(),
                 ServiceKind::Ssh,
                 &session_id,
             );
+            app_state.ssh_sessions.lock().unwrap().remove(&session_id);
             return Err("ssh_session_cancelled".to_string());
         }
         result = resolve => match result {
@@ -108,12 +116,12 @@ pub async fn ssh_session_start(
                     "[ssh] start rejected phase=route code={}",
                     sanitize_diagnostic_code(&error)
                 );
-                app_state.ssh_sessions.lock().unwrap().remove(&session_id);
                 connection_resolver::release_session_route(
                     app_state.inner(),
                     ServiceKind::Ssh,
                     &session_id,
                 );
+                app_state.ssh_sessions.lock().unwrap().remove(&session_id);
                 let mut outcome = ConnectionOutcomeInput::new(
                     session_id.clone(),
                     ServiceKind::Ssh,
@@ -218,7 +226,7 @@ pub fn ssh_session_close(session_id: String, app_state: State<'_, AppState>) -> 
         );
     }
     match active {
-        Ok(()) => Ok(()),
+        Ok(_) => Ok(()),
         Err(error) if error == "ssh_session_not_found" => Ok(()),
         Err(error) => Err(error),
     }

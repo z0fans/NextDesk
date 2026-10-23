@@ -375,7 +375,7 @@ pub async fn report_for_lease(
     if saved.dashboard_url.is_empty() || saved.cloud_device_id.is_empty() {
         return Ok(());
     }
-    let token = cloud_auth::load_device_token(&saved.cloud_device_id)?;
+    let token = cloud_auth::load_device_token(&saved)?;
     let mut last_error = None;
     for delay in [
         Duration::ZERO,

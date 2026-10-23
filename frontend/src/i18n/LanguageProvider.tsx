@@ -1,4 +1,4 @@
-import { createContext, useState, useEffect, type ReactNode } from 'react';
+import { createContext, useState, useEffect, useRef, type ReactNode } from 'react';
 import { translations, type Language, type TranslationKey } from './translations';
 import { api } from '../api';
 
@@ -14,47 +14,51 @@ interface LanguageProviderProps {
   children: ReactNode;
 }
 
-function initialLanguage(): Language {
+function savedLanguage(): Language | null {
   try {
-    const savedLang = localStorage.getItem('nextdesk-language') as Language | null;
+    const savedLang = localStorage.getItem('nextdesk-language');
     if (savedLang === 'zh-CN' || savedLang === 'en-US') return savedLang;
   } catch {
-    // Fall back to the browser locale when storage is unavailable.
+    // Storage is optional; language selection must remain usable without it.
   }
-  return navigator.language.startsWith('zh') ? 'zh-CN' : 'en-US';
+  return null;
+}
+
+function saveLanguage(language: Language) {
+  try {
+    localStorage.setItem('nextdesk-language', language);
+  } catch (error) {
+    console.warn('[i18n] failed to save language', error);
+  }
 }
 
 export function LanguageProvider({ children }: LanguageProviderProps) {
-  const [language, setLanguageState] = useState<Language>(initialLanguage);
+  const [language, setLanguageState] = useState<Language>(() =>
+    savedLanguage() ?? (navigator.language.startsWith('zh') ? 'zh-CN' : 'en-US')
+  );
+  const userSelectedLanguage = useRef(false);
 
   useEffect(() => {
-    const initLanguage = async () => {
-      const savedLang = localStorage.getItem('nextdesk-language') as Language | null;
-      if (savedLang && (savedLang === 'en-US' || savedLang === 'zh-CN')) {
-        setLanguageState(savedLang);
-      } else {
-        try {
-          const systemLang = await api.getSystemLanguage();
-          if (systemLang === 'zh-CN' || systemLang === 'en-US') {
-            setLanguageState(systemLang as Language);
-            localStorage.setItem('nextdesk-language', systemLang);
-          }
-        } catch {
-          const browserLang = navigator.language;
-          if (browserLang.startsWith('zh')) {
-            setLanguageState('zh-CN');
-          } else {
-            setLanguageState('en-US');
-          }
-        }
+    if (savedLanguage()) return;
+    let active = true;
+    void api.getSystemLanguage().then((systemLang) => {
+      if (!active || userSelectedLanguage.current) return;
+      if (systemLang === 'zh-CN' || systemLang === 'en-US') {
+        setLanguageState(systemLang);
+        saveLanguage(systemLang);
       }
+    }).catch(() => {
+      // Keep the initial browser fallback or the user's newer selection.
+    });
+    return () => {
+      active = false;
     };
-    initLanguage();
   }, []);
 
   const setLanguage = (lang: Language) => {
+    userSelectedLanguage.current = true;
     setLanguageState(lang);
-    localStorage.setItem('nextdesk-language', lang);
+    saveLanguage(lang);
   };
 
   const t = (key: TranslationKey, params?: Record<string, string | number>): string => {

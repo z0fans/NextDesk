@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, type SetStateAction } from 'react';
+import { useState, useCallback, useEffect, useSyncExternalStore, type SetStateAction } from 'react';
 import type { ServerEntry, ServerGroup, SessionTab, ViewMode, ConnectionState, RdpRoutePolicy } from './rdp-types';
 
 function uid() {
@@ -59,51 +59,57 @@ function normalizeServers(value: unknown): ServerEntry[] {
     });
 }
 
-export function useFolderSharingSetting() {
-  const [folderSharingEnabled, setFolderSharingEnabledState] = useState<boolean>(() =>
-    loadFromStorage(FOLDER_SHARING_KEY, false)
-  );
+const folderSharingListeners = new Set<() => void>();
+let folderSharingSnapshot = false;
 
-  const setFolderSharingEnabled = useCallback((value: SetStateAction<boolean>) => {
-    setFolderSharingEnabledState(prev => {
-      const next = typeof value === 'function'
-        ? (value as (previous: boolean) => boolean)(prev)
-        : value;
+function getFolderSharingSnapshot(): boolean {
+  // Keep live updates usable even when persistence fails; reload after all consumers leave.
+  return folderSharingListeners.size > 0
+    ? folderSharingSnapshot
+    : loadFromStorage<unknown>(FOLDER_SHARING_KEY, false) === true;
+}
 
-      saveToStorage(FOLDER_SHARING_KEY, next);
-      window.dispatchEvent(new CustomEvent<boolean>(FOLDER_SHARING_EVENT, { detail: next }));
+function notifyFolderSharing(next: boolean) {
+  folderSharingSnapshot = next;
+  folderSharingListeners.forEach(listener => listener());
+}
 
-      return next;
-    });
-  }, []);
+function handleFolderSharingChange(event: Event) {
+  const next = (event as CustomEvent<unknown>).detail;
+  if (typeof next === 'boolean') notifyFolderSharing(next);
+}
 
-  useEffect(() => {
-    saveToStorage(FOLDER_SHARING_KEY, folderSharingEnabled);
-  }, [folderSharingEnabled]);
+function handleFolderSharingStorageChange(event: StorageEvent) {
+  if (event.key === FOLDER_SHARING_KEY || event.key === null) {
+    notifyFolderSharing(loadFromStorage<unknown>(FOLDER_SHARING_KEY, false) === true);
+  }
+}
 
-  useEffect(() => {
-    const handleFolderSharingChange = (event: Event) => {
-      const next = (event as CustomEvent<boolean>).detail;
-      if (typeof next === 'boolean') {
-        setFolderSharingEnabledState(next);
-      }
-    };
-
-    const handleStorageChange = (event: StorageEvent) => {
-      if (event.key === FOLDER_SHARING_KEY) {
-        setFolderSharingEnabledState(loadFromStorage(FOLDER_SHARING_KEY, false));
-      }
-    };
-
+function subscribeFolderSharing(listener: () => void) {
+  if (folderSharingListeners.size === 0) {
+    folderSharingSnapshot = getFolderSharingSnapshot();
     window.addEventListener(FOLDER_SHARING_EVENT, handleFolderSharingChange);
-    window.addEventListener('storage', handleStorageChange);
+    window.addEventListener('storage', handleFolderSharingStorageChange);
+  }
+  folderSharingListeners.add(listener);
 
-    return () => {
+  return () => {
+    folderSharingListeners.delete(listener);
+    if (folderSharingListeners.size === 0) {
       window.removeEventListener(FOLDER_SHARING_EVENT, handleFolderSharingChange);
-      window.removeEventListener('storage', handleStorageChange);
-    };
-  }, []);
+      window.removeEventListener('storage', handleFolderSharingStorageChange);
+    }
+  };
+}
 
+function setFolderSharingEnabled(value: SetStateAction<boolean>) {
+  const next = typeof value === 'function' ? value(getFolderSharingSnapshot()) : value;
+  saveToStorage(FOLDER_SHARING_KEY, next);
+  window.dispatchEvent(new CustomEvent<boolean>(FOLDER_SHARING_EVENT, { detail: next }));
+}
+
+export function useFolderSharingSetting() {
+  const folderSharingEnabled = useSyncExternalStore(subscribeFolderSharing, getFolderSharingSnapshot);
   return { folderSharingEnabled, setFolderSharingEnabled };
 }
 

@@ -299,6 +299,7 @@ impl Drop for OleInitGuard {
 pub fn write_files_with_native_virtual_data_object(
     files: &[VirtualClipboardFile],
 ) -> Result<Option<VirtualClipboardWriteResult>, String> {
+    crate::virtual_file_clipboard::validate_clipboard_files(files)?;
     if files.is_empty() {
         return Ok(None);
     }

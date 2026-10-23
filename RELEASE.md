@@ -61,6 +61,8 @@ RUSTFLAGS='--cfg nextdesk_kkterm_rdp' \
   cargo test --locked --manifest-path src-tauri/Cargo.toml \
   --lib --features kkterm-rdp -- --nocapture
 
+go -C gateway-agent test ./...
+
 git diff --check
 ```
 
@@ -98,7 +100,7 @@ The tag push triggers `.github/workflows/build.yml` (`Build & Release`). The wor
 1. checks out the pinned IronRDP commit and applies the NextDesk patch;
 2. installs locked npm dependencies with `npm ci`;
 3. runs lint, all frontend tests, the production frontend build, Rust formatting and
-   locked Rust library tests;
+   locked Rust library tests, and Gateway Agent Go tests;
 4. builds macOS first, then Windows for a normal tagged release;
 5. publishes artifacts to the matching GitHub Release.
 

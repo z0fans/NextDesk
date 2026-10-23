@@ -367,28 +367,6 @@ where
     }
 }
 
-fn cloud_auth_error(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    error.contains("401")
-        || error.contains("403")
-        || error.contains("unauthorized")
-        || error.contains("forbidden")
-        || error.contains("cloud_authorization_expired")
-}
-
-fn normalize_cloud_error(error: String) -> String {
-    if cloud_auth_error(&error) {
-        "cloud_authorization_expired".to_string()
-    } else {
-        error
-    }
-}
-
-fn cloud_rate_limited(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    error.contains("429") || error.contains("too many requests") || error.contains("rate limit")
-}
-
 fn binding_is_valid(binding: &ActiveCloudBinding, now: u128) -> bool {
     binding.expires_at_ms > now
 }
@@ -470,7 +448,8 @@ async fn prepare_with_retry(
         {
             Ok(response) => return Ok(response),
             Err(error)
-                if cloud_rate_limited(&error) && attempt < CLOUD_PREPARE_RETRY_DELAYS_MS.len() =>
+                if error == cloud_gateway::RATE_LIMITED
+                    && attempt < CLOUD_PREPARE_RETRY_DELAYS_MS.len() =>
             {
                 let delay = CLOUD_PREPARE_RETRY_DELAYS_MS[attempt];
                 log::warn!(
@@ -501,7 +480,8 @@ async fn renew_with_retry(
         match cloud_gateway::renew(panel_url, device_id, token, binding_id).await {
             Ok(response) => return Ok(response),
             Err(error)
-                if cloud_rate_limited(&error) && attempt < CLOUD_RENEW_RETRY_DELAYS_MS.len() =>
+                if error == cloud_gateway::RATE_LIMITED
+                    && attempt < CLOUD_RENEW_RETRY_DELAYS_MS.len() =>
             {
                 let delay = CLOUD_RENEW_RETRY_DELAYS_MS[attempt];
                 log::warn!(
@@ -580,13 +560,7 @@ pub async fn keep_binding_alive(
     keep_route_alive(app_state, ServiceKind::Rdp, session_id, host, port).await
 }
 
-const CLOUD_BINDING_GONE_ERROR: &str = "cloud_binding_gone";
-
-fn cloud_binding_is_gone(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    error.contains("cloud renew rejected")
-        && (error.contains("410 gone") || error.contains("status code 410"))
-}
+const CLOUD_BINDING_GONE_ERROR: &str = cloud_gateway::BINDING_GONE;
 
 fn invalidate_cloud_binding_if_current(app_state: &AppState, key: &str, binding_id: &str) -> bool {
     let mut bindings = app_state.cloud_active_bindings.lock().unwrap();
@@ -632,8 +606,7 @@ pub async fn keep_route_alive(
         return Ok(());
     }
 
-    let token =
-        cloud_auth::load_device_token(&saved.cloud_device_id).map_err(normalize_cloud_error)?;
+    let token = cloud_auth::load_device_token(&saved)?;
     match renew_with_retry(
         &saved.dashboard_url,
         &saved.cloud_device_id,
@@ -659,7 +632,7 @@ pub async fn keep_route_alive(
             );
             Ok(())
         }
-        Err(error) if cloud_binding_is_gone(&error) => {
+        Err(error) if error == cloud_gateway::BINDING_GONE => {
             let invalidated =
                 invalidate_cloud_binding_if_current(app_state, &key, &binding.binding_id);
             log::warn!(
@@ -681,12 +654,13 @@ pub async fn keep_route_alive(
             );
             Ok(())
         }
-        Err(error) => Err(normalize_cloud_error(error)),
+        Err(error) => Err(error),
     }
 }
 
 async fn resolve_connection_target_inner(
     app_state: &AppState,
+    saved: &config::SavedConfig,
     host: String,
     port: u16,
     reuse_cloud_binding: bool,
@@ -703,7 +677,6 @@ async fn resolve_connection_target_inner(
         return Ok(direct_target(host, port, "local_direct"));
     }
 
-    let saved = config::load_saved_config();
     if !cloud_credentials_present(&saved) {
         if route_policy == RoutePolicy::CloudOnly {
             return Err("cloud_authorization_required".to_string());
@@ -723,8 +696,7 @@ async fn resolve_connection_target_inner(
     if let Some(binding) = cached_binding {
         if can_reuse_cached_binding(&binding, now, reuse_cloud_binding) {
             if binding_needs_renewal(&binding, now) {
-                let token = cloud_auth::load_device_token(&saved.cloud_device_id)
-                    .map_err(normalize_cloud_error)?;
+                let token = cloud_auth::load_device_token(&saved)?;
                 match renew_with_retry(
                     &saved.dashboard_url,
                     &saved.cloud_device_id,
@@ -757,7 +729,7 @@ async fn resolve_connection_target_inner(
                         return Ok(updated.resolved());
                     }
                     Err(error) => {
-                        if cloud_binding_is_gone(&error) {
+                        if error == cloud_gateway::BINDING_GONE {
                             let invalidated = invalidate_cloud_binding_if_current(
                                 app_state,
                                 &key,
@@ -843,8 +815,7 @@ async fn resolve_connection_target_inner(
         reuse_cloud_binding
     );
 
-    let token =
-        cloud_auth::load_device_token(&saved.cloud_device_id).map_err(normalize_cloud_error)?;
+    let token = cloud_auth::load_device_token(&saved)?;
     let prepared = prepare_with_retry(
         &saved.dashboard_url,
         &saved.cloud_device_id,
@@ -856,8 +827,7 @@ async fn resolve_connection_target_inner(
         session_id,
         service_kind,
     )
-    .await
-    .map_err(normalize_cloud_error)?;
+    .await?;
 
     let (ready, endpoint_was_probed) = match prepared.mode {
         CloudPrepareMode::Reused => (
@@ -1012,8 +982,7 @@ async fn resolve_connection_target_inner(
                     &cloud_results,
                     saved.anonymous_quality_feedback_enabled(),
                 )
-                .await
-                .map_err(normalize_cloud_error)?,
+                .await?,
                 true,
             )
         }
@@ -1185,8 +1154,7 @@ pub async fn assess_route_health(
     if !cloud_credentials_present(&saved) {
         return Ok(unsupported_route_health("cloud_unavailable"));
     }
-    let token =
-        cloud_auth::load_device_token(&saved.cloud_device_id).map_err(normalize_cloud_error)?;
+    let token = cloud_auth::load_device_token(&saved)?;
     let prepared = cloud_gateway::prepare(
         &saved.dashboard_url,
         &saved.cloud_device_id,
@@ -1198,8 +1166,7 @@ pub async fn assess_route_health(
         Some(session_id),
         service_kind,
     )
-    .await
-    .map_err(normalize_cloud_error)?;
+    .await?;
 
     let prepare_id = match prepared.mode {
         CloudPrepareMode::Candidates => prepared
@@ -1413,7 +1380,7 @@ pub async fn resolve_connection(
     {
         let saved = config::load_saved_config();
         if cloud_credentials_present(&saved) {
-            if let Ok(token) = cloud_auth::load_device_token(&saved.cloud_device_id) {
+            if let Ok(token) = cloud_auth::load_device_token(&saved) {
                 match cloud_gateway::network_context(
                     &saved.dashboard_url,
                     &saved.cloud_device_id,
@@ -1434,15 +1401,22 @@ pub async fn resolve_connection(
                     }
                     Err(error) => log::warn!(
                         "[cloud] network-scoped route preference unavailable; using intelligent mode: {}",
-                        normalize_cloud_error(error)
+                        error
                     ),
                 }
             }
         }
     }
+    let saved = if is_private_target || effective_intent.route_policy == RoutePolicy::Direct {
+        config::SavedConfig::default()
+    } else {
+        config::load_saved_config()
+    };
+    let identity = cloud_auth::DeviceIdentity::from(&saved);
     let result = if is_private_target || effective_intent.route_policy == RoutePolicy::Direct {
         resolve_connection_target_inner(
             app_state,
+            &saved,
             host,
             port,
             effective_intent.reuse_cloud_binding,
@@ -1459,9 +1433,15 @@ pub async fn resolve_connection(
             &host,
             port,
         );
+        // A new account must not join an old account's in-flight authorization result.
+        let key = format!(
+            "{key}|{}|{}|{}",
+            saved.dashboard_url, saved.cloud_device_id, saved.cloud_authorization_revision
+        );
         run_cloud_resolve_singleflight(app_state, key, || {
             resolve_connection_target_inner(
                 app_state,
+                &saved,
                 host,
                 port,
                 effective_intent.reuse_cloud_binding,
@@ -1473,9 +1453,14 @@ pub async fn resolve_connection(
         })
         .await
     };
-    if result.as_ref().is_err_and(|error| cloud_auth_error(error)) {
-        cloud_auth::invalidate_authorization();
-        app_state.cloud_active_bindings.lock().unwrap().clear();
+    if result
+        .as_ref()
+        .is_err_and(|error| error == cloud_gateway::AUTHORIZATION_EXPIRED)
+    {
+        match cloud_auth::invalidate_authorization(&identity) {
+            Ok(()) => app_state.cloud_active_bindings.lock().unwrap().clear(),
+            Err(error) => log::warn!("[cloud] authorization invalidation skipped: {error}"),
+        }
     }
     let mut resolved = match effective_intent.route_policy {
         RoutePolicy::Auto => resolve_cloud_result(original_host, port, result),
@@ -1657,7 +1642,7 @@ fn release_lease_resources(app_state: &AppState, lease: RouteLease) {
                 );
                 return;
             }
-            let Ok(token) = cloud_auth::load_device_token(&saved.cloud_device_id) else {
+            let Ok(token) = cloud_auth::load_device_token(&saved) else {
                 log::warn!(
                     "[cloud] route released locally but remote close token is unavailable service={}",
                     service_kind.as_str()
@@ -1678,13 +1663,13 @@ fn release_lease_resources(app_state: &AppState, lease: RouteLease) {
 #[cfg(test)]
 mod tests {
     use super::{
-        binding_is_valid, binding_needs_renewal, can_reuse_cached_binding, cloud_binding_is_gone,
-        cloud_binding_key, cloud_credentials_present, cloud_rate_limited, direct_fallback_lease,
-        direct_target, invalidate_cloud_binding_if_current, normalize_cloud_error,
-        release_session_route, release_session_route_if_current, resolve_cloud_result,
-        resolve_connection, resolve_connection_target, route_improvement_percent,
-        run_cloud_resolve_singleflight, ConnectionIntent, ResolvedTarget, RouteHealthPath,
-        RouteLease, RoutePolicy, ServiceKind, TargetAddress, CLOUD_BINDING_GONE_ERROR,
+        binding_is_valid, binding_needs_renewal, can_reuse_cached_binding, cloud_binding_key,
+        cloud_credentials_present, direct_fallback_lease, direct_target,
+        invalidate_cloud_binding_if_current, release_session_route,
+        release_session_route_if_current, resolve_cloud_result, resolve_connection,
+        resolve_connection_target, route_improvement_percent, run_cloud_resolve_singleflight,
+        ConnectionIntent, ResolvedTarget, RouteHealthPath, RouteLease, RoutePolicy, ServiceKind,
+        TargetAddress,
     };
     use crate::config::SavedConfig;
     use crate::state::{ActiveCloudBinding, AppState};
@@ -1763,14 +1748,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_prepare_unsupported_stays_cloud_specific() {
-        assert_eq!(
-            normalize_cloud_error("cloud_prepare_unsupported".to_string()),
-            "cloud_prepare_unsupported"
-        );
-    }
-
-    #[test]
     fn cached_binding_is_reused_until_lease_expires() {
         let now = 10_000;
         let binding = binding(now + 120_000);
@@ -1816,25 +1793,6 @@ mod tests {
 
         assert!(binding_is_valid(&binding, now));
         assert!(binding_needs_renewal(&binding, now));
-    }
-
-    #[test]
-    fn cloud_rate_limit_errors_are_retryable() {
-        assert!(cloud_rate_limited(
-            "cloud prepare rejected: HTTP status client error (429 Too Many Requests)"
-        ));
-        assert!(!cloud_rate_limited("cloud prepare unsupported"));
-    }
-
-    #[test]
-    fn gone_renewal_is_a_terminal_binding_failure() {
-        assert!(cloud_binding_is_gone(
-            "cloud renew rejected: HTTP status client error (410 Gone)"
-        ));
-        assert!(!cloud_binding_is_gone(
-            "cloud renew request failed: connection reset"
-        ));
-        assert_eq!(CLOUD_BINDING_GONE_ERROR, "cloud_binding_gone");
     }
 
     #[test]

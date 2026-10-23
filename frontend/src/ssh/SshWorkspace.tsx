@@ -147,6 +147,7 @@ function errorTranslationKey(message: string): TranslationKey {
   if (code.includes("private_key") || code === "ssh_key_algorithm_failed")
     return "sshErrorPrivateKey";
   if (code.startsWith("credential_")) return "sshErrorCredential";
+  if (code === "cloud_rate_limited") return "cloudRateLimited";
   if (code.startsWith("cloud_")) return "sshErrorCloud";
   if (code.startsWith("ssh_transport_")) return "sshErrorTransport";
   if (code.endsWith("_invalid") || code.endsWith("_required"))
